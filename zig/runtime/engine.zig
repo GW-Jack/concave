@@ -1,5 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const blob_store_mod = @import("../core/blob_store.zig");
+const key_mod = @import("../core/key.zig");
 const manifest_mod = @import("../core/manifest.zig");
 const readset_mod = @import("../core/readset.zig");
 const storage_mod = @import("../core/storage.zig");
@@ -55,6 +57,7 @@ pub const ExecutionEnv = struct {
     allocator: Allocator,
     io: std.Io,
     auth: ?auth_mod.AuthIdentity,
+    blob_store: ?*blob_store_mod.BlobStore = null,
     mode: union(enum) {
         tx: *tx_mod.TxContext,
         action: *ConcaveEngine,
@@ -70,6 +73,34 @@ pub const ExecutionEnv = struct {
     pub fn dbQuery(self: *ExecutionEnv, allocator: Allocator, query: *const storage_mod.IndexQuery) ![]storage_mod.Document {
         return switch (self.mode) {
             .tx => |t| t.scanIndex(allocator, query),
+            .action => error.DbNotAllowedInAction,
+        };
+    }
+
+    pub fn dbPaginate(
+        self: *ExecutionEnv,
+        allocator: Allocator,
+        query: *const storage_mod.IndexQuery,
+        cursor: []const u8,
+        page_size: usize,
+    ) !tx_mod.TxContext.PageResult {
+        return switch (self.mode) {
+            .tx => |t| t.paginate(allocator, query, cursor, page_size),
+            .action => error.DbNotAllowedInAction,
+        };
+    }
+
+    pub fn dbSearch(
+        self: *ExecutionEnv,
+        allocator: Allocator,
+        ns: []const u8,
+        table: []const u8,
+        field: []const u8,
+        query_text: []const u8,
+        limit: usize,
+    ) ![]storage_mod.Document {
+        return switch (self.mode) {
+            .tx => |t| t.search(allocator, ns, table, field, query_text, limit),
             .action => error.DbNotAllowedInAction,
         };
     }
@@ -100,6 +131,43 @@ pub const ExecutionEnv = struct {
             .tx => |t| t.delete(ns, table, doc_id),
             .action => error.DbNotAllowedInAction,
         };
+    }
+
+    pub fn scheduleJob(self: *ExecutionEnv, allocator: Allocator, run_at_ms: i64, fn_name: []const u8, args_json: []const u8) ![]u8 {
+        return switch (self.mode) {
+            .tx => |t| t.scheduleJob(allocator, run_at_ms, fn_name, args_json, null),
+            .action => error.SchedulerOnlyInMutation,
+        };
+    }
+
+    pub fn cancelJob(self: *ExecutionEnv, job_id: []const u8) !void {
+        return switch (self.mode) {
+            .tx => |t| t.cancelJob(job_id),
+            .action => error.SchedulerOnlyInMutation,
+        };
+    }
+
+    pub fn storageUploadUrl(self: *ExecutionEnv, allocator: Allocator) ![]u8 {
+        switch (self.mode) {
+            .tx => |t| if (t.read_only) return storage_mod.StorageError.ReadOnly,
+            .action => {},
+        }
+        const bs = self.blob_store orelse return error.StorageNotConfigured;
+        return try bs.generateUploadUrl(allocator);
+    }
+
+    pub fn storageGetUrl(self: *ExecutionEnv, allocator: Allocator, storage_id: []const u8) ![]u8 {
+        const bs = self.blob_store orelse return error.StorageNotConfigured;
+        return try bs.getDownloadUrl(allocator, storage_id);
+    }
+
+    pub fn storageDelete(self: *ExecutionEnv, storage_id: []const u8) !void {
+        switch (self.mode) {
+            .tx => |t| if (t.read_only) return storage_mod.StorageError.ReadOnly,
+            .action => {},
+        }
+        const bs = self.blob_store orelse return error.StorageNotConfigured;
+        return try bs.deleteBlob(storage_id);
     }
 
     pub fn httpFetch(self: *ExecutionEnv, allocator: Allocator, req: http_client.HttpFetchRequest) !http_client.HttpFetchResponse {
@@ -133,6 +201,7 @@ pub const AppExecutor = struct {
         executeQuery: *const fn (ptr: *anyopaque, allocator: Allocator, name: []const u8, args_json: []const u8, env: *ExecutionEnv) ExecResult,
         executeMutation: *const fn (ptr: *anyopaque, allocator: Allocator, name: []const u8, args_json: []const u8, env: *ExecutionEnv) ExecResult,
         executeAction: *const fn (ptr: *anyopaque, allocator: Allocator, name: []const u8, args_json: []const u8, env: *ExecutionEnv) ExecResult,
+        executeHttpRoute: ?*const fn (ptr: *anyopaque, allocator: Allocator, method: []const u8, path: []const u8, req_json: []const u8, env: *ExecutionEnv) ExecResult = null,
     };
 
     pub fn manifest(self: AppExecutor) *const manifest_mod.AppManifest {
@@ -149,6 +218,13 @@ pub const AppExecutor = struct {
 
     pub fn executeAction(self: AppExecutor, allocator: Allocator, name: []const u8, args_json: []const u8, env: *ExecutionEnv) ExecResult {
         return self.vtable.executeAction(self.ptr, allocator, name, args_json, env);
+    }
+
+    pub fn executeHttpRoute(self: AppExecutor, allocator: Allocator, method: []const u8, path: []const u8, req_json: []const u8, env: *ExecutionEnv) ExecResult {
+        if (self.vtable.executeHttpRoute) |f| {
+            return f(self.ptr, allocator, method, path, req_json, env);
+        }
+        return .{ .err = allocator.dupe(u8, "http routes not supported by executor") catch &.{} };
     }
 };
 
@@ -212,6 +288,7 @@ pub const ConcaveEngine = struct {
     executor: AppExecutor,
     manifest: *const manifest_mod.AppManifest,
     auth_config: auth_mod.AuthConfig,
+    blob_store: ?*blob_store_mod.BlobStore = null,
 
     clients_mutex: std.Io.Mutex = .init,
     clients: std.AutoHashMapUnmanaged(u64, *ClientSession) = .empty,
@@ -517,6 +594,7 @@ pub const ConcaveEngine = struct {
             .allocator = self.allocator,
             .io = self.io,
             .auth = auth_clone,
+            .blob_store = self.blob_store,
             .mode = .{ .tx = &tx },
         };
 
@@ -551,6 +629,7 @@ pub const ConcaveEngine = struct {
                 .allocator = self.allocator,
                 .io = self.io,
                 .auth = auth_clone,
+                .blob_store = self.blob_store,
                 .mode = .{ .tx = &tx },
             };
 
@@ -602,9 +681,247 @@ pub const ConcaveEngine = struct {
             .allocator = self.allocator,
             .io = self.io,
             .auth = auth_clone,
+            .blob_store = self.blob_store,
             .mode = .{ .action = self },
         };
         return self.executor.executeAction(allocator, name, args_json, &env);
+    }
+
+    pub fn executeHttpRoute(
+        self: *ConcaveEngine,
+        allocator: Allocator,
+        method: []const u8,
+        path: []const u8,
+        req_json: []const u8,
+        auth: ?*const auth_mod.AuthIdentity,
+    ) !ExecResult {
+        const auth_clone = if (auth) |a| a.clone(self.allocator) catch null else null;
+        defer if (auth_clone) |*ac| ac.deinit(self.allocator);
+
+        var env = ExecutionEnv{
+            .allocator = self.allocator,
+            .io = self.io,
+            .auth = auth_clone,
+            .blob_store = self.blob_store,
+            .mode = .{ .action = self },
+        };
+        return self.executor.executeHttpRoute(allocator, method, path, req_json, &env);
+    }
+
+    /// Ensure every manifest cron has an active pending/running job in `_system._scheduled_jobs`.
+    pub fn ensureCronJobs(self: *ConcaveEngine) !void {
+        if (self.manifest.crons.len == 0) return;
+        for (self.manifest.crons) |cron| {
+            const snapshot_ts = try self.storage.latestCommitTs();
+            var tx = tx_mod.TxContext.init(self.allocator, self.io, self.storage, self.manifest, snapshot_ts, false);
+            defer tx.deinit();
+
+            const has_pending = try hasCronJobWithStatus(self.allocator, &tx, cron.name, "pending");
+            if (has_pending) continue;
+            const has_running = try hasCronJobWithStatus(self.allocator, &tx, cron.name, "running");
+            if (has_running) continue;
+
+            const run_at = storage_mod.nowMillis(self.io) + cron.interval_ms;
+            const job_id = try tx.scheduleJob(self.allocator, run_at, cron.fn_name, cron.args_json, cron.name);
+            defer self.allocator.free(job_id);
+
+            var commit = self.storage.commitTx(
+                self.allocator,
+                self.manifest,
+                snapshot_ts,
+                &tx.read_set,
+                tx.writes.items,
+            ) catch |err| {
+                if (err == storage_mod.StorageError.Conflict) continue;
+                return err;
+            };
+            defer commit.deinit(self.allocator);
+            if (!commit.write_set.isEmpty()) {
+                self.handleLocalCommit(commit.commit_ts, &commit.write_set);
+            }
+        }
+    }
+
+    /// Claim and execute due jobs from `_system._scheduled_jobs` safely across replicas via OCC.
+    pub fn pollScheduledJobs(self: *ConcaveEngine) !usize {
+        try self.ensureCronJobs();
+
+        const now_ms = storage_mod.nowMillis(self.io);
+        const start_key = try key_mod.encodeKey(self.allocator, &.{.{ .str_val = "pending" }});
+        defer self.allocator.free(start_key);
+        const end_key = try key_mod.encodeKey(self.allocator, &.{ .{ .str_val = "pending" }, .{ .int_val = now_ms } });
+        defer self.allocator.free(end_key);
+
+        const due_docs = try self.storage.scanIndex(self.allocator, &.{
+            .namespace = "_system",
+            .table = "_scheduled_jobs",
+            .index_name = "by_status_run_at",
+            .start = .{ .included = start_key },
+            .end = .{ .included = end_key },
+            .order = .asc,
+            .limit = 16,
+        });
+        defer {
+            for (due_docs) |*d| d.deinit(self.allocator);
+            self.allocator.free(due_docs);
+        }
+
+        var executed: usize = 0;
+        for (due_docs) |*doc| {
+            // Step 1: Atomically claim `pending` -> `running` via OCC.
+            var fn_name_owned: []u8 = undefined;
+            var args_json_owned: []u8 = undefined;
+            var cron_name_owned: ?[]u8 = null;
+
+            const claimed = blk: {
+                const snap_ts = self.storage.latestCommitTs() catch break :blk false;
+                var tx = tx_mod.TxContext.init(self.allocator, self.io, self.storage, self.manifest, snap_ts, false);
+                defer tx.deinit();
+
+                const fresh = (tx.get(self.allocator, "_system", "_scheduled_jobs", doc.id) catch break :blk false) orelse break :blk false;
+                defer fresh.deinit(self.allocator);
+
+                var arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer arena.deinit();
+                const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), fresh.body_json, .{}) catch break :blk false;
+                if (parsed != .object) break :blk false;
+                const status_v = parsed.object.get("status") orelse break :blk false;
+                if (status_v != .string or !std.mem.eql(u8, status_v.string, "pending")) break :blk false;
+
+                const fn_v = parsed.object.get("fn_name") orelse break :blk false;
+                const args_v = parsed.object.get("args_json") orelse break :blk false;
+                if (fn_v != .string or args_v != .string) break :blk false;
+                const attempts: i64 = if (parsed.object.get("attempts")) |av| (if (av == .integer) av.integer else 0) else 0;
+
+                const patch_json = std.fmt.allocPrint(self.allocator, "{{\"status\":\"running\",\"attempts\":{d}}}", .{attempts + 1}) catch break :blk false;
+                defer self.allocator.free(patch_json);
+                tx.patch("_system", "_scheduled_jobs", doc.id, patch_json) catch break :blk false;
+
+                var commit = self.storage.commitTx(
+                    self.allocator,
+                    self.manifest,
+                    snap_ts,
+                    &tx.read_set,
+                    tx.writes.items,
+                ) catch break :blk false;
+                defer commit.deinit(self.allocator);
+                if (!commit.write_set.isEmpty()) {
+                    self.handleLocalCommit(commit.commit_ts, &commit.write_set);
+                }
+
+                fn_name_owned = try self.allocator.dupe(u8, fn_v.string);
+                args_json_owned = try self.allocator.dupe(u8, args_v.string);
+                if (parsed.object.get("cron_name")) |cv| {
+                    if (cv == .string and cv.string.len > 0) {
+                        cron_name_owned = try self.allocator.dupe(u8, cv.string);
+                    }
+                }
+                break :blk true;
+            };
+            if (!claimed) continue;
+            defer self.allocator.free(fn_name_owned);
+            defer self.allocator.free(args_json_owned);
+            defer if (cron_name_owned) |cn| self.allocator.free(cn);
+
+            // Step 2: Execute the scheduled function (mutation or action).
+            var job_err: ?[]u8 = null;
+            defer if (job_err) |e| self.allocator.free(e);
+
+            if (self.manifest.findFunction(fn_name_owned)) |fspec| {
+                switch (fspec.kind) {
+                    .mutation => {
+                        const mres: ?MutationExecResult = self.executeMutation(self.allocator, fn_name_owned, args_json_owned, null) catch |err| blk_e: {
+                            job_err = try self.allocator.dupe(u8, @errorName(err));
+                            break :blk_e null;
+                        };
+                        if (mres) |mr| {
+                            defer mr.deinit(self.allocator);
+                            if (mr.result == .err) {
+                                job_err = try self.allocator.dupe(u8, mr.result.err);
+                            }
+                        }
+                    },
+                    .action => {
+                        const ares: ?ExecResult = self.executeAction(self.allocator, fn_name_owned, args_json_owned, null) catch |err| blk_e: {
+                            job_err = try self.allocator.dupe(u8, @errorName(err));
+                            break :blk_e null;
+                        };
+                        if (ares) |ar| {
+                            defer ar.deinit(self.allocator);
+                            if (ar == .err) {
+                                job_err = try self.allocator.dupe(u8, ar.err);
+                            }
+                        }
+                    },
+                    .query => {
+                        job_err = try self.allocator.dupe(u8, "scheduled function must be a mutation or action, not a query");
+                    },
+                }
+            } else {
+                job_err = try std.fmt.allocPrint(self.allocator, "unknown scheduled function `{s}`", .{fn_name_owned});
+            }
+
+            // Step 3: Record completion/failure and reschedule next cron tick if applicable.
+            for (0..4) |_| {
+                const snap_ts = self.storage.latestCommitTs() catch break;
+                var tx = tx_mod.TxContext.init(self.allocator, self.io, self.storage, self.manifest, snap_ts, false);
+                defer tx.deinit();
+
+                var patch_out: std.Io.Writer.Allocating = .init(self.allocator);
+                defer patch_out.deinit();
+                if (job_err) |emsg| {
+                    try patch_out.writer.writeAll("{\"status\":\"failed\",\"last_error\":");
+                    try storage_mod.writeJsonString(&patch_out.writer, emsg);
+                    try patch_out.writer.writeByte('}');
+                } else {
+                    try patch_out.writer.writeAll("{\"status\":\"completed\"}");
+                }
+                tx.patch("_system", "_scheduled_jobs", doc.id, patch_out.written()) catch break;
+
+                if (cron_name_owned) |cn| {
+                    for (self.manifest.crons) |cron| {
+                        if (std.mem.eql(u8, cron.name, cn)) {
+                            const next_run = storage_mod.nowMillis(self.io) + cron.interval_ms;
+                            const next_id = try tx.scheduleJob(self.allocator, next_run, cron.fn_name, cron.args_json, cron.name);
+                            self.allocator.free(next_id);
+                            break;
+                        }
+                    }
+                }
+
+                var commit = self.storage.commitTx(
+                    self.allocator,
+                    self.manifest,
+                    snap_ts,
+                    &tx.read_set,
+                    tx.writes.items,
+                ) catch |err| {
+                    if (err == storage_mod.StorageError.Conflict) continue;
+                    break;
+                };
+                defer commit.deinit(self.allocator);
+                if (!commit.write_set.isEmpty()) {
+                    self.handleLocalCommit(commit.commit_ts, &commit.write_set);
+                }
+                break;
+            }
+            executed += 1;
+        }
+        return executed;
+    }
+
+    pub fn spawnSchedulerWorker(self: *ConcaveEngine, poll_ms: u64) !std.Thread {
+        const Ctx = struct {
+            engine: *ConcaveEngine,
+            poll_ms: u64,
+            fn run(ctx: @This()) void {
+                while (!ctx.engine.stop_tailer.load(.acquire)) {
+                    _ = ctx.engine.pollScheduledJobs() catch {};
+                    ctx.engine.io.sleep(.fromMilliseconds(@intCast(ctx.poll_ms)), .awake) catch break;
+                }
+            }
+        };
+        return try std.Thread.spawn(.{}, Ctx.run, .{Ctx{ .engine = self, .poll_ms = poll_ms }});
     }
 
     /// Cross-instance commit_log poller (skips DB queries when no WebSocket clients are connected).
@@ -823,6 +1140,27 @@ pub const ConcaveEngine = struct {
     }
 };
 
+fn hasCronJobWithStatus(allocator: Allocator, tx: *tx_mod.TxContext, cron_name: []const u8, status: []const u8) !bool {
+    const start_key = try key_mod.encodeKey(allocator, &.{ .{ .str_val = cron_name }, .{ .str_val = status } });
+    defer allocator.free(start_key);
+    const end_key = try key_mod.encodePrefixUpperBound(allocator, &.{ .{ .str_val = cron_name }, .{ .str_val = status } });
+    defer allocator.free(end_key);
+    const docs = try tx.scanIndex(allocator, &.{
+        .namespace = "_system",
+        .table = "_scheduled_jobs",
+        .index_name = "by_cron",
+        .start = .{ .included = start_key },
+        .end = .{ .excluded = end_key },
+        .order = .asc,
+        .limit = 1,
+    });
+    defer {
+        for (docs) |*d| d.deinit(allocator);
+        allocator.free(docs);
+    }
+    return docs.len > 0;
+}
+
 const UpdateFrame = struct {
     sub_id: []u8,
     result: ExecResult,
@@ -885,7 +1223,6 @@ fn formatAuthError(allocator: Allocator, err_msg: []const u8) ![]u8 {
 }
 
 test "cross-instance commit_log tailer pushes surgical transitions to remote subscribers" {
-    const key_mod = @import("../core/key.zig");
     const WalStore = @import("../core/wal_store.zig").WalStore;
     const allocator = std.testing.allocator;
     const io = std.testing.io;

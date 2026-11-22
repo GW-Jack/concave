@@ -4,10 +4,17 @@
 Host := [Host].{
     db_get! : Str, Str, Str => Str
     db_query! : Str => Str
+    db_paginate! : Str => Str
+    db_search! : Str => Str
     db_insert! : Str, Str, Str => Str
     db_patch! : Str, Str, Str, Str => Str
     db_replace! : Str, Str, Str, Str => Str
     db_delete! : Str, Str, Str => Str
+    schedule_job! : I64, Str, Str => Str
+    cancel_job! : Str => Str
+    storage_upload_url! : () => Str
+    storage_get_url! : Str => Str
+    storage_delete! : Str => Str
     auth_identity! : () => Str
     http_fetch! : Str, Str, Str => Str
     run_query! : Str, Str => Str

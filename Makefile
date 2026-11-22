@@ -58,6 +58,7 @@ test-roc:
 	roc check platform/main.roc
 	roc check examples/chat-app/backend/main.roc
 	roc check tests/fixtures/analytics-app/main.roc
+	roc check tests/fixtures/platform-features-app/main.roc
 
 test-client:
 	node --test client/concave-client/test/*.test.mjs
@@ -65,6 +66,7 @@ test-client:
 test-e2e: host codegen-chat
 	node --test --test-timeout=15000 tests/e2e_chat_platform.mjs
 	node --test --test-timeout=20000 tests/e2e_analytics.mjs
+	node --test --test-timeout=25000 tests/e2e_platform_features.mjs
 
 test-ws: host
 	node --test --test-timeout=15000 tests/ws_conformance.mjs

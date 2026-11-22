@@ -280,6 +280,176 @@ pub const TxContext = struct {
         } });
     }
 
+    /// Transactional scheduler enqueue: inserts into `("_system", "_scheduled_jobs")` inside
+    /// THIS exact transaction so rolled-back mutations never fire orphan scheduled jobs.
+    pub fn scheduleJob(
+        self: *TxContext,
+        allocator: Allocator,
+        run_at_ms: i64,
+        fn_name: []const u8,
+        args_json: []const u8,
+        cron_name: ?[]const u8,
+    ) ![]u8 {
+        if (self.read_only) return storage_mod.StorageError.ReadOnly;
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        const w = &out.writer;
+        try w.writeAll("{\"status\":\"pending\",\"run_at_ms\":");
+        try w.print("{d}", .{run_at_ms});
+        try w.writeAll(",\"fn_name\":");
+        try storage_mod.writeJsonString(w, fn_name);
+        try w.writeAll(",\"args_json\":");
+        try storage_mod.writeJsonString(w, args_json);
+        if (cron_name) |cn| {
+            try w.writeAll(",\"cron_name\":");
+            try storage_mod.writeJsonString(w, cn);
+        }
+        try w.writeAll(",\"attempts\":0}");
+        return try self.insert(allocator, "_system", "_scheduled_jobs", out.written());
+    }
+
+    pub fn cancelJob(self: *TxContext, job_id: []const u8) !void {
+        if (self.read_only) return storage_mod.StorageError.ReadOnly;
+        try self.patch("_system", "_scheduled_jobs", job_id, "{\"status\":\"canceled\"}");
+    }
+
+    pub const PageResult = struct {
+        docs: []Document,
+        next_cursor: []u8,
+        is_done: bool,
+
+        pub fn deinit(self: *const PageResult, allocator: Allocator) void {
+            for (self.docs) |*d| d.deinit(allocator);
+            allocator.free(self.docs);
+            allocator.free(self.next_cursor);
+        }
+    };
+
+    /// Reactive cursor pagination over any indexed query (`cursor` is `""` for the first page,
+    /// or the previous page's `next_cursor` doc ID). Records the exact index range in `ReadSet`.
+    pub fn paginate(
+        self: *TxContext,
+        allocator: Allocator,
+        query: *const IndexQuery,
+        cursor: []const u8,
+        page_size: usize,
+    ) !PageResult {
+        const effective_size = if (page_size == 0) 1 else page_size;
+        var unbounded = query.*;
+        unbounded.limit = null;
+        const all_docs = try self.scanIndex(self.allocator, &unbounded);
+        defer {
+            for (all_docs) |*d| d.deinit(self.allocator);
+            self.allocator.free(all_docs);
+        }
+
+        var start_idx: usize = 0;
+        if (cursor.len > 0) {
+            var found = false;
+            for (all_docs, 0..) |*d, i| {
+                if (std.mem.eql(u8, d.id, cursor)) {
+                    start_idx = i + 1;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) start_idx = all_docs.len;
+        }
+
+        const remaining = if (start_idx < all_docs.len) all_docs.len - start_idx else 0;
+        const take_count = @min(effective_size, remaining);
+        const is_done = start_idx + take_count >= all_docs.len;
+
+        var page = try allocator.alloc(Document, take_count);
+        var built: usize = 0;
+        errdefer {
+            for (page[0..built]) |*d| d.deinit(allocator);
+            allocator.free(page);
+        }
+        for (all_docs[start_idx .. start_idx + take_count], 0..) |*d, i| {
+            page[i] = try d.clone(allocator);
+            built += 1;
+        }
+
+        const next_cursor = if (!is_done and take_count > 0)
+            try allocator.dupe(u8, page[take_count - 1].id)
+        else
+            try allocator.dupe(u8, "");
+
+        return .{
+            .docs = page,
+            .next_cursor = next_cursor,
+            .is_done = is_done,
+        };
+    }
+
+    /// Reactive case-insensitive multi-token full-text search over a table field.
+    /// Automatically respects RYOW and records the table's `ReadSet` for live WS invalidation.
+    pub fn search(
+        self: *TxContext,
+        allocator: Allocator,
+        ns: []const u8,
+        table: []const u8,
+        field: []const u8,
+        query_text: []const u8,
+        limit: usize,
+    ) ![]Document {
+        const all_docs = try self.scanIndex(self.allocator, &.{
+            .namespace = ns,
+            .table = table,
+            .index_name = "by_creation_time",
+            .start = .unbounded,
+            .end = .unbounded,
+            .order = .desc,
+            .limit = null,
+        });
+        defer {
+            for (all_docs) |*d| d.deinit(self.allocator);
+            self.allocator.free(all_docs);
+        }
+
+        var tokens: std.ArrayList([]const u8) = .empty;
+        defer tokens.deinit(self.allocator);
+        var tit = std.mem.tokenizeAny(u8, query_text, " \t\r\n");
+        while (tit.next()) |tok| {
+            try tokens.append(self.allocator, tok);
+        }
+
+        var matched: std.ArrayList(Document) = .empty;
+        errdefer {
+            for (matched.items) |*d| d.deinit(allocator);
+            matched.deinit(allocator);
+        }
+
+        const max_docs = if (limit == 0) 50 else limit;
+        for (all_docs) |*doc| {
+            if (matched.items.len >= max_docs) break;
+            if (tokens.items.len == 0) {
+                try matched.append(allocator, try doc.clone(allocator));
+                continue;
+            }
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), doc.body_json, .{}) catch continue;
+            if (parsed != .object) continue;
+            const fv = parsed.object.get(field) orelse continue;
+            if (fv != .string) continue;
+
+            var all_match = true;
+            for (tokens.items) |tok| {
+                if (!containsAsciiIgnoreCase(fv.string, tok)) {
+                    all_match = false;
+                    break;
+                }
+            }
+            if (all_match) {
+                try matched.append(allocator, try doc.clone(allocator));
+            }
+        }
+
+        return try matched.toOwnedSlice(allocator);
+    }
+
     fn putPending(self: *TxContext, ns: []const u8, table: []const u8, doc_id: []const u8, doc: ?Document) !void {
         const key = try makeKey(self.allocator, ns, table, doc_id);
         if (self.pending_docs.fetchRemove(key)) |old| {
@@ -292,4 +462,14 @@ pub const TxContext = struct {
 
 fn makeKey(allocator: Allocator, ns: []const u8, table: []const u8, doc_id: []const u8) ![]u8 {
     return try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}", .{ ns, table, doc_id });
+}
+
+fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
 }

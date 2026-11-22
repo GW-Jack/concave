@@ -801,6 +801,20 @@ pub const HostDb_queryArgs = extern struct {
     arg0: RocStr,
 };
 
+/// Arguments for Host.db_paginate!
+/// Roc signature: Str => Str
+/// Refcounted fields are owned by the hosted function.
+pub const HostDb_paginateArgs = extern struct {
+    arg0: RocStr,
+};
+
+/// Arguments for Host.db_search!
+/// Roc signature: Str => Str
+/// Refcounted fields are owned by the hosted function.
+pub const HostDb_searchArgs = extern struct {
+    arg0: RocStr,
+};
+
 /// Arguments for Host.db_insert!
 /// Roc signature: Str, Str, Str => Str
 /// Refcounted fields are owned by the hosted function.
@@ -837,6 +851,36 @@ pub const HostDb_deleteArgs = extern struct {
     arg0: RocStr,
     arg1: RocStr,
     arg2: RocStr,
+};
+
+/// Arguments for Host.schedule_job!
+/// Roc signature: I64, Str, Str => Str
+/// Refcounted fields are owned by the hosted function.
+pub const HostSchedule_jobArgs = extern struct {
+    arg0: i64,
+    arg1: RocStr,
+    arg2: RocStr,
+};
+
+/// Arguments for Host.cancel_job!
+/// Roc signature: Str => Str
+/// Refcounted fields are owned by the hosted function.
+pub const HostCancel_jobArgs = extern struct {
+    arg0: RocStr,
+};
+
+/// Arguments for Host.storage_get_url!
+/// Roc signature: Str => Str
+/// Refcounted fields are owned by the hosted function.
+pub const HostStorage_get_urlArgs = extern struct {
+    arg0: RocStr,
+};
+
+/// Arguments for Host.storage_delete!
+/// Roc signature: Str => Str
+/// Refcounted fields are owned by the hosted function.
+pub const HostStorage_deleteArgs = extern struct {
+    arg0: RocStr,
 };
 
 /// Arguments for Host.http_fetch!
@@ -911,6 +955,22 @@ pub extern fn roc_host_db_get(arg0: RocStr, arg1: RocStr, arg2: RocStr) callconv
 /// The result is owned by Roc: return exactly one owned reference.
 pub extern fn roc_host_db_query(arg0: RocStr) callconv(.c) RocStr;
 
+/// Hosted symbol for Host.db_paginate!
+/// Roc signature: Str => Str
+/// Owned arguments. Release each exactly once before returning, unless it is
+/// moved into storage or into the result:
+///     arg0.decref(roc_host);
+/// The result is owned by Roc: return exactly one owned reference.
+pub extern fn roc_host_db_paginate(arg0: RocStr) callconv(.c) RocStr;
+
+/// Hosted symbol for Host.db_search!
+/// Roc signature: Str => Str
+/// Owned arguments. Release each exactly once before returning, unless it is
+/// moved into storage or into the result:
+///     arg0.decref(roc_host);
+/// The result is owned by Roc: return exactly one owned reference.
+pub extern fn roc_host_db_search(arg0: RocStr) callconv(.c) RocStr;
+
 /// Hosted symbol for Host.db_insert!
 /// Roc signature: Str, Str, Str => Str
 /// Owned arguments. Release each exactly once before returning, unless it is
@@ -952,6 +1012,44 @@ pub extern fn roc_host_db_replace(arg0: RocStr, arg1: RocStr, arg2: RocStr, arg3
 ///     arg2.decref(roc_host);
 /// The result is owned by Roc: return exactly one owned reference.
 pub extern fn roc_host_db_delete(arg0: RocStr, arg1: RocStr, arg2: RocStr) callconv(.c) RocStr;
+
+/// Hosted symbol for Host.schedule_job!
+/// Roc signature: I64, Str, Str => Str
+/// Owned arguments. Release each exactly once before returning, unless it is
+/// moved into storage or into the result:
+///     arg1.decref(roc_host);
+///     arg2.decref(roc_host);
+/// The result is owned by Roc: return exactly one owned reference.
+pub extern fn roc_host_schedule_job(arg0: i64, arg1: RocStr, arg2: RocStr) callconv(.c) RocStr;
+
+/// Hosted symbol for Host.cancel_job!
+/// Roc signature: Str => Str
+/// Owned arguments. Release each exactly once before returning, unless it is
+/// moved into storage or into the result:
+///     arg0.decref(roc_host);
+/// The result is owned by Roc: return exactly one owned reference.
+pub extern fn roc_host_cancel_job(arg0: RocStr) callconv(.c) RocStr;
+
+/// Hosted symbol for Host.storage_upload_url!
+/// Roc signature: {} => Str
+/// The result is owned by Roc: return exactly one owned reference.
+pub extern fn roc_host_storage_upload_url() callconv(.c) RocStr;
+
+/// Hosted symbol for Host.storage_get_url!
+/// Roc signature: Str => Str
+/// Owned arguments. Release each exactly once before returning, unless it is
+/// moved into storage or into the result:
+///     arg0.decref(roc_host);
+/// The result is owned by Roc: return exactly one owned reference.
+pub extern fn roc_host_storage_get_url(arg0: RocStr) callconv(.c) RocStr;
+
+/// Hosted symbol for Host.storage_delete!
+/// Roc signature: Str => Str
+/// Owned arguments. Release each exactly once before returning, unless it is
+/// moved into storage or into the result:
+///     arg0.decref(roc_host);
+/// The result is owned by Roc: return exactly one owned reference.
+pub extern fn roc_host_storage_delete(arg0: RocStr) callconv(.c) RocStr;
 
 /// Hosted symbol for Host.auth_identity!
 /// Roc signature: {} => Str
@@ -1141,4 +1239,7 @@ pub extern fn roc_dispatch_mutation(arg0: RocStr, arg1: RocStr) callconv(.c) Roc
 
 /// Entrypoint: dispatch_action_for_host!
 pub extern fn roc_dispatch_action(arg0: RocStr, arg1: RocStr) callconv(.c) RocStr;
+
+/// Entrypoint: dispatch_http_for_host!
+pub extern fn roc_dispatch_http(arg0: RocStr, arg1: RocStr, arg2: RocStr) callconv(.c) RocStr;
 

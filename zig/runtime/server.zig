@@ -64,6 +64,8 @@ pub fn serve(
 pub const HttpRequest = struct {
     method: []u8,
     path: []u8,
+    query: []u8,
+    content_type: ?[]u8 = null,
     authorization: ?[]u8 = null,
     upgrade_ws: bool = false,
     ws_key: ?[]u8 = null,
@@ -72,6 +74,8 @@ pub const HttpRequest = struct {
     pub fn deinit(self: *const HttpRequest, allocator: Allocator) void {
         allocator.free(self.method);
         allocator.free(self.path);
+        allocator.free(self.query);
+        if (self.content_type) |ct| allocator.free(ct);
         if (self.authorization) |a| allocator.free(a);
         if (self.ws_key) |k| allocator.free(k);
         allocator.free(self.body);
@@ -99,8 +103,11 @@ pub fn readHttpRequest(allocator: Allocator, reader: *std.Io.Reader) !?HttpReque
     const method_raw = req_parts.next() orelse return null;
     const target_raw = req_parts.next() orelse return null;
     const path_raw = if (std.mem.indexOfScalar(u8, target_raw, '?')) |qi| target_raw[0..qi] else target_raw;
+    const query_raw = if (std.mem.indexOfScalar(u8, target_raw, '?')) |qi| target_raw[qi + 1 ..] else "";
 
     var content_length: usize = 0;
+    var content_type: ?[]u8 = null;
+    errdefer if (content_type) |ct| allocator.free(ct);
     var auth_header: ?[]u8 = null;
     errdefer if (auth_header) |a| allocator.free(a);
     var upgrade_ws = false;
@@ -114,6 +121,9 @@ pub fn readHttpRequest(allocator: Allocator, reader: *std.Io.Reader) !?HttpReque
 
         if (std.ascii.eqlIgnoreCase(hname, "Content-Length")) {
             content_length = std.fmt.parseInt(usize, hval, 10) catch 0;
+        } else if (std.ascii.eqlIgnoreCase(hname, "Content-Type")) {
+            if (content_type) |old| allocator.free(old);
+            content_type = try allocator.dupe(u8, hval);
         } else if (std.ascii.eqlIgnoreCase(hname, "Authorization")) {
             if (auth_header) |old| allocator.free(old);
             auth_header = try allocator.dupe(u8, hval);
@@ -135,6 +145,8 @@ pub fn readHttpRequest(allocator: Allocator, reader: *std.Io.Reader) !?HttpReque
     return .{
         .method = try allocator.dupe(u8, method_raw),
         .path = try allocator.dupe(u8, path_raw),
+        .query = try allocator.dupe(u8, query_raw),
+        .content_type = content_type,
         .authorization = auth_header,
         .upgrade_ws = upgrade_ws,
         .ws_key = ws_key,
@@ -276,6 +288,126 @@ fn handleConnection(
         }
     }
 
+    // Built-in local blob storage upload & download endpoints (`/_storage/...`)
+    if (std.mem.startsWith(u8, req.path, "/_storage/upload/") and
+        (std.mem.eql(u8, req.method, "POST") or std.mem.eql(u8, req.method, "PUT")))
+    {
+        const bs = engine.blob_store orelse {
+            writeHttpResponse(io, stream, 503, "Service Unavailable", "application/json", "{\"error\":\"storage not configured\"}");
+            return;
+        };
+        const token = req.path["/_storage/upload/".len..];
+        const storage_id = bs.verifyUploadToken(allocator, token) catch {
+            writeHttpResponse(io, stream, 403, "Forbidden", "application/json", "{\"error\":\"invalid or expired upload token\"}");
+            return;
+        };
+        defer allocator.free(storage_id);
+        const ct = req.content_type orelse "application/octet-stream";
+        bs.putLocalBlob(storage_id, ct, req.body) catch {
+            writeHttpResponse(io, stream, 500, "Internal Server Error", "application/json", "{\"error\":\"failed to store blob\"}");
+            return;
+        };
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        out.writer.writeAll("{\"storage_id\":") catch return;
+        storage_mod.writeJsonString(&out.writer, storage_id) catch return;
+        out.writer.writeByte('}') catch return;
+        writeHttpResponse(io, stream, 200, "OK", "application/json", out.written());
+        return;
+    }
+
+    if (std.mem.eql(u8, req.method, "GET") and std.mem.startsWith(u8, req.path, "/_storage/")) {
+        const bs = engine.blob_store orelse {
+            writeHttpResponse(io, stream, 503, "Service Unavailable", "text/plain", "storage not configured");
+            return;
+        };
+        const storage_id = req.path["/_storage/".len..];
+        const blob = bs.getLocalBlob(allocator, storage_id) catch {
+            writeHttpResponse(io, stream, 404, "Not Found", "text/plain", "blob not found");
+            return;
+        };
+        defer blob.deinit(allocator);
+        writeHttpResponse(io, stream, 200, "OK", blob.content_type, blob.bytes);
+        return;
+    }
+
+    // Custom application HTTP routes / webhooks (`App.http_route`)
+    if (engine.manifest.matchHttpRoute(req.method, req.path) != null) {
+        var auth_id: ?auth_mod.AuthIdentity = null;
+        defer if (auth_id) |*a| a.deinit(allocator);
+        if (req.authorization) |raw_auth| {
+            auth_id = engine.verifyAuthToken(allocator, raw_auth) catch {
+                writeHttpResponse(io, stream, 401, "Unauthorized", "application/json", "{\"error\":\"unauthorized\"}");
+                return;
+            };
+        }
+
+        var req_out: std.Io.Writer.Allocating = .init(allocator);
+        defer req_out.deinit();
+        const rw = &req_out.writer;
+        rw.writeAll("{\"method\":") catch return;
+        storage_mod.writeJsonString(rw, req.method) catch return;
+        rw.writeAll(",\"path\":") catch return;
+        storage_mod.writeJsonString(rw, req.path) catch return;
+        rw.writeAll(",\"query\":") catch return;
+        storage_mod.writeJsonString(rw, req.query) catch return;
+        rw.writeAll(",\"body\":") catch return;
+        storage_mod.writeJsonString(rw, req.body) catch return;
+        rw.writeAll(",\"content_type\":") catch return;
+        storage_mod.writeJsonString(rw, req.content_type orelse "") catch return;
+        rw.writeByte('}') catch return;
+
+        const res = engine.executeHttpRoute(
+            allocator,
+            req.method,
+            req.path,
+            req_out.written(),
+            if (auth_id) |*a| a else null,
+        ) catch {
+            writeHttpResponse(io, stream, 500, "Internal Server Error", "application/json", "{\"error\":\"internal error\"}");
+            return;
+        };
+        defer res.deinit(allocator);
+
+        switch (res) {
+            .ok => |val| {
+                var arena = std.heap.ArenaAllocator.init(allocator);
+                defer arena.deinit();
+                const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), val, .{}) catch {
+                    writeHttpResponse(io, stream, 200, "OK", "application/json", val);
+                    return;
+                };
+                if (parsed == .object) {
+                    const status: u16 = if (parsed.object.get("status")) |sv|
+                        (if (sv == .integer and sv.integer >= 100 and sv.integer <= 599) @intCast(sv.integer) else 200)
+                    else
+                        200;
+                    const ct = if (parsed.object.get("content_type")) |cv|
+                        (if (cv == .string and cv.string.len > 0) cv.string else "application/json")
+                    else
+                        "application/json";
+                    const resp_body = if (parsed.object.get("body")) |bv|
+                        (if (bv == .string) bv.string else "")
+                    else
+                        "";
+                    writeHttpResponse(io, stream, status, httpStatusReason(status), ct, resp_body);
+                    return;
+                }
+                writeHttpResponse(io, stream, 200, "OK", "application/json", val);
+                return;
+            },
+            .err => |msg| {
+                var eout: std.Io.Writer.Allocating = .init(allocator);
+                defer eout.deinit();
+                eout.writer.writeAll("{\"error\":") catch return;
+                storage_mod.writeJsonString(&eout.writer, msg) catch return;
+                eout.writer.writeByte('}') catch return;
+                writeHttpResponse(io, stream, 500, "Internal Server Error", "application/json", eout.written());
+                return;
+            },
+        }
+    }
+
     // Static frontend serving from `--static-dir`
     if (std.mem.eql(u8, req.method, "GET")) {
         if (static_dir) |root| {
@@ -392,7 +524,7 @@ fn writeHttpResponse(
             "Content-Length: {d}\r\n" ++
             "Access-Control-Allow-Origin: *\r\n" ++
             "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n" ++
+            "Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n" ++
             "Connection: close\r\n\r\n",
         .{ status, reason, content_type, body.len },
     ) catch return;
@@ -539,6 +671,27 @@ fn handleWsText(
         defer allocator.free(pong);
         sender.sendText(pong) catch {};
     }
+}
+
+fn httpStatusReason(status: u16) []const u8 {
+    return switch (status) {
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        else => "OK",
+    };
 }
 
 fn jsonStringField(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {

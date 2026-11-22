@@ -5,6 +5,8 @@ comptime {
     _ = @import("core/storage.zig");
     _ = @import("core/wal_store.zig");
     _ = @import("core/pg_wire.zig");
+    _ = @import("core/sigv4.zig");
+    _ = @import("core/blob_store.zig");
     _ = @import("codegen/codegen.zig");
     _ = @import("runtime/auth.zig");
     _ = @import("runtime/ws.zig");

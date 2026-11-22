@@ -19,11 +19,32 @@ Ctx := [Ctx].{
         body : Str,
     }
 
+    ## Transactional job scheduler (committed atomically with the enclosing mutation).
+    Scheduler : {
+        run_after! : I64, Str, Str => Try(Str, Str),
+        run_at! : I64, Str, Str => Try(Str, Str),
+        cancel! : Str => Try({}, Str),
+    }
+
+    ## Read-only blob storage capability (available in Queries).
+    StorageReader : {
+        get_url! : Str => Try(Str, Str),
+    }
+
+    ## Full blob storage capability (available in Mutations and Actions).
+    StorageWriter : {
+        generate_upload_url! : () => Try(Str, Str),
+        get_url! : Str => Try(Str, Str),
+        delete! : Str => Try({}, Str),
+    }
+
     ## Read-only database capability (scoped to a single component namespace, "" for root app).
     DbReader : {
         namespace : Str,
         get_raw! : Str, Str, Str => Try(Str, Str),
         query_raw! : Str => Try(Str, Str),
+        paginate_raw! : Str => Try(Str, Str),
+        search_raw! : Str => Try(Str, Str),
     }
 
     ## Read + write transactional database capability (scoped to a single component namespace).
@@ -31,6 +52,8 @@ Ctx := [Ctx].{
         namespace : Str,
         get_raw! : Str, Str, Str => Try(Str, Str),
         query_raw! : Str => Try(Str, Str),
+        paginate_raw! : Str => Try(Str, Str),
+        search_raw! : Str => Try(Str, Str),
         insert_raw! : Str, Str, Str => Try(Str, Str),
         patch_raw! : Str, Str, Str, Str => Try({}, Str),
         replace_raw! : Str, Str, Str, Str => Try({}, Str),
@@ -40,6 +63,7 @@ Ctx := [Ctx].{
     ## Context passed to reactive read-only Queries.
     QueryCtx : {
         db : DbReader,
+        storage : StorageReader,
         auth! : () => Try(AuthIdentity, [Unauthenticated]),
         now_ms! : () => I64,
     }
@@ -47,12 +71,15 @@ Ctx := [Ctx].{
     ## Context passed to ACID transactional Mutations.
     MutationCtx : {
         db : DbWriter,
+        scheduler : Scheduler,
+        storage : StorageWriter,
         auth! : () => Try(AuthIdentity, [Unauthenticated]),
         now_ms! : () => I64,
     }
 
     ## Context passed to non-deterministic external Actions.
     ActionCtx : {
+        storage : StorageWriter,
         auth! : () => Try(AuthIdentity, [Unauthenticated]),
         now_ms! : () => I64,
         http_fetch! : HttpRequest => Try(HttpResponse, Str),
@@ -66,12 +93,15 @@ Ctx := [Ctx].{
         namespace: w.namespace,
         get_raw!: w.get_raw!,
         query_raw!: w.query_raw!,
+        paginate_raw!: w.paginate_raw!,
+        search_raw!: w.search_raw!,
     }
 
     ## Derive a `QueryCtx` from a `MutationCtx` (enabling mutations to call read-only query helpers).
     as_query_ctx : MutationCtx -> QueryCtx
     as_query_ctx = |m| {
         db: as_reader(m.db),
+        storage: { get_url!: m.storage.get_url! },
         auth!: m.auth!,
         now_ms!: m.now_ms!,
     }
@@ -83,7 +113,10 @@ Ctx := [Ctx].{
             namespace,
             get_raw!: ctx.db.get_raw!,
             query_raw!: ctx.db.query_raw!,
+            paginate_raw!: ctx.db.paginate_raw!,
+            search_raw!: ctx.db.search_raw!,
         },
+        storage: ctx.storage,
         auth!: ctx.auth!,
         now_ms!: ctx.now_ms!,
     }
@@ -95,11 +128,15 @@ Ctx := [Ctx].{
             namespace,
             get_raw!: ctx.db.get_raw!,
             query_raw!: ctx.db.query_raw!,
+            paginate_raw!: ctx.db.paginate_raw!,
+            search_raw!: ctx.db.search_raw!,
             insert_raw!: ctx.db.insert_raw!,
             patch_raw!: ctx.db.patch_raw!,
             replace_raw!: ctx.db.replace_raw!,
             delete_raw!: ctx.db.delete_raw!,
         },
+        scheduler: ctx.scheduler,
+        storage: ctx.storage,
         auth!: ctx.auth!,
         now_ms!: ctx.now_ms!,
     }

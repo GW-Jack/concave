@@ -5,6 +5,8 @@ const key_mod = @import("../core/key.zig");
 const manifest_mod = @import("../core/manifest.zig");
 const readset_mod = @import("../core/readset.zig");
 const storage_mod = @import("../core/storage.zig");
+const BlobStore = @import("../core/blob_store.zig").BlobStore;
+const S3Config = @import("../core/sigv4.zig").S3Config;
 const WalStore = @import("../core/wal_store.zig").WalStore;
 const PgStore = @import("../core/pg_wire.zig").PgStore;
 const auth_mod = @import("../runtime/auth.zig");
@@ -220,6 +222,113 @@ export fn roc_host_db_query(req_raw: RocStr) callconv(.c) RocStr {
     return wireOk(out.written());
 }
 
+export fn roc_host_db_paginate(req_raw: RocStr) callconv(.c) RocStr {
+    const req_json = takeRocStr(g_alloc, req_raw) catch return wireErr("oom");
+    defer g_alloc.free(req_json);
+
+    const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
+
+    var arena = std.heap.ArenaAllocator.init(g_alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, req_json, .{}) catch
+        return wireErr("invalid paginate JSON");
+    if (parsed != .object) return wireErr("invalid paginate JSON object");
+    const obj = parsed.object;
+
+    const ns_v = obj.get("namespace") orelse return wireErr("missing namespace");
+    const table_v = obj.get("table") orelse return wireErr("missing table");
+    const index_v = obj.get("index_name") orelse return wireErr("missing index_name");
+    if (ns_v != .string or table_v != .string or index_v != .string) return wireErr("invalid string field");
+    const start = parseWireBound(a, obj.get("start") orelse return wireErr("missing start")) catch
+        return wireErr("invalid start bound");
+    const end = parseWireBound(a, obj.get("end") orelse return wireErr("missing end")) catch
+        return wireErr("invalid end bound");
+
+    var order: storage_mod.QueryOrder = .asc;
+    if (obj.get("order")) |ov| {
+        if (ov == .string and std.mem.eql(u8, ov.string, "desc")) order = .desc;
+    }
+    const cursor: []const u8 = if (obj.get("cursor")) |cv| (if (cv == .string) cv.string else "") else "";
+    const page_size: usize = if (obj.get("page_size")) |pv|
+        (if (pv == .integer and pv.integer > 0) @intCast(pv.integer) else 25)
+    else
+        25;
+
+    const page_res = env.dbPaginate(g_alloc, &.{
+        .namespace = ns_v.string,
+        .table = table_v.string,
+        .index_name = index_v.string,
+        .start = start,
+        .end = end,
+        .order = order,
+        .limit = null,
+    }, cursor, page_size) catch |err| return wireErr(@errorName(err));
+    defer page_res.deinit(g_alloc);
+
+    var out: std.Io.Writer.Allocating = .init(g_alloc);
+    defer out.deinit();
+    out.writer.writeAll("{\"page\":[") catch return wireErr("oom");
+    for (page_res.docs, 0..) |*d, i| {
+        if (i > 0) out.writer.writeByte(',') catch return wireErr("oom");
+        const wj = d.toWireJson(g_alloc) catch return wireErr("oom");
+        defer g_alloc.free(wj);
+        out.writer.writeAll(wj) catch return wireErr("oom");
+    }
+    out.writer.writeAll("],\"next_cursor\":") catch return wireErr("oom");
+    storage_mod.writeJsonString(&out.writer, page_res.next_cursor) catch return wireErr("oom");
+    out.writer.print(",\"is_done\":{s}}}", .{if (page_res.is_done) "true" else "false"}) catch return wireErr("oom");
+    return wireOk(out.written());
+}
+
+export fn roc_host_db_search(req_raw: RocStr) callconv(.c) RocStr {
+    const req_json = takeRocStr(g_alloc, req_raw) catch return wireErr("oom");
+    defer g_alloc.free(req_json);
+
+    const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
+
+    var arena = std.heap.ArenaAllocator.init(g_alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, req_json, .{}) catch
+        return wireErr("invalid search JSON");
+    if (parsed != .object) return wireErr("invalid search JSON object");
+    const obj = parsed.object;
+
+    const ns_v = obj.get("namespace") orelse return wireErr("missing namespace");
+    const table_v = obj.get("table") orelse return wireErr("missing table");
+    const field_v = obj.get("field") orelse return wireErr("missing field");
+    const query_v = obj.get("query") orelse return wireErr("missing query");
+    if (ns_v != .string or table_v != .string or field_v != .string or query_v != .string) {
+        return wireErr("invalid search string field");
+    }
+    const limit: usize = if (obj.get("limit")) |lv|
+        (if (lv == .integer and lv.integer > 0) @intCast(lv.integer) else 50)
+    else
+        50;
+
+    const docs = env.dbSearch(g_alloc, ns_v.string, table_v.string, field_v.string, query_v.string, limit) catch |err|
+        return wireErr(@errorName(err));
+    defer {
+        for (docs) |*d| d.deinit(g_alloc);
+        g_alloc.free(docs);
+    }
+
+    var out: std.Io.Writer.Allocating = .init(g_alloc);
+    defer out.deinit();
+    out.writer.writeByte('[') catch return wireErr("oom");
+    for (docs, 0..) |*d, i| {
+        if (i > 0) out.writer.writeByte(',') catch return wireErr("oom");
+        const wj = d.toWireJson(g_alloc) catch return wireErr("oom");
+        defer g_alloc.free(wj);
+        out.writer.writeAll(wj) catch return wireErr("oom");
+    }
+    out.writer.writeByte(']') catch return wireErr("oom");
+    return wireOk(out.written());
+}
+
 export fn roc_host_db_insert(ns_raw: RocStr, table_raw: RocStr, body_raw: RocStr) callconv(.c) RocStr {
     const ns = takeRocStr(g_alloc, ns_raw) catch return wireErr("oom");
     defer g_alloc.free(ns);
@@ -274,6 +383,53 @@ export fn roc_host_db_delete(ns_raw: RocStr, table_raw: RocStr, id_raw: RocStr) 
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
     env.dbDelete(ns, table, doc_id) catch |err| return wireErr(@errorName(err));
+    return wireOk("ok");
+}
+
+export fn roc_host_schedule_job(run_at_ms: i64, fn_raw: RocStr, args_raw: RocStr) callconv(.c) RocStr {
+    const fn_name = takeRocStr(g_alloc, fn_raw) catch return wireErr("oom");
+    defer g_alloc.free(fn_name);
+    const args_json = takeRocStr(g_alloc, args_raw) catch return wireErr("oom");
+    defer g_alloc.free(args_json);
+
+    const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
+    const job_id = env.scheduleJob(g_alloc, run_at_ms, fn_name, args_json) catch |err| return wireErr(@errorName(err));
+    defer g_alloc.free(job_id);
+    return wireOk(job_id);
+}
+
+export fn roc_host_cancel_job(id_raw: RocStr) callconv(.c) RocStr {
+    const job_id = takeRocStr(g_alloc, id_raw) catch return wireErr("oom");
+    defer g_alloc.free(job_id);
+
+    const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
+    env.cancelJob(job_id) catch |err| return wireErr(@errorName(err));
+    return wireOk("ok");
+}
+
+export fn roc_host_storage_upload_url() callconv(.c) RocStr {
+    const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
+    const url = env.storageUploadUrl(g_alloc) catch |err| return wireErr(@errorName(err));
+    defer g_alloc.free(url);
+    return wireOk(url);
+}
+
+export fn roc_host_storage_get_url(id_raw: RocStr) callconv(.c) RocStr {
+    const storage_id = takeRocStr(g_alloc, id_raw) catch return wireErr("oom");
+    defer g_alloc.free(storage_id);
+
+    const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
+    const url = env.storageGetUrl(g_alloc, storage_id) catch |err| return wireErr(@errorName(err));
+    defer g_alloc.free(url);
+    return wireOk(url);
+}
+
+export fn roc_host_storage_delete(id_raw: RocStr) callconv(.c) RocStr {
+    const storage_id = takeRocStr(g_alloc, id_raw) catch return wireErr("oom");
+    defer g_alloc.free(storage_id);
+
+    const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
+    env.storageDelete(storage_id) catch |err| return wireErr(@errorName(err));
     return wireOk("ok");
 }
 
@@ -456,11 +612,40 @@ const RocAppExecutor = struct {
         return dispatch(.action, allocator, name, args_json, env);
     }
 
+    fn runHttpRoute(_: *anyopaque, allocator: Allocator, method: []const u8, path: []const u8, req_json: []const u8, env: *engine_mod.ExecutionEnv) engine_mod.ExecResult {
+        const io = getIo();
+        if (t_roc_lock_depth == 0) {
+            g_roc_mutex.lockUncancelable(io);
+        }
+        t_roc_lock_depth += 1;
+        defer {
+            t_roc_lock_depth -= 1;
+            if (t_roc_lock_depth == 0) {
+                g_roc_mutex.unlock(io);
+            }
+        }
+
+        if (t_env_depth >= t_env_stack.len) {
+            return .{ .err = allocator.dupe(u8, "max re-entrant Roc call depth exceeded") catch &.{} };
+        }
+        t_env_stack[t_env_depth] = env;
+        t_env_depth += 1;
+        defer t_env_depth -= 1;
+
+        const roc_method = RocStr.fromSlice(method, &g_roc_host);
+        const roc_path = RocStr.fromSlice(path, &g_roc_host);
+        const roc_req = RocStr.fromSlice(req_json, &g_roc_host);
+        const raw_res = abi.roc_dispatch_http(roc_method, roc_path, roc_req);
+        defer raw_res.decref(&g_roc_host);
+        return unwrapRocWire(allocator, raw_res.asSlice());
+    }
+
     const vtable = engine_mod.AppExecutor.VTable{
         .manifest = &getManifest,
         .executeQuery = &runQuery,
         .executeMutation = &runMutation,
         .executeAction = &runAction,
+        .executeHttpRoute = &runHttpRoute,
     };
 
     fn asExecutor(self: *RocAppExecutor) engine_mod.AppExecutor {
@@ -622,9 +807,44 @@ fn runServer(
     });
     defer engine.deinit();
 
+    // Configure built-in local / S3-SigV4 blob storage.
+    const storage_dir = getEnvSlice("CONCAVE_STORAGE_DIR") orelse ".concave/storage";
+    const default_host = if (std.mem.eql(u8, host, "0.0.0.0")) "127.0.0.1" else host;
+    const default_base_url = try std.fmt.allocPrint(g_alloc, "http://{s}:{d}", .{ default_host, port });
+    defer g_alloc.free(default_base_url);
+    const public_url = getEnvSlice("CONCAVE_PUBLIC_URL") orelse default_base_url;
+
+    const s3_opt: ?S3Config = blk: {
+        const ep = getEnvSlice("CONCAVE_S3_ENDPOINT") orelse break :blk null;
+        const bucket = getEnvSlice("CONCAVE_S3_BUCKET") orelse break :blk null;
+        const ak = getEnvSlice("CONCAVE_S3_ACCESS_KEY") orelse break :blk null;
+        const sk = getEnvSlice("CONCAVE_S3_SECRET_KEY") orelse break :blk null;
+        const region = getEnvSlice("CONCAVE_S3_REGION") orelse "auto";
+        break :blk .{
+            .endpoint = ep,
+            .bucket = bucket,
+            .region = region,
+            .access_key = ak,
+            .secret_key = sk,
+        };
+    };
+
+    const blob_store = try BlobStore.init(g_alloc, io, storage_dir, public_url, s3_opt);
+    defer blob_store.deinit();
+    engine.blob_store = blob_store;
+
     if (commit_poll_ms > 0) {
         const tailer = try engine.spawnCommitTailer(commit_poll_ms);
         tailer.detach();
+    }
+
+    const sched_poll_ms: u64 = if (getEnvSlice("CONCAVE_SCHEDULER_POLL_MS")) |s|
+        std.fmt.parseInt(u64, s, 10) catch 200
+    else
+        200;
+    if (sched_poll_ms > 0) {
+        const sched_worker = try engine.spawnSchedulerWorker(sched_poll_ms);
+        sched_worker.detach();
     }
 
     try server_mod.serve(g_alloc, io, engine, .{

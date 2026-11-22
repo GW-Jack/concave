@@ -75,6 +75,35 @@ pub const FunctionSpec = struct {
     returns_schema: SchemaType,
 };
 
+pub const CronSpec = struct {
+    name: []const u8,
+    interval_ms: i64,
+    fn_name: []const u8,
+    args_json: []const u8,
+};
+
+pub const HttpRouteSpec = struct {
+    method: []const u8,
+    path: []const u8,
+};
+
+const system_sched_idx_status_fields = [_][]const u8{ "status", "run_at_ms" };
+const system_sched_idx_cron_fields = [_][]const u8{ "cron_name", "status" };
+const system_sched_indexes = [_]IndexSpec{
+    .{ .name = "by_status_run_at", .fields = &system_sched_idx_status_fields },
+    .{ .name = "by_cron", .fields = &system_sched_idx_cron_fields },
+};
+const system_scheduled_jobs_table = TableSpec{
+    .name = "_scheduled_jobs",
+    .document_schema = .any_t,
+    .indexes = &system_sched_indexes,
+};
+const system_storage_table = TableSpec{
+    .name = "_storage",
+    .document_schema = .any_t,
+    .indexes = &.{},
+};
+
 pub const AppManifest = struct {
     arena: std.heap.ArenaAllocator,
     raw_json: []const u8,
@@ -82,6 +111,8 @@ pub const AppManifest = struct {
     tables: []const TableSpec,
     components: []const ComponentSpec,
     functions: []const FunctionSpec,
+    crons: []const CronSpec = &.{},
+    http_routes: []const HttpRouteSpec = &.{},
 
     pub fn deinit(self: *AppManifest) void {
         self.arena.deinit();
@@ -126,6 +157,44 @@ pub const AppManifest = struct {
             }
         }
 
+        var crons: std.ArrayList(CronSpec) = .empty;
+        if (obj.get("crons")) |crv| {
+            if (crv == .array) {
+                for (crv.array.items) |item| {
+                    if (item != .object) continue;
+                    const cname = getOptionalStr(item.object, "name");
+                    const fn_name = getOptionalStr(item.object, "fn_name");
+                    const args_json = if (item.object.get("args_json")) |av| (if (av == .string) av.string else "{}") else "{}";
+                    const iv_ms: i64 = if (item.object.get("interval_ms")) |iv| (if (iv == .integer) iv.integer else 0) else 0;
+                    if (cname.len > 0 and fn_name.len > 0 and iv_ms > 0) {
+                        try crons.append(alloc, .{
+                            .name = cname,
+                            .interval_ms = iv_ms,
+                            .fn_name = fn_name,
+                            .args_json = args_json,
+                        });
+                    }
+                }
+            }
+        }
+
+        var http_routes: std.ArrayList(HttpRouteSpec) = .empty;
+        if (obj.get("http_routes")) |hrv| {
+            if (hrv == .array) {
+                for (hrv.array.items) |item| {
+                    if (item != .object) continue;
+                    const method = getOptionalStr(item.object, "method");
+                    const route_path = getOptionalStr(item.object, "path");
+                    if (method.len > 0 and route_path.len > 0) {
+                        try http_routes.append(alloc, .{
+                            .method = method,
+                            .path = route_path,
+                        });
+                    }
+                }
+            }
+        }
+
         return .{
             .arena = arena,
             .raw_json = raw_copy,
@@ -133,10 +202,17 @@ pub const AppManifest = struct {
             .tables = try tables.toOwnedSlice(alloc),
             .components = try components.toOwnedSlice(alloc),
             .functions = try functions.toOwnedSlice(alloc),
+            .crons = try crons.toOwnedSlice(alloc),
+            .http_routes = try http_routes.toOwnedSlice(alloc),
         };
     }
 
     pub fn findTable(self: *const AppManifest, namespace: []const u8, table_name: []const u8) ?*const TableSpec {
+        if (std.mem.eql(u8, namespace, "_system")) {
+            if (std.mem.eql(u8, table_name, "_scheduled_jobs")) return &system_scheduled_jobs_table;
+            if (std.mem.eql(u8, table_name, "_storage")) return &system_storage_table;
+            return null;
+        }
         if (namespace.len == 0) {
             for (self.tables) |*t| {
                 if (std.mem.eql(u8, t.name, table_name)) return t;
@@ -148,6 +224,27 @@ pub const AppManifest = struct {
                 for (c.tables) |*t| {
                     if (std.mem.eql(u8, t.name, table_name)) return t;
                 }
+            }
+        }
+        return null;
+    }
+
+    pub fn findFunction(self: *const AppManifest, name: []const u8) ?*const FunctionSpec {
+        for (self.functions) |*f| {
+            if (std.mem.eql(u8, f.name, name)) return f;
+        }
+        return null;
+    }
+
+    pub fn matchHttpRoute(self: *const AppManifest, method: []const u8, req_path: []const u8) ?*const HttpRouteSpec {
+        for (self.http_routes) |*r| {
+            const method_ok = std.mem.eql(u8, r.method, "*") or std.ascii.eqlIgnoreCase(r.method, method);
+            if (!method_ok) continue;
+            if (std.mem.endsWith(u8, r.path, "*")) {
+                const prefix = r.path[0 .. r.path.len - 1];
+                if (std.mem.startsWith(u8, req_path, prefix)) return r;
+            } else if (std.mem.eql(u8, r.path, req_path)) {
+                return r;
             }
         }
         return null;

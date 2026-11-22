@@ -203,6 +203,13 @@ Db := [Db].{
         }
     }
 
+    ## Result of a reactive cursor-paginated query.
+    Page(doc) : {
+        page : List(doc),
+        next_cursor : Str,
+        is_done : Bool,
+    }
+
     ## Execute the query with `limit = 1` and return `Found(doc)` or `NotFound`.
     first! : QueryBuilder(doc), Ctx.DbReader => Try([Found(doc), NotFound], Str)
         where [doc.Json.Parseable([InvalidJson(Str)])]
@@ -211,6 +218,34 @@ Db := [Db].{
         match List.first(docs) {
             Ok(d) => Ok(Found(d))
             Err(_) => Ok(NotFound)
+        }
+    }
+
+    ## Reactive cursor pagination over any indexed query (`cursor == ""` starts from the beginning).
+    paginate! : QueryBuilder(doc), Ctx.DbReader, Str, U64 => Try(Page(doc), Str)
+        where [doc.Json.Parseable([InvalidJson(Str)])]
+    paginate! = |q, db, cursor, page_size| {
+        req_json =
+            "{\"namespace\":${Json.to_str(db.namespace)},\"table\":${Json.to_str(q.table_name)},\"index_name\":${Json.to_str(q.index_name)},\"start\":${Key.bound_to_json(q.start)},\"end\":${Key.bound_to_json(q.end)},\"order\":${Key.order_to_json(q.order)},\"cursor\":${Json.to_str(cursor)},\"page_size\":${page_size.to_str()}}"
+        paginate_raw! = db.paginate_raw!
+        raw = paginate_raw!(req_json)?
+        match Json.parse(raw) {
+            Ok(res) => Ok(res)
+            Err(InvalidJson(msg)) => Err("failed to decode page result: ${msg}")
+        }
+    }
+
+    ## Reactive case-insensitive multi-token full-text search on a string field of `table`.
+    search! : Ctx.DbReader, Table(doc), Str, Str, U64 => Try(List(doc), Str)
+        where [doc.Json.Parseable([InvalidJson(Str)])]
+    search! = |db, table, field, query_text, limit| {
+        req_json =
+            "{\"namespace\":${Json.to_str(db.namespace)},\"table\":${Json.to_str(Table.table_name(table))},\"field\":${Json.to_str(field)},\"query\":${Json.to_str(query_text)},\"limit\":${limit.to_str()}}"
+        search_raw! = db.search_raw!
+        raw = search_raw!(req_json)?
+        match Json.parse(raw) {
+            Ok(docs) => Ok(docs)
+            Err(InvalidJson(msg)) => Err("failed to decode search results: ${msg}")
         }
     }
 }

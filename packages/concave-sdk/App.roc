@@ -11,6 +11,8 @@ App := {
     queries : List(QueryEntry),
     mutations : List(MutationEntry),
     actions : List(ActionEntry),
+    crons : List(CronEntry),
+    http_routes : List(HttpRouteEntry),
 }.{
     FunctionMeta : {
         name : Str,
@@ -35,6 +37,33 @@ App := {
         run! : Box((Ctx.ActionCtx, Str => Try(Str, Str))),
     }
 
+    CronEntry : {
+        name : Str,
+        interval_ms : I64,
+        fn_name : Str,
+        args_json : Str,
+    }
+
+    HttpRouteRequest : {
+        method : Str,
+        path : Str,
+        query : Str,
+        body : Str,
+        content_type : Str,
+    }
+
+    HttpRouteResponse : {
+        status : U64,
+        content_type : Str,
+        body : Str,
+    }
+
+    HttpRouteEntry : {
+        method : Str,
+        path : Str,
+        run! : Box((Ctx.ActionCtx, HttpRouteRequest => Try(HttpRouteResponse, Str))),
+    }
+
     new : Str -> App
     new = |app_name| {
         app_name,
@@ -43,6 +72,8 @@ App := {
         queries: [],
         mutations: [],
         actions: [],
+        crons: [],
+        http_routes: [],
     }
 
     table : App, Table(doc) -> App
@@ -53,6 +84,8 @@ App := {
         queries: a.queries,
         mutations: a.mutations,
         actions: a.actions,
+        crons: a.crons,
+        http_routes: a.http_routes,
     }
 
     component : App, Component.ComponentSpec -> App
@@ -63,6 +96,8 @@ App := {
         queries: a.queries,
         mutations: a.mutations,
         actions: a.actions,
+        crons: a.crons,
+        http_routes: a.http_routes,
     }
 
     ## Register a typed reactive Query endpoint.
@@ -109,6 +144,8 @@ App := {
             queries: List.append(a.queries, entry),
             mutations: a.mutations,
             actions: a.actions,
+            crons: a.crons,
+            http_routes: a.http_routes,
         }
     }
 
@@ -158,6 +195,8 @@ App := {
             queries: List.append(a.queries, entry),
             mutations: a.mutations,
             actions: a.actions,
+            crons: a.crons,
+            http_routes: a.http_routes,
         }
     }
 
@@ -205,6 +244,8 @@ App := {
             queries: a.queries,
             mutations: List.append(a.mutations, entry),
             actions: a.actions,
+            crons: a.crons,
+            http_routes: a.http_routes,
         }
     }
 
@@ -254,6 +295,8 @@ App := {
             queries: a.queries,
             mutations: List.append(a.mutations, entry),
             actions: a.actions,
+            crons: a.crons,
+            http_routes: a.http_routes,
         }
     }
 
@@ -301,6 +344,47 @@ App := {
             queries: a.queries,
             mutations: a.mutations,
             actions: List.append(a.actions, entry),
+            crons: a.crons,
+            http_routes: a.http_routes,
+        }
+    }
+
+    ## Register a recurring scheduled Cron job that calls a registered mutation or action every `interval_ms` ms.
+    cron : App, Str, I64, Str, Str -> App
+    cron = |a, name, interval_ms, fn_name, args_json| {
+        entry : CronEntry
+        entry = { name, interval_ms, fn_name, args_json }
+        {
+            app_name: a.app_name,
+            tables: a.tables,
+            components: a.components,
+            queries: a.queries,
+            mutations: a.mutations,
+            actions: a.actions,
+            crons: List.append(a.crons, entry),
+            http_routes: a.http_routes,
+        }
+    }
+
+    ## Register a custom HTTP route / webhook handler (e.g. `App.http_route("POST", "/webhooks/stripe", handler!)`).
+    ## Paths ending in `*` match by prefix; method `"*"` matches any HTTP method.
+    http_route : App, Str, Str, (Ctx.ActionCtx, HttpRouteRequest => Try(HttpRouteResponse, Str)) -> App
+    http_route = |a, method, path, handler!| {
+        entry : HttpRouteEntry
+        entry = {
+            method,
+            path,
+            run!: Box.box(handler!),
+        }
+        {
+            app_name: a.app_name,
+            tables: a.tables,
+            components: a.components,
+            queries: a.queries,
+            mutations: a.mutations,
+            actions: a.actions,
+            crons: a.crons,
+            http_routes: List.append(a.http_routes, entry),
         }
     }
 
@@ -321,8 +405,26 @@ App := {
             |> List.map(function_meta_to_json)
             |> Str.join_with(",")
 
-        "{\"app_name\":${Json.to_str(a.app_name)},\"tables\":[${tables_json}],\"components\":[${comps_json}],\"functions\":[${funcs_json}]}"
+        crons_json =
+            a.crons
+            |> List.map(cron_to_json)
+            |> Str.join_with(",")
+
+        routes_json =
+            a.http_routes
+            |> List.map(http_route_to_json)
+            |> Str.join_with(",")
+
+        "{\"app_name\":${Json.to_str(a.app_name)},\"tables\":[${tables_json}],\"components\":[${comps_json}],\"functions\":[${funcs_json}],\"crons\":[${crons_json}],\"http_routes\":[${routes_json}]}"
     }
+
+    cron_to_json : CronEntry -> Str
+    cron_to_json = |c|
+        "{\"name\":${Json.to_str(c.name)},\"interval_ms\":${c.interval_ms.to_str()},\"fn_name\":${Json.to_str(c.fn_name)},\"args_json\":${Json.to_str(c.args_json)}}"
+
+    http_route_to_json : HttpRouteEntry -> Str
+    http_route_to_json = |r|
+        "{\"method\":${Json.to_str(r.method)},\"path\":${Json.to_str(r.path)}}"
 
     function_meta_to_json : FunctionMeta -> Str
     function_meta_to_json = |m| {
@@ -368,5 +470,33 @@ App := {
             }
         }
         Err("unknown action `${name}`")
+    }
+
+    ## Dispatch a custom HTTP route by method + path (invoked by the Concave platform host).
+    dispatch_http! : App, Ctx.ActionCtx, Str, Str, Str => Try(Str, Str)
+    dispatch_http! = |a, ctx, method, path, req_json| {
+        for entry in a.http_routes {
+            method_ok = entry.method == "*" or entry.method == method
+            path_ok =
+                if Str.ends_with(entry.path, "*") {
+                    Str.starts_with(path, Str.drop_suffix(entry.path, "*"))
+                } else {
+                    entry.path == path
+                }
+            if method_ok and path_ok {
+                parsed : HttpRouteRequest
+                parsed = match Json.parse(req_json) {
+                    Ok(v) => v
+                    Err(InvalidJson(msg)) => return Err("invalid http route request: ${msg}")
+                }
+                run! = Box.unbox(entry.run!)
+                resp = run!(ctx, parsed)?
+                return match Json.to_str_try(resp) {
+                    Ok(s) => Ok(s)
+                    Err(_) => Err("failed to encode http route response")
+                }
+            }
+        }
+        Err("no matching http route for `${method} ${path}`")
     }
 }
