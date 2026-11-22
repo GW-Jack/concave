@@ -287,6 +287,26 @@ export fn roc_host_auth_identity() callconv(.c) RocStr {
     return wireErr("unauthenticated");
 }
 
+/// Temporarily release `g_roc_mutex` across blocking I/O (`http_fetch`) or engine re-entry
+/// (`run_query`/`run_mutation`) so we never hold `g_roc_mutex` while acquiring `sync_mutex`
+/// (preventing AB-BA deadlock with `subscribe`/`broadcastInvalidation`) and HTTP Actions never
+/// stall other queries/mutations.
+fn releaseRocLockForHostCall() usize {
+    const saved = t_roc_lock_depth;
+    if (saved > 0) {
+        t_roc_lock_depth = 0;
+        g_roc_mutex.unlock(getIo());
+    }
+    return saved;
+}
+
+fn reacquireRocLockAfterHostCall(saved: usize) void {
+    if (saved > 0) {
+        g_roc_mutex.lockUncancelable(getIo());
+        t_roc_lock_depth = saved;
+    }
+}
+
 export fn roc_host_http_fetch(method_raw: RocStr, url_raw: RocStr, body_raw: RocStr) callconv(.c) RocStr {
     const method = takeRocStr(g_alloc, method_raw) catch return wireErr("oom");
     defer g_alloc.free(method);
@@ -296,11 +316,16 @@ export fn roc_host_http_fetch(method_raw: RocStr, url_raw: RocStr, body_raw: Roc
     defer g_alloc.free(body);
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
-    const resp = env.httpFetch(g_alloc, .{
-        .method = method,
-        .url = url,
-        .body = if (body.len > 0) body else null,
-    }) catch |err| return wireErr(@errorName(err));
+    const fetch_res = blk: {
+        const saved = releaseRocLockForHostCall();
+        defer reacquireRocLockAfterHostCall(saved);
+        break :blk env.httpFetch(g_alloc, .{
+            .method = method,
+            .url = url,
+            .body = if (body.len > 0) body else null,
+        });
+    };
+    const resp = fetch_res catch |err| return wireErr(@errorName(err));
     defer resp.deinit(g_alloc);
 
     var out: std.Io.Writer.Allocating = .init(g_alloc);
@@ -318,7 +343,12 @@ export fn roc_host_run_query(name_raw: RocStr, args_raw: RocStr) callconv(.c) Ro
     defer g_alloc.free(args_json);
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
-    const res = env.runQuery(g_alloc, name, args_json) catch |err| return wireErr(@errorName(err));
+    const qres = blk: {
+        const saved = releaseRocLockForHostCall();
+        defer reacquireRocLockAfterHostCall(saved);
+        break :blk env.runQuery(g_alloc, name, args_json);
+    };
+    const res = qres catch |err| return wireErr(@errorName(err));
     defer res.deinit(g_alloc);
     return switch (res) {
         .ok => |v| wireOk(v),
@@ -333,7 +363,12 @@ export fn roc_host_run_mutation(name_raw: RocStr, args_raw: RocStr) callconv(.c)
     defer g_alloc.free(args_json);
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
-    const mres = env.runMutation(g_alloc, name, args_json) catch |err| return wireErr(@errorName(err));
+    const mut_res = blk: {
+        const saved = releaseRocLockForHostCall();
+        defer reacquireRocLockAfterHostCall(saved);
+        break :blk env.runMutation(g_alloc, name, args_json);
+    };
+    const mres = mut_res catch |err| return wireErr(@errorName(err));
     defer mres.deinit(g_alloc);
     return switch (mres.result) {
         .ok => |v| wireOk(v),

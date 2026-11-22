@@ -43,7 +43,21 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(cli_exe);
 
-    // 3. All Zig unit, DST, crash-recovery, and fuzz-corpus tests (`zig build test`)
+    // 3. Wave 3 PostgreSQL vs WalStore differential test runner (`zig build pg-diff`)
+    const pg_diff_mod = b.createModule(.{
+        .root_source_file = b.path("zig/pg_diff_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const pg_diff_exe = b.addExecutable(.{
+        .name = "pg-diff",
+        .root_module = pg_diff_mod,
+    });
+    const install_pg_diff = b.addInstallArtifact(pg_diff_exe, .{});
+    const pg_diff_step = b.step("pg-diff", "Build the Wave 3 Postgres vs WalStore differential verifier");
+    pg_diff_step.dependOn(&install_pg_diff.step);
+
+    // 4. All Zig unit, DST, crash-recovery, and fuzz-corpus tests (`zig build test`)
     const test_mod = b.createModule(.{
         .root_source_file = b.path("zig/tests.zig"),
         .target = target,

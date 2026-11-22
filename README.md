@@ -28,7 +28,8 @@ concave/
 ├── packages/
 │   ├── concave-sdk/       # Pure Roc SDK (`Schema`, `Key`, `Table`, `Ctx`, `Db`, `Component`, `App`)
 │   ├── presence/          # Reusable pure-Roc Presence component package
-│   └── rate-limiter/      # Reusable pure-Roc Rate Limiter component package
+│   ├── rate-limiter/      # Reusable pure-Roc Rate Limiter component package
+│   └── analytics/         # Reusable pure-Roc PostHog-style Product Analytics & Feature Flags component
 ├── zig/
 │   ├── core/              # Lexicographic key codec, Manifest, ReadSet/OCC, WalStore, PgStore (PG Wire v3 + TLS 1.3 + SCRAM-SHA-256)
 │   ├── runtime/           # HTTP/1.1 + RFC 6455 WS server, subscription engine + commit_log tailer, HS256 JWT auth, HTTP Actions client
@@ -72,5 +73,6 @@ To run against PostgreSQL (e.g., PlanetScale Postgres, Neon, or local PG) instea
 
 - [Architecture & Design](docs/ARCHITECTURE.md)
 - [Roc API Guide](docs/ROC_API.md)
+- [PostHog-Style Analytics Component](docs/ANALYTICS.md)
 - [WebSocket & HTTP Wire Protocol](docs/PROTOCOL.md)
 - [Deploying to Google Cloud Run + Serverless Postgres](docs/DEPLOY_CLOUD_RUN.md)

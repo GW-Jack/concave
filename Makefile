@@ -1,4 +1,4 @@
-.PHONY: host host-release test test-zig test-roc test-client test-e2e verify-formal codegen-chat dev-chat
+.PHONY: host host-release test test-zig test-roc test-client test-e2e test-ws test-stress test-pg-docker verify-formal codegen-chat dev-chat
 
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
@@ -41,16 +41,34 @@ test-roc:
 	roc test packages/presence/Presence.roc
 	roc check packages/rate-limiter/main.roc
 	roc test packages/rate-limiter/RateLimiter.roc
+	roc check packages/analytics/main.roc
+	roc test packages/analytics/Props.roc
+	roc test packages/analytics/Hash.roc
+	roc test packages/analytics/Flags.roc
+	roc test packages/analytics/Insights.roc
+	roc test packages/analytics/Analytics.roc
 	roc check platform/main.roc
 	roc check examples/chat-app/backend/main.roc
+	roc check tests/fixtures/analytics-app/main.roc
 
 test-client:
 	node --test client/concave-client/test/*.test.mjs
 
 test-e2e: host codegen-chat
 	node --test --test-timeout=15000 tests/e2e_chat_platform.mjs
+	node --test --test-timeout=20000 tests/e2e_analytics.mjs
 
-test: test-zig test-roc test-client test-e2e
+test-ws: host
+	node --test --test-timeout=15000 tests/ws_conformance.mjs
+
+test-stress: host codegen-chat
+	node --test --test-timeout=20000 tests/stress_roc_ffi.mjs
+
+## Wave 3: Real PostgreSQL 16 (SCRAM-SHA-256) + PgBouncer (transaction mode) differential & 2-replica test (requires Docker)
+test-pg-docker: host codegen-chat
+	node --test --test-timeout=90000 tests/wave3_pg_docker.mjs
+
+test: test-zig test-roc test-client test-e2e test-ws test-stress
 
 ## Run all Wave 2 machine-checked formal proofs & model checks (Lean 4, Maude, Z3)
 verify-formal:
