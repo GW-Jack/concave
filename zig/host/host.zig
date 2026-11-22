@@ -843,6 +843,12 @@ fn runServer(
     });
     defer engine.deinit();
 
+    if (getEnvSlice("CONCAVE_LOG_FORMAT")) |fmt| {
+        if (std.ascii.eqlIgnoreCase(fmt, "json")) {
+            engine.metrics.log_json = true;
+        }
+    }
+
     // Configure built-in local / S3-SigV4 blob storage.
     const storage_dir = getEnvSlice("CONCAVE_STORAGE_DIR") orelse ".concave/storage";
     const default_host = if (std.mem.eql(u8, host, "0.0.0.0")) "127.0.0.1" else host;
@@ -916,6 +922,7 @@ fn runServer(
         .port = port,
         .static_dir = static_dir,
         .admin_key = getEnvSlice("CONCAVE_ADMIN_KEY"),
+        .operator_token = getEnvSlice("CONCAVE_OPERATOR_TOKEN"),
         .shutdown_flag = &g_shutdown,
     });
 

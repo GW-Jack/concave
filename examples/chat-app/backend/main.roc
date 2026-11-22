@@ -4,6 +4,7 @@ app [concave_app] {
     presence: "../../../packages/presence/main.roc",
     ratelimit: "../../../packages/rate-limiter/main.roc",
     analytics: "../../../packages/analytics/main.roc",
+    monitor: "../../../packages/monitor/main.roc",
 }
 
 import sdk.App
@@ -16,6 +17,8 @@ import ratelimit.RateLimiter
 import analytics.Analytics
 import analytics.Flags
 import analytics.Props
+import monitor.Attrs
+import monitor.Monitor
 import Room
 import Message
 
@@ -29,6 +32,9 @@ send_limiter = RateLimiter.mount("rate_limit", 12, 60000)
 
 chat_analytics : Analytics.Mount
 chat_analytics = Analytics.mount("analytics")
+
+chat_monitor : Monitor.Mount
+chat_monitor = Monitor.mount("monitor")
 
 ## Queries
 
@@ -71,6 +77,24 @@ ensure_defaults! = |ctx, _| {
                 Flags.variant("control", 50),
                 Flags.variant("rocket", 50),
             ],
+        })?
+    }
+
+    # Seed default application alert rule if none exist yet.
+    existing_rules = Monitor.list_alert_rules_in_query!(chat_monitor, Ctx.as_query_ctx(ctx))?
+    if List.is_empty(existing_rules) {
+        _ = Monitor.upsert_alert_rule_in_tx!(chat_monitor, ctx, {
+            key: "chat-error-spike",
+            name: "Chat Error Spike (>= 3 in 5m)",
+            active: True,
+            kind: "error_count",
+            target: "",
+            aggregation: "count",
+            op: "gte",
+            threshold: 3.0,
+            window_ms: 300000,
+            cooldown_ms: 60000,
+            webhook_url: "",
         })?
     }
 
@@ -129,6 +153,13 @@ create_room! = |ctx, args| {
                 Props.prop("room_id", room_id),
                 Props.prop("room_name", trimmed),
             ])?
+            _ = Monitor.log_info!(
+                chat_monitor,
+                ctx,
+                "chat",
+                "Room #${trimmed} created by ${user.name}",
+                [Attrs.attr("room_id", room_id), Attrs.attr("author", user.subject)],
+            )?
             Ok(room_id)
         }
     }
@@ -161,11 +192,27 @@ send_message! = |ctx, args| {
         kind: "text",
     })?
 
-    # Record analytics atomically in the exact same ACID transaction.
+    # Record analytics & monitoring atomically in the exact same ACID transaction.
     _ = Analytics.track_event!(chat_analytics, ctx, user.subject, "message_sent", [
         Props.prop("room_id", args.room_id),
         Props.prop("author", user.name),
     ])?
+    _ = Monitor.log_info!(
+        chat_monitor,
+        ctx,
+        "chat",
+        "Message sent by ${user.name} in room ${args.room_id}",
+        [Attrs.attr("room_id", args.room_id), Attrs.attr("author", user.subject)],
+    )?
+    _ = Monitor.record_metric!(
+        chat_monitor,
+        ctx,
+        "chat.messages_sent",
+        "counter",
+        1.0,
+        "chat",
+        [Attrs.attr("room_id", args.room_id)],
+    )?
 
     Ok(msg_id)
 }
@@ -192,6 +239,13 @@ post_preview! = |ctx, args| {
     _ = Analytics.track_event!(chat_analytics, ctx, user.subject, "link_preview_posted", [
         Props.prop("room_id", args.room_id),
     ])?
+    _ = Monitor.log_info!(
+        chat_monitor,
+        ctx,
+        "preview",
+        "Link preview posted by ${user.name}",
+        [Attrs.attr("room_id", args.room_id), Attrs.attr("author", user.subject)],
+    )?
     Ok(msg_id)
 }
 
@@ -211,19 +265,40 @@ extract_title = |html| {
 
 fetch_preview! : Ctx.ActionCtx, Message.FetchPreviewArgs => Try(Message.PreviewResult, Str)
 fetch_preview! = |ctx, args| {
-    _ = Ctx.require_auth!(ctx.auth!)?
+    user = Ctx.require_auth!(ctx.auth!)?
     http_fetch! = ctx.http_fetch!
-    resp = http_fetch!({
+    run_mutation! = ctx.run_mutation!
+
+    resp = match http_fetch!({
         method: "GET",
         url: args.url,
         body: "",
-    })?
+    }) {
+        Ok(r) => r
+        Err(fetch_err) => {
+            _ = run_mutation!(
+                "monitor.captureError",
+                Json.to_str({
+                    source: "messages.fetchPreview",
+                    error_type: "HttpFetchError",
+                    message: "Failed to fetch ${args.url}: ${fetch_err}",
+                    level: "error",
+                    stack: "",
+                    trace_id: "",
+                    user_id: user.subject,
+                    fingerprint: "",
+                    attrs: [Attrs.attr("url", args.url), Attrs.attr("room_id", args.room_id)],
+                    timestamp_ms: 0,
+                }),
+            )
+            return Err(fetch_err)
+        }
+    }
 
     raw_title = extract_title(resp.body)
     title = if Str.is_empty(raw_title) { args.url } else { raw_title }
     summary = "🔗 ${title} (HTTP ${resp.status.to_str()}) — ${args.url}"
 
-    run_mutation! = ctx.run_mutation!
     mut_args = Json.to_str({ room_id: args.room_id, body: summary })
     msg_id_json = run_mutation!("messages.postPreview", mut_args)?
     msg_id = Json.parse(msg_id_json) ?? msg_id_json
@@ -245,6 +320,7 @@ concave_app = ||
     |> Presence.attach(chat_presence)
     |> RateLimiter.attach(send_limiter)
     |> Analytics.attach(chat_analytics)
+    |> Monitor.attach_with_cron(chat_monitor, 60000, 3600000)
     |> App.query("rooms.list", Schema.record([]), Schema.list(Room.doc_schema), list_rooms!)
     |> App.query("messages.list", Message.list_args_schema, Schema.list(Message.doc_schema), list_messages!)
     |> App.mutation("rooms.ensureDefaults", Schema.record([]), Schema.list(Room.doc_schema), ensure_defaults!)

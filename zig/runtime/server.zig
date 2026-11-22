@@ -10,6 +10,7 @@ const CLIENT_SIGNALS_JS = @embedFile("concave_client_signals_js");
 const CLIENT_CLIENT_JS = @embedFile("concave_client_client_js");
 const CLIENT_DOM_JS = @embedFile("concave_client_dom_js");
 const ANALYTICS_CLIENT_JS = @embedFile("concave_analytics_client_js");
+const MONITOR_CLIENT_JS = @embedFile("concave_monitor_client_js");
 const DASHBOARD_INDEX_HTML = @embedFile("concave_dashboard_index_html");
 const DASHBOARD_STYLES_CSS = @embedFile("concave_dashboard_styles_css");
 const DASHBOARD_APP_JS = @embedFile("concave_dashboard_app_js");
@@ -19,6 +20,7 @@ pub const ServerConfig = struct {
     port: u16 = 3210,
     static_dir: ?[]const u8 = null,
     admin_key: ?[]const u8 = null,
+    operator_token: ?[]const u8 = null,
     shutdown_flag: ?*std.atomic.Value(bool) = null,
 };
 
@@ -58,10 +60,11 @@ pub fn serve(
             engine: *engine_mod.ConcaveEngine,
             static_dir: ?[]const u8,
             admin_key: ?[]const u8,
+            operator_token: ?[]const u8,
             stream: std.Io.net.Stream,
 
             fn run(ctx: @This()) void {
-                handleConnection(ctx.allocator, ctx.io, ctx.engine, ctx.static_dir, ctx.admin_key, ctx.stream);
+                handleConnection(ctx.allocator, ctx.io, ctx.engine, ctx.static_dir, ctx.admin_key, ctx.operator_token, ctx.stream);
             }
         };
 
@@ -71,6 +74,7 @@ pub fn serve(
             .engine = engine,
             .static_dir = config.static_dir,
             .admin_key = config.admin_key,
+            .operator_token = config.operator_token,
             .stream = stream,
         }}) catch {
             stream.close(io);
@@ -179,9 +183,12 @@ fn handleConnection(
     engine: *engine_mod.ConcaveEngine,
     static_dir: ?[]const u8,
     admin_key: ?[]const u8,
+    operator_token: ?[]const u8,
     stream: std.Io.net.Stream,
 ) void {
     defer stream.close(io);
+    t_active_engine = engine;
+    defer t_active_engine = null;
 
     var rbuf: [8192]u8 = undefined;
     var sr = stream.reader(io, &rbuf);
@@ -254,6 +261,39 @@ fn handleConnection(
     }
     if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/_dashboard/app.js")) {
         writeHttpResponse(io, stream, 200, "OK", "text/javascript; charset=utf-8", DASHBOARD_APP_JS);
+        return;
+    }
+
+    // Platform Operator Reliability Endpoints (`/_internal/metrics`, `/_internal/status`)
+    // Strictly owned by the platform operator; storage-independent and protected by `CONCAVE_OPERATOR_TOKEN`
+    // (falling back to `CONCAVE_ADMIN_KEY`, or dev mode when neither is configured).
+    if (std.mem.eql(u8, req.method, "GET") and std.mem.startsWith(u8, req.path, "/_internal/")) {
+        const expected_tok = operator_token orelse admin_key;
+        if (!isOperatorAuthorized(engine, expected_tok, req.authorization, req.query)) {
+            const status: u16 = if (expected_tok != null) 401 else 403;
+            const reason = if (expected_tok != null) "Unauthorized" else "Forbidden";
+            writeHttpResponse(io, stream, status, reason, "application/json", "{\"error\":\"operator access denied\"}");
+            return;
+        }
+        if (std.mem.eql(u8, req.path, "/_internal/metrics")) {
+            const body = engine.formatPrometheusMetrics(allocator) catch {
+                writeHttpResponse(io, stream, 500, "Internal Server Error", "text/plain", "metrics unavailable");
+                return;
+            };
+            defer allocator.free(body);
+            writeHttpResponse(io, stream, 200, "OK", "text/plain; version=0.0.4; charset=utf-8", body);
+            return;
+        }
+        if (std.mem.eql(u8, req.path, "/_internal/status")) {
+            const body = engine.formatInternalStatusJson(allocator) catch {
+                writeHttpResponse(io, stream, 500, "Internal Server Error", "application/json", "{\"error\":\"status unavailable\"}");
+                return;
+            };
+            defer allocator.free(body);
+            writeHttpResponse(io, stream, 200, "OK", "application/json", body);
+            return;
+        }
+        writeHttpResponse(io, stream, 404, "Not Found", "application/json", "{\"error\":\"unknown internal endpoint\"}");
         return;
     }
 
@@ -332,6 +372,8 @@ fn handleConnection(
             CLIENT_DOM_JS
         else if (std.mem.eql(u8, file, "analytics.js"))
             ANALYTICS_CLIENT_JS
+        else if (std.mem.eql(u8, file, "monitor.js"))
+            MONITOR_CLIENT_JS
         else
             null;
         if (js) |content| {
@@ -606,6 +648,8 @@ fn mimeType(path: []const u8) []const u8 {
     return "application/octet-stream";
 }
 
+threadlocal var t_active_engine: ?*engine_mod.ConcaveEngine = null;
+
 fn writeHttpResponse(
     io: std.Io,
     stream: std.Io.net.Stream,
@@ -614,6 +658,9 @@ fn writeHttpResponse(
     content_type: []const u8,
     body: []const u8,
 ) void {
+    if (t_active_engine) |eng| {
+        eng.metrics.recordHttpStatus(status);
+    }
     var wbuf: [4096]u8 = undefined;
     var sw = stream.writer(io, &wbuf);
     sw.interface.print(
@@ -769,6 +816,33 @@ fn handleWsText(
         defer allocator.free(pong);
         sender.sendText(pong) catch {};
     }
+}
+
+fn isOperatorAuthorized(
+    engine: *const engine_mod.ConcaveEngine,
+    expected_token: ?[]const u8,
+    auth_header: ?[]const u8,
+    query: []const u8,
+) bool {
+    if (expected_token) |expected| {
+        if (auth_header) |ah| {
+            var tok = std.mem.trim(u8, ah, " \t");
+            if (std.mem.startsWith(u8, tok, "Bearer ")) {
+                tok = std.mem.trim(u8, tok["Bearer ".len..], " \t");
+            }
+            if (timingSafeStrEql(tok, expected)) return true;
+        }
+        var pairs = std.mem.splitScalar(u8, query, '&');
+        while (pairs.next()) |pair| {
+            if (std.mem.startsWith(u8, pair, "token=")) {
+                if (timingSafeStrEql(pair["token=".len..], expected)) return true;
+            } else if (std.mem.startsWith(u8, pair, "key=")) {
+                if (timingSafeStrEql(pair["key=".len..], expected)) return true;
+            }
+        }
+        return false;
+    }
+    return engine.auth_config.allow_dev_tokens;
 }
 
 fn isAdminAuthorized(

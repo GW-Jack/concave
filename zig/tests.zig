@@ -11,6 +11,7 @@ comptime {
     _ = @import("runtime/auth.zig");
     _ = @import("runtime/ws.zig");
     _ = @import("runtime/http_client.zig");
+    _ = @import("runtime/metrics.zig");
     _ = @import("runtime/tx.zig");
     _ = @import("runtime/engine.zig");
     _ = @import("runtime/server.zig");

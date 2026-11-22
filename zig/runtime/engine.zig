@@ -7,6 +7,7 @@ const readset_mod = @import("../core/readset.zig");
 const storage_mod = @import("../core/storage.zig");
 const auth_mod = @import("auth.zig");
 const http_client = @import("http_client.zig");
+const metrics_mod = @import("metrics.zig");
 const tx_mod = @import("tx.zig");
 const ws_mod = @import("ws.zig");
 
@@ -312,6 +313,7 @@ pub const ConcaveEngine = struct {
     last_broadcast_ts: std.atomic.Value(i64) = .init(0),
     sync_mutex: std.Io.Mutex = .init,
     stop_tailer: std.atomic.Value(bool) = .init(false),
+    metrics: metrics_mod.PlatformMetrics = .{},
 
     pub fn init(
         allocator: Allocator,
@@ -333,6 +335,7 @@ pub const ConcaveEngine = struct {
             .manifest = mf,
             .auth_config = auth_config,
             .last_broadcast_ts = .init(initial_ts),
+            .metrics = metrics_mod.PlatformMetrics.init(io, false),
         };
         return self;
     }
@@ -369,6 +372,37 @@ pub const ConcaveEngine = struct {
             .active_clients = client_count,
             .active_subscriptions = sub_count,
         };
+    }
+
+    pub fn storageBackendName(self: *const ConcaveEngine) []const u8 {
+        return switch (self.storage) {
+            .wal => "wal",
+            .pg => "postgres",
+        };
+    }
+
+    pub fn formatPrometheusMetrics(self: *ConcaveEngine, allocator: Allocator) ![]u8 {
+        const stats = self.getStats();
+        return try self.metrics.formatPrometheus(allocator, self.io, .{
+            .app_name = self.manifest.app_name,
+            .storage_backend = self.storageBackendName(),
+            .commit_ts = stats.commit_ts,
+            .last_broadcast_ts = self.last_broadcast_ts.load(.acquire),
+            .active_clients = stats.active_clients,
+            .active_subscriptions = stats.active_subscriptions,
+        });
+    }
+
+    pub fn formatInternalStatusJson(self: *ConcaveEngine, allocator: Allocator) ![]u8 {
+        const stats = self.getStats();
+        return try self.metrics.formatStatusJson(allocator, self.io, .{
+            .app_name = self.manifest.app_name,
+            .storage_backend = self.storageBackendName(),
+            .commit_ts = stats.commit_ts,
+            .last_broadcast_ts = self.last_broadcast_ts.load(.acquire),
+            .active_clients = stats.active_clients,
+            .active_subscriptions = stats.active_subscriptions,
+        });
     }
 
     pub fn adminScanTable(
@@ -411,6 +445,7 @@ pub const ConcaveEngine = struct {
         self.clients_mutex.lockUncancelable(self.io);
         defer self.clients_mutex.unlock(self.io);
         try self.clients.put(self.allocator, id, sess);
+        _ = self.metrics.ws_connections_total.fetchAdd(1, .monotonic);
         return id;
     }
 
@@ -632,7 +667,15 @@ pub const ConcaveEngine = struct {
         args_json: []const u8,
         auth: ?*const auth_mod.AuthIdentity,
     ) InternalQueryRun {
+        const start_us = metrics_mod.PlatformMetrics.nowMicros(self.io);
+        _ = self.metrics.queries_total.fetchAdd(1, .monotonic);
+
         const snapshot_ts = self.storage.latestCommitTs() catch |err| {
+            _ = self.metrics.queries_err_total.fetchAdd(1, .monotonic);
+            _ = self.metrics.storage_errors_total.fetchAdd(1, .monotonic);
+            const dur_us = metrics_mod.PlatformMetrics.elapsedUs(self.io, start_us);
+            self.metrics.query_latency.observeUs(dur_us);
+            self.metrics.logRpc(self.io, "query", name, dur_us, false, 0, @errorName(err));
             return .{
                 .result = .{ .err = std.fmt.allocPrint(self.allocator, "storage error: {s}", .{@errorName(err)}) catch &.{} },
                 .read_set = .{},
@@ -659,6 +702,15 @@ pub const ConcaveEngine = struct {
         };
 
         const res = self.executor.executeQuery(self.allocator, name, args_json, &env);
+        const dur_us = metrics_mod.PlatformMetrics.elapsedUs(self.io, start_us);
+        self.metrics.query_latency.observeUs(dur_us);
+        switch (res) {
+            .ok => self.metrics.logRpc(self.io, "query", name, dur_us, true, 0, null),
+            .err => |emsg| {
+                _ = self.metrics.queries_err_total.fetchAdd(1, .monotonic);
+                self.metrics.logRpc(self.io, "query", name, dur_us, false, 0, emsg);
+            },
+        }
         const rs = tx.read_set;
         return .{
             .result = res,
@@ -674,8 +726,17 @@ pub const ConcaveEngine = struct {
         args_json: []const u8,
         auth: ?*const auth_mod.AuthIdentity,
     ) !MutationExecResult {
+        const start_us = metrics_mod.PlatformMetrics.nowMicros(self.io);
+        _ = self.metrics.mutations_total.fetchAdd(1, .monotonic);
+        var retries: usize = 0;
+
         for (0..MAX_OCC_RETRIES) |_| {
             const snapshot_ts = self.storage.latestCommitTs() catch |err| {
+                _ = self.metrics.mutations_err_total.fetchAdd(1, .monotonic);
+                _ = self.metrics.storage_errors_total.fetchAdd(1, .monotonic);
+                const dur_us = metrics_mod.PlatformMetrics.elapsedUs(self.io, start_us);
+                self.metrics.mutation_latency.observeUs(dur_us);
+                self.metrics.logRpc(self.io, "mutation", name, dur_us, false, retries, @errorName(err));
                 return .{ .result = .{ .err = try std.fmt.allocPrint(allocator, "storage error: {s}", .{@errorName(err)}) } };
             };
 
@@ -695,10 +756,17 @@ pub const ConcaveEngine = struct {
 
             const res = self.executor.executeMutation(allocator, name, args_json, &env);
             switch (res) {
-                .err => return .{ .result = res, .commit_ts = 0 },
+                .err => |emsg| {
+                    _ = self.metrics.mutations_err_total.fetchAdd(1, .monotonic);
+                    const dur_us = metrics_mod.PlatformMetrics.elapsedUs(self.io, start_us);
+                    self.metrics.mutation_latency.observeUs(dur_us);
+                    self.metrics.logRpc(self.io, "mutation", name, dur_us, false, retries, emsg);
+                    return .{ .result = res, .commit_ts = 0 };
+                },
                 .ok => {},
             }
 
+            const commit_start_us = metrics_mod.PlatformMetrics.nowMicros(self.io);
             var commit = self.storage.commitTx(
                 self.allocator,
                 self.manifest,
@@ -708,18 +776,35 @@ pub const ConcaveEngine = struct {
             ) catch |err| {
                 res.deinit(allocator);
                 if (err == storage_mod.StorageError.Conflict) {
+                    retries += 1;
+                    _ = self.metrics.occ_retries_total.fetchAdd(1, .monotonic);
                     continue;
                 }
+                _ = self.metrics.mutations_err_total.fetchAdd(1, .monotonic);
+                _ = self.metrics.storage_errors_total.fetchAdd(1, .monotonic);
+                const dur_us = metrics_mod.PlatformMetrics.elapsedUs(self.io, start_us);
+                self.metrics.mutation_latency.observeUs(dur_us);
+                self.metrics.logRpc(self.io, "mutation", name, dur_us, false, retries, @errorName(err));
                 return .{ .result = .{ .err = try std.fmt.allocPrint(allocator, "commit error: {s}", .{@errorName(err)}) } };
             };
             defer commit.deinit(self.allocator);
+            self.metrics.commit_latency.observeUs(metrics_mod.PlatformMetrics.elapsedUs(self.io, commit_start_us));
+            _ = self.metrics.storage_commits_total.fetchAdd(1, .monotonic);
 
             if (!commit.write_set.isEmpty()) {
                 self.handleLocalCommit(commit.commit_ts, &commit.write_set);
             }
+            const dur_us = metrics_mod.PlatformMetrics.elapsedUs(self.io, start_us);
+            self.metrics.mutation_latency.observeUs(dur_us);
+            self.metrics.logRpc(self.io, "mutation", name, dur_us, true, retries, null);
             return .{ .result = res, .commit_ts = commit.commit_ts };
         }
 
+        _ = self.metrics.mutations_err_total.fetchAdd(1, .monotonic);
+        _ = self.metrics.occ_exhausted_total.fetchAdd(1, .monotonic);
+        const dur_us = metrics_mod.PlatformMetrics.elapsedUs(self.io, start_us);
+        self.metrics.mutation_latency.observeUs(dur_us);
+        self.metrics.logRpc(self.io, "mutation", name, dur_us, false, retries, "occ_exhausted");
         return .{ .result = .{ .err = try std.fmt.allocPrint(
             allocator,
             "mutation `{s}` exceeded {d} OCC retries due to concurrent conflicts",
@@ -734,6 +819,9 @@ pub const ConcaveEngine = struct {
         args_json: []const u8,
         auth: ?*const auth_mod.AuthIdentity,
     ) !ExecResult {
+        const start_us = metrics_mod.PlatformMetrics.nowMicros(self.io);
+        _ = self.metrics.actions_total.fetchAdd(1, .monotonic);
+
         const auth_clone = if (auth) |a| a.clone(self.allocator) catch null else null;
         defer if (auth_clone) |*ac| ac.deinit(self.allocator);
 
@@ -744,7 +832,17 @@ pub const ConcaveEngine = struct {
             .blob_store = self.blob_store,
             .mode = .{ .action = self },
         };
-        return self.executor.executeAction(allocator, name, args_json, &env);
+        const res = self.executor.executeAction(allocator, name, args_json, &env);
+        const dur_us = metrics_mod.PlatformMetrics.elapsedUs(self.io, start_us);
+        self.metrics.action_latency.observeUs(dur_us);
+        switch (res) {
+            .ok => self.metrics.logRpc(self.io, "action", name, dur_us, true, 0, null),
+            .err => |emsg| {
+                _ = self.metrics.actions_err_total.fetchAdd(1, .monotonic);
+                self.metrics.logRpc(self.io, "action", name, dur_us, false, 0, emsg);
+            },
+        }
+        return res;
     }
 
     pub fn executeHttpRoute(
@@ -755,6 +853,9 @@ pub const ConcaveEngine = struct {
         req_json: []const u8,
         auth: ?*const auth_mod.AuthIdentity,
     ) !ExecResult {
+        const start_us = metrics_mod.PlatformMetrics.nowMicros(self.io);
+        _ = self.metrics.http_routes_total.fetchAdd(1, .monotonic);
+
         const auth_clone = if (auth) |a| a.clone(self.allocator) catch null else null;
         defer if (auth_clone) |*ac| ac.deinit(self.allocator);
 
@@ -765,7 +866,16 @@ pub const ConcaveEngine = struct {
             .blob_store = self.blob_store,
             .mode = .{ .action = self },
         };
-        return self.executor.executeHttpRoute(allocator, method, path, req_json, &env);
+        const res = self.executor.executeHttpRoute(allocator, method, path, req_json, &env);
+        const dur_us = metrics_mod.PlatformMetrics.elapsedUs(self.io, start_us);
+        switch (res) {
+            .ok => self.metrics.logRpc(self.io, "http_route", path, dur_us, true, 0, null),
+            .err => |emsg| {
+                _ = self.metrics.http_routes_err_total.fetchAdd(1, .monotonic);
+                self.metrics.logRpc(self.io, "http_route", path, dur_us, false, 0, emsg);
+            },
+        }
+        return res;
     }
 
     /// Ensure every manifest cron has an active pending/running job in `_system._scheduled_jobs`.
@@ -922,6 +1032,10 @@ pub const ConcaveEngine = struct {
             }
 
             // Step 3: Record completion/failure and reschedule next cron tick if applicable.
+            _ = self.metrics.scheduler_jobs_executed_total.fetchAdd(1, .monotonic);
+            if (job_err != null) {
+                _ = self.metrics.scheduler_jobs_failed_total.fetchAdd(1, .monotonic);
+            }
             for (0..4) |_| {
                 const snap_ts = self.storage.latestCommitTs() catch break;
                 var tx = tx_mod.TxContext.init(self.allocator, self.io, self.storage, self.manifest, snap_ts, false);
@@ -1058,6 +1172,10 @@ pub const ConcaveEngine = struct {
     }
 
     fn broadcastInvalidation(self: *ConcaveEngine, commit_ts: i64, write_set: *const readset_mod.WriteSet) void {
+        const fanout_start_us = metrics_mod.PlatformMetrics.nowMicros(self.io);
+        _ = self.metrics.ws_invalidations_total.fetchAdd(1, .monotonic);
+        defer self.metrics.fanout_latency.observeUs(metrics_mod.PlatformMetrics.elapsedUs(self.io, fanout_start_us));
+
         const SubJob = struct { sub_id: []u8, name: []u8, args_json: []u8 };
         const ClientJob = struct {
             client_id: u64,
@@ -1192,6 +1310,7 @@ pub const ConcaveEngine = struct {
                         const frame_json = formatTransition(self.allocator, effective_ts, updates.items) catch break;
                         defer self.allocator.free(frame_json);
                         sess.sink.send(frame_json);
+                        _ = self.metrics.ws_transitions_sent_total.fetchAdd(1, .monotonic);
                     }
                 }
                 break;

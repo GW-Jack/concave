@@ -15,6 +15,7 @@ import {
   signal,
 } from "/_concave/index.js";
 import { createAnalytics, fromProps } from "/_concave/analytics.js";
+import { createMonitor } from "/_concave/monitor.js";
 import { api } from "./_generated/api.js";
 
 /** @typedef {import("./_generated/dataModel.d.ts").Id<"rooms">} RoomId */
@@ -35,7 +36,11 @@ const newRoomTopic = signal("");
 /** @type {import("/_concave/index.d.ts").Signal<string | null>} */
 const errorMessage = signal(null);
 const previewBusy = signal(false);
-const showAnalytics = signal(false);
+/** @type {import("/_concave/index.d.ts").Signal<"none" | "analytics" | "monitor">} */
+const activeDrawer = signal("none");
+const showAnalytics = computed(() => activeDrawer() === "analytics");
+const showMonitor = computed(() => activeDrawer() === "monitor");
+const logSearchQuery = signal("");
 
 /** @param {string} handle */
 function makeDevToken(handle) {
@@ -48,6 +53,12 @@ const client = new ConcaveClient(SERVER_URL, {
   authToken: makeDevToken(storedHandle),
 });
 const analytics = createAnalytics(client, api.analytics);
+const monitor = createMonitor(client, api.monitor, {
+  service: "chat-web",
+  release: "v1.0.0",
+  environment: "dev",
+  captureGlobalErrors: true,
+});
 
 // Seed default rooms & feature flags on boot if the database is empty.
 void client.mutate(api.rooms.ensureDefaults, {}).then((rooms) => {
@@ -91,6 +102,7 @@ effect(() => {
   void analytics
     .capture("room_viewed", { room_id: room.id, room_name: room.name })
     .catch(() => {});
+  monitor.addBreadcrumb("navigation", `Opened #${room.name}`);
 });
 
 // Reactive queries directly wired to Concave WebSocket `commit_ts` transitions.
@@ -129,6 +141,25 @@ const flagDefsQuery = client.query(api.analytics.listFlags, () =>
   showAnalytics() ? {} : null,
 );
 
+// Lazy reactive Monitor dashboard queries (only active while the Monitor drawer is open).
+const monitorOverviewQuery = monitor.subscribeOverview(() =>
+  showMonitor() ? { window_ms: 3600000, top_n: 5 } : null,
+);
+const monitorIssuesQuery = monitor.subscribeIssues(() =>
+  showMonitor() ? { limit: 15 } : null,
+);
+const monitorAlertsQuery = client.query(api.monitor.listAlertRules, () =>
+  showMonitor() ? {} : null,
+);
+const monitorLogsQuery = monitor.subscribeLogs(() =>
+  showMonitor() && logSearchQuery().trim().length === 0 ? { limit: 15 } : null,
+);
+const monitorSearchLogsQuery = monitor.subscribeSearchLogs(() => {
+  if (!showMonitor()) return null;
+  const q = logSearchQuery().trim();
+  return q.length > 0 ? q : null;
+}, 15);
+
 const rooms = computed(() => roomsQuery().data ?? []);
 const activeRoom = computed(() => {
   const id = activeRoomId();
@@ -146,6 +177,13 @@ const topEvents = computed(() => summaryQuery().data?.top_events ?? []);
 const funnelSteps = computed(() => funnelQuery().data?.steps ?? []);
 const recentEvents = computed(() => recentEventsQuery().data ?? []);
 const flagDefs = computed(() => flagDefsQuery().data ?? []);
+const monitorIssues = computed(() => monitorIssuesQuery().data ?? []);
+const monitorAlerts = computed(() => monitorAlertsQuery().data ?? []);
+const monitorVisibleLogs = computed(() =>
+  logSearchQuery().trim().length > 0
+    ? (monitorSearchLogsQuery().data ?? [])
+    : (monitorLogsQuery().data ?? []),
+);
 
 // Auto-select the first room as soon as rooms arrive.
 effect(() => {
@@ -205,6 +243,7 @@ async function handleSend(ev) {
       await client.action(api.messages.fetchPreview, { room_id: roomId, url });
     } catch (err) {
       errorMessage.set(err instanceof Error ? err.message : String(err));
+      void monitor.captureException(err, { source: "chat-web", attrs: { action: "preview", url } }).catch(() => {});
     } finally {
       previewBusy.set(false);
     }
@@ -215,6 +254,7 @@ async function handleSend(ev) {
   const authorId = client.identity()?.subject ?? "me";
   draft.set("");
   notifyTyping(false);
+  monitor.addBreadcrumb("chat", `Sent message in ${roomId}`);
 
   try {
     await client.mutate(
@@ -241,6 +281,7 @@ async function handleSend(ev) {
     );
   } catch (err) {
     errorMessage.set(err instanceof Error ? err.message : String(err));
+    void monitor.captureException(err, { source: "chat-web", attrs: { action: "send", room_id: roomId } }).catch(() => {});
   }
 }
 
@@ -260,6 +301,7 @@ async function handleCreateRoom(ev) {
     activeRoomId.set(id);
   } catch (err) {
     errorMessage.set(err instanceof Error ? err.message : String(err));
+    void monitor.captureException(err, { source: "chat-web", attrs: { action: "create_room", name } }).catch(() => {});
   }
 }
 
@@ -460,10 +502,212 @@ function AnalyticsPanel() {
   );
 }
 
+/** @param {import("/_concave/monitor.js").IssueDoc} issue */
+async function toggleIssueStatus(issue) {
+  try {
+    const next = issue.status === "resolved" ? "open" : "resolved";
+    await monitor.updateIssueStatus(issue.id, next);
+  } catch (err) {
+    errorMessage.set(err instanceof Error ? err.message : String(err));
+  }
+}
+
+async function simulateSampleError() {
+  try {
+    const reqId = Math.floor(1000 + Math.random() * 9000);
+    await monitor.captureException(
+      new Error(`Delivery retry failed for message ${reqId} in room ${activeRoom()?.name ?? "general"}`),
+      {
+        source: "chat-web",
+        errorType: "DeliveryError",
+        attrs: { room: activeRoom()?.name ?? "general" },
+      },
+    );
+  } catch (err) {
+    errorMessage.set(err instanceof Error ? err.message : String(err));
+  }
+}
+
+async function evaluateChatAlerts() {
+  try {
+    await monitor.evaluateAlerts();
+  } catch (err) {
+    errorMessage.set(err instanceof Error ? err.message : String(err));
+  }
+}
+
+function MonitorPanel() {
+  return el(
+    "aside",
+    { class: "analytics-panel" },
+    el(
+      "div",
+      { class: "analytics-header" },
+      el("h3", null, "App Monitor"),
+      el("span", { class: "badge connected" }, "reactive"),
+    ),
+    el(
+      "div",
+      { class: "kpi-grid" },
+      el(
+        "div",
+        { class: "kpi-card" },
+        el("div", { class: "kpi-label" }, "Open Issues"),
+        el("div", { class: "kpi-value" }, () =>
+          String(monitorOverviewQuery().data?.open_issues ?? 0),
+        ),
+      ),
+      el(
+        "div",
+        { class: "kpi-card" },
+        el("div", { class: "kpi-label" }, "Errors (1h)"),
+        el("div", { class: "kpi-value" }, () =>
+          String(monitorOverviewQuery().data?.error_logs_in_window ?? 0),
+        ),
+      ),
+      el(
+        "div",
+        { class: "kpi-card" },
+        el("div", { class: "kpi-label" }, "Firing Alerts"),
+        el("div", { class: "kpi-value" }, () =>
+          String(monitorOverviewQuery().data?.firing_alerts ?? 0),
+        ),
+      ),
+    ),
+    el(
+      "div",
+      { class: "monitor-actions" },
+      el(
+        "button",
+        {
+          class: "btn secondary",
+          type: "button",
+          onClick: () => void simulateSampleError(),
+        },
+        "Simulate Error",
+      ),
+      el(
+        "button",
+        {
+          class: "btn secondary",
+          type: "button",
+          onClick: () => void evaluateChatAlerts(),
+        },
+        "Evaluate Alerts",
+      ),
+    ),
+    el(
+      "div",
+      { class: "analytics-section" },
+      el("div", { class: "section-title" }, "Grouped Issues (Sentry-style)"),
+      each(
+        monitorIssues,
+        (i) => i.id,
+        (issue) =>
+          el(
+            "div",
+            { class: "flag-row" },
+            el(
+              "div",
+              { class: "flag-info" },
+              el("div", { class: "flag-key issue-title" }, () => issue().title),
+              el(
+                "div",
+                { class: "flag-meta" },
+                () =>
+                  `${issue().source} · ×${issue().count} · ${issue().status}`,
+              ),
+            ),
+            el(
+              "button",
+              {
+                class: () =>
+                  `flag-toggle ${issue().status === "resolved" ? "on" : "off"}`,
+                type: "button",
+                onClick: () => void toggleIssueStatus(issue()),
+              },
+              () => (issue().status === "resolved" ? "REOPEN" : "RESOLVE"),
+            ),
+          ),
+      ),
+    ),
+    el(
+      "div",
+      { class: "analytics-section" },
+      el("div", { class: "section-title" }, "Alert Rules"),
+      each(
+        monitorAlerts,
+        (r) => r.key,
+        (rule) =>
+          el(
+            "div",
+            { class: "flag-row" },
+            el(
+              "div",
+              { class: "flag-info" },
+              el("div", { class: "flag-key" }, () => rule().name),
+              el(
+                "div",
+                { class: "flag-meta" },
+                () =>
+                  `val=${rule().last_value} ${rule().op} ${rule().threshold}`,
+              ),
+            ),
+            el(
+              "span",
+              {
+                class: () => `alert-pill ${rule().status}`,
+              },
+              () => rule().status.toUpperCase(),
+            ),
+          ),
+      ),
+    ),
+    el(
+      "div",
+      { class: "analytics-section" },
+      el("div", { class: "section-title" }, "Live Logs & Search (Db.search!)"),
+      el("input", {
+        class: "input",
+        placeholder: "Full-text search logs...",
+        value: () => logSearchQuery(),
+        onInput: (/** @type {Event} */ e) =>
+          logSearchQuery.set(/** @type {HTMLInputElement} */ (e.target).value),
+      }),
+      el(
+        "div",
+        { class: "event-stream" },
+        each(
+          monitorVisibleLogs,
+          (l) => l.id,
+          (entry) =>
+            el(
+              "div",
+              { class: "event-row" },
+              el(
+                "div",
+                { class: "event-head" },
+                el(
+                  "span",
+                  { class: () => `log-level ${entry().level}` },
+                  () => `${entry().level.toUpperCase()} · ${entry().service}`,
+                ),
+                el("span", { class: "event-time" }, () =>
+                  formatTime(entry().timestamp_ms),
+                ),
+              ),
+              el("div", { class: "event-sub" }, () => entry().message),
+            ),
+        ),
+      ),
+    ),
+  );
+}
+
 function AppView() {
   return el(
     "div",
-    { class: () => `layout ${showAnalytics() ? "with-analytics" : ""}` },
+    { class: () => `layout ${activeDrawer() !== "none" ? "with-analytics" : ""}` },
     el(
       "aside",
       { class: "sidebar" },
@@ -570,9 +814,20 @@ function AppView() {
             {
               class: () => `btn secondary toggle-analytics ${showAnalytics() ? "active" : ""}`,
               type: "button",
-              onClick: () => showAnalytics.set(!showAnalytics()),
+              onClick: () =>
+                activeDrawer.set(showAnalytics() ? "none" : "analytics"),
             },
             () => (showAnalytics() ? "Hide Analytics" : "Analytics"),
+          ),
+          el(
+            "button",
+            {
+              class: () => `btn secondary toggle-analytics ${showMonitor() ? "active" : ""}`,
+              type: "button",
+              onClick: () =>
+                activeDrawer.set(showMonitor() ? "none" : "monitor"),
+            },
+            () => (showMonitor() ? "Hide Monitor" : "Monitor"),
           ),
         ),
       ),
@@ -648,6 +903,7 @@ function AppView() {
       ),
     ),
     show(showAnalytics, () => AnalyticsPanel()),
+    show(showMonitor, () => MonitorPanel()),
   );
 }
 

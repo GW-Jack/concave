@@ -128,6 +128,12 @@ test("end-to-end native Roc platform: WS reactivity, index-range isolation, comp
   const analyticsClientJs = await analyticsClientResp.text();
   assert.ok(analyticsClientJs.includes("createAnalytics"));
 
+  const monitorClientResp = await fetch(`${serverUrl}/_concave/monitor.js`);
+  assert.equal(monitorClientResp.status, 200);
+  assert.match(monitorClientResp.headers.get("content-type") ?? "", /text\/javascript/);
+  const monitorClientJs = await monitorClientResp.text();
+  assert.ok(monitorClientJs.includes("createMonitor"));
+
   const mainJsResp = await fetch(`${serverUrl}/src/main.js`);
   assert.equal(mainJsResp.status, 200);
   assert.match(mainJsResp.headers.get("content-type") ?? "", /text\/javascript/);
@@ -178,6 +184,12 @@ test("end-to-end native Roc platform: WS reactivity, index-range isolation, comp
     distinct_id: "alice",
     override_properties: [],
   });
+  const liveMonitorLogs = alice.query(api.monitor.recentLogs, {
+    service: "chat",
+    level: "",
+    fn_name: "",
+    limit: 20,
+  });
 
   await waitForCondition(() => aliceMsgs().status === "ready", 5000, "aliceMsgs ready");
   await waitForCondition(() => bobMsgs().status === "ready", 5000, "bobMsgs ready");
@@ -185,6 +197,7 @@ test("end-to-end native Roc platform: WS reactivity, index-range isolation, comp
   await waitForCondition(() => liveSummary().status === "ready", 5000, "liveSummary ready");
   await waitForCondition(() => liveMsgTrend().status === "ready", 5000, "liveMsgTrend ready");
   await waitForCondition(() => aliceFlags().status === "ready", 5000, "aliceFlags ready");
+  await waitForCondition(() => liveMonitorLogs().status === "ready", 5000, "liveMonitorLogs ready");
 
   assert.equal(aliceMsgs().data.length, 1);
   assert.equal(bobMsgs().data.length, 1);
@@ -223,6 +236,11 @@ test("end-to-end native Roc platform: WS reactivity, index-range isolation, comp
     () => liveMsgTrend().data?.total_events === 1 && liveSummary().data?.total_events === 1,
     5000,
     `live analytics summary/trends react to message_sent (summary: ${JSON.stringify(liveSummary())}, trend: ${JSON.stringify(liveMsgTrend())})`,
+  );
+  await waitForCondition(
+    () => liveMonitorLogs().data?.length === 1 && liveMonitorLogs().data[0].message.includes("Message sent by Alice"),
+    5000,
+    `live monitor logs react to message_sent (logs: ${JSON.stringify(liveMonitorLogs())})`,
   );
 
   // Give a brief tick and verify Bob was NOT invalidated by #general write.
@@ -314,4 +332,5 @@ test("end-to-end native Roc platform: WS reactivity, index-range isolation, comp
   liveSummary.dispose();
   liveMsgTrend.dispose();
   aliceFlags.dispose();
+  liveMonitorLogs.dispose();
 });

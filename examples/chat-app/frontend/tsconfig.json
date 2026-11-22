@@ -11,6 +11,7 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "paths": {
       "/_concave/analytics.js": ["../../../packages/analytics/client.d.ts"],
+      "/_concave/monitor.js": ["../../../packages/monitor/client.d.ts"],
       "/_concave/*": ["../../../client/concave-client/src/*"]
     }
   },
@@ -18,6 +19,7 @@
     "src/**/*.js",
     "src/**/*.d.ts",
     "../../../client/concave-client/src/**/*.d.ts",
-    "../../../packages/analytics/*.d.ts"
+    "../../../packages/analytics/*.d.ts",
+    "../../../packages/monitor/*.d.ts"
   ]
 }

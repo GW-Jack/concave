@@ -498,3 +498,63 @@ body,
 .muted {
   color: var(--muted);
 }
+
+.monitor-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.issue-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.alert-pill {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.alert-pill.ok {
+  background: rgba(52, 211, 153, 0.14);
+  border-color: rgba(52, 211, 153, 0.4);
+  color: var(--ok);
+}
+
+.alert-pill.firing {
+  background: rgba(248, 113, 113, 0.16);
+  border-color: rgba(248, 113, 113, 0.45);
+  color: var(--err);
+}
+
+.alert-pill.acked {
+  background: rgba(251, 191, 36, 0.16);
+  border-color: rgba(251, 191, 36, 0.45);
+  color: var(--warn);
+}
+
+.log-level {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.log-level.info,
+.log-level.debug {
+  color: var(--accent);
+}
+
+.log-level.warn {
+  color: var(--warn);
+}
+
+.log-level.error,
+.log-level.fatal {
+  color: var(--err);
+}

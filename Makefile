@@ -55,9 +55,16 @@ test-roc:
 	roc test packages/analytics/Flags.roc
 	roc test packages/analytics/Insights.roc
 	roc test packages/analytics/Analytics.roc
+	roc check packages/monitor/main.roc
+	roc test packages/monitor/Attrs.roc
+	roc test packages/monitor/Fingerprint.roc
+	roc test packages/monitor/Rollups.roc
+	roc test packages/monitor/Alerts.roc
+	roc test packages/monitor/Monitor.roc
 	roc check platform/main.roc
 	roc check examples/chat-app/backend/main.roc
 	roc check tests/fixtures/analytics-app/main.roc
+	roc check tests/fixtures/monitor-app/main.roc
 	roc check tests/fixtures/platform-features-app/main.roc
 
 test-client:
@@ -66,6 +73,8 @@ test-client:
 test-e2e: host codegen-chat
 	node --test --test-timeout=15000 tests/e2e_chat_platform.mjs
 	node --test --test-timeout=20000 tests/e2e_analytics.mjs
+	node --test --test-timeout=30000 tests/property_analytics.mjs
+	node --test --test-timeout=20000 tests/e2e_monitor.mjs
 	node --test --test-timeout=25000 tests/e2e_platform_features.mjs
 	node --test --test-timeout=25000 tests/e2e_production_hardening.mjs
 
@@ -85,10 +94,13 @@ test: test-zig test-roc test-client test-e2e test-ws test-stress
 verify-formal:
 	lean specs/lean/KeyCodec.lean
 	lean specs/lean/ReadSetSoundness.lean
+	lean specs/lean/AnalyticsProofs.lean
 	maude -no-banner specs/maude/signals.maude
 	maude -no-banner specs/maude/optimistic_sync.maude
 	maude -no-banner specs/maude/concave_cluster.maude
+	maude -no-banner -batch specs/maude/analytics_identity.maude
 	z3 specs/z3/key_and_occ.smt2
+	z3 specs/z3/analytics.smt2
 
 codegen-chat: host
 	./zig-out/bin/concave codegen \

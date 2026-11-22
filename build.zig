@@ -27,6 +27,9 @@ pub fn build(b: *std.Build) void {
     host_mod.addAnonymousImport("concave_analytics_client_js", .{
         .root_source_file = b.path("packages/analytics/client.js"),
     });
+    host_mod.addAnonymousImport("concave_monitor_client_js", .{
+        .root_source_file = b.path("packages/monitor/client.js"),
+    });
     host_mod.addAnonymousImport("concave_dashboard_index_html", .{
         .root_source_file = b.path("client/concave-dashboard/index.html"),
     });
@@ -91,6 +94,9 @@ pub fn build(b: *std.Build) void {
     });
     test_mod.addAnonymousImport("concave_analytics_client_js", .{
         .root_source_file = b.path("packages/analytics/client.js"),
+    });
+    test_mod.addAnonymousImport("concave_monitor_client_js", .{
+        .root_source_file = b.path("packages/monitor/client.js"),
     });
     test_mod.addAnonymousImport("concave_dashboard_index_html", .{
         .root_source_file = b.path("client/concave-dashboard/index.html"),
