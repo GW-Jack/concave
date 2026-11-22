@@ -100,3 +100,8 @@ jobs:
           done
           curl -fsS http://127.0.0.1:18080/ready
           curl -fsS http://127.0.0.1:18080/_concave/index.js | grep -q "ConcaveClient"
+          curl -fsS http://127.0.0.1:18080/_dashboard | grep -q "Concave Dashboard"
+          curl -fsS http://127.0.0.1:18080/_admin/stats | grep -q "commit_ts"
+          curl -fsS http://127.0.0.1:18080/_internal/metrics | grep -q "concave_up"
+          docker stop -t 5 ci-smoke
+          test "$(docker inspect -f '{{.State.ExitCode}}' ci-smoke)" = "0"
