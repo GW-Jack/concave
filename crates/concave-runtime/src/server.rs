@@ -37,6 +37,7 @@ impl Default for ServerConfig {
 pub fn build_router(engine: Arc<ConcaveEngine>, static_dir: Option<PathBuf>) -> Router {
     let mut app = Router::new()
         .route("/health", get(health))
+        .route("/ready", get(ready))
         .route("/api/manifest", get(get_manifest))
         .route("/api/query/{name}", post(http_query))
         .route("/api/mutation/{name}", post(http_mutation))
@@ -164,12 +165,49 @@ pub async fn serve(engine: Arc<ConcaveEngine>, config: ServerConfig) -> Result<(
         .map_err(|e| format!("failed to bind {}: {e}", config.bind_addr))?;
     info!("Concave server listening on http://{}", config.bind_addr);
     axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| format!("server error: {e}"))
 }
 
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("received SIGINT, draining Concave server..."),
+        _ = terminate => info!("received SIGTERM, draining Concave server..."),
+    }
+}
+
 async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
+}
+
+async fn ready(State(engine): State<Arc<ConcaveEngine>>) -> impl IntoResponse {
+    match engine.ready_check().await {
+        Ok(commit_ts) => (
+            StatusCode::OK,
+            Json(json!({ "status": "ready", "commit_ts": commit_ts })),
+        ),
+        Err(err) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "unavailable", "error": err.to_string() })),
+        ),
+    }
 }
 
 async fn get_manifest(State(engine): State<Arc<ConcaveEngine>>) -> impl IntoResponse {

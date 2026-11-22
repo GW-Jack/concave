@@ -30,7 +30,9 @@ platform ""
         arm64mac: { inputs: ["libhost.a", app] },
         x64mac: { inputs: ["libhost.a", app] },
         x64linux: { inputs: ["libhost.a", app] },
+        x64glibc: { inputs: ["libhost.a", app] },
         arm64linux: { inputs: ["libhost.a", app] },
+        arm64glibc: { inputs: ["libhost.a", app] },
     }
 
 import Host

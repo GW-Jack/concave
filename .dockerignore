@@ -1,0 +1,10 @@
+target/
+.git/
+.concave/
+platform/targets/
+examples/*/.concave/
+examples/*/frontend/src/_generated/
+*.db
+*.db-wal
+*.db-shm
+.DS_Store

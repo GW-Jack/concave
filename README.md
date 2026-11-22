@@ -68,3 +68,4 @@ To run against PostgreSQL (e.g., Neon, PlanetScale Postgres, or local PG) instea
 - [Architecture & Design](docs/ARCHITECTURE.md)
 - [Roc API Guide](docs/ROC_API.md)
 - [WebSocket & HTTP Wire Protocol](docs/PROTOCOL.md)
+- [Deploying to Google Cloud Run + Serverless Postgres](docs/DEPLOY_CLOUD_RUN.md)

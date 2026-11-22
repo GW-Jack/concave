@@ -1,0 +1,75 @@
+# syntax=docker/dockerfile:1
+# Multi-stage production build for deploying any Concave Roc app to Google Cloud Run
+# (or Fly.io / Railway / Cloudflare Containers) backed by Serverless PostgreSQL.
+
+ARG APP_ENTRY=examples/chat-app/backend/main.roc
+ARG FRONTEND_DIR=examples/chat-app/frontend
+ARG ROC_VERSION=0.1.0_RC1
+
+FROM rust:1.95-bookworm AS builder
+ARG TARGETARCH
+ARG APP_ENTRY
+ARG FRONTEND_DIR
+ARG ROC_VERSION
+
+WORKDIR /src
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Roc 0.1.0_RC1 for the container architecture (amd64 -> x86_64, arm64 -> arm64).
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+      amd64) ROC_ASSET="roc-linux_x86_64-${ROC_VERSION}.tar.gz"; ROC_TARGET="x64linux" ;; \
+      arm64) ROC_ASSET="roc-linux_arm64-${ROC_VERSION}.tar.gz"; ROC_TARGET="arm64linux" ;; \
+      *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    mkdir -p /opt/roc; \
+    curl -fsSL "https://github.com/roc-lang/roc/releases/download/${ROC_VERSION}/${ROC_ASSET}" \
+      | tar -xz --strip-components=1 -C /opt/roc; \
+    ln -s /opt/roc/roc /usr/local/bin/roc; \
+    echo "${ROC_TARGET}" > /opt/roc-target; \
+    roc version
+
+COPY . .
+
+# 1. Build release Rust host staticlib (`libhost.a`) and `concave` CLI.
+RUN set -eux; \
+    ROC_TARGET="$(cat /opt/roc-target)"; \
+    cargo build --release -p concave-host -p concave-cli; \
+    mkdir -p "platform/targets/${ROC_TARGET}"; \
+    cp target/release/libconcave_host.a "platform/targets/${ROC_TARGET}/libhost.a"
+
+# 2. Compile the Roc backend + Rust host into a standalone native binary and generate typed client API.
+RUN set -eux; \
+    ROC_TARGET="$(cat /opt/roc-target)"; \
+    mkdir -p /out; \
+    roc build --opt=speed --target="${ROC_TARGET}" --output=/out/concave-server "${APP_ENTRY}"; \
+    /src/target/release/concave codegen \
+      --entry "${APP_ENTRY}" \
+      --out "/out/frontend/src/_generated" \
+      --opt=dev; \
+    cp -r "${FRONTEND_DIR}/." /out/frontend/
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=builder /out/concave-server /app/concave-server
+COPY --from=builder /out/frontend /app/frontend
+
+ENV PORT=8080
+ENV CONCAVE_HOST=0.0.0.0
+ENV CONCAVE_STATIC_DIR=/app/frontend
+ENV CONCAVE_COMMIT_POLL_MS=100
+ENV RUST_LOG=info
+
+EXPOSE 8080
+
+ENTRYPOINT ["/app/concave-server", "--serve"]

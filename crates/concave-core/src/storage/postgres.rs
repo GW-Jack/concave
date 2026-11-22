@@ -1,5 +1,9 @@
+use std::str::FromStr;
+use std::time::Duration;
+
 use async_trait::async_trait;
 use serde_json::Value;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, QueryBuilder, Row};
 
 use crate::error::{CoreError, CoreResult};
@@ -25,13 +29,31 @@ pub struct PostgresStorage {
 }
 
 impl PostgresStorage {
+    /// Connect to PostgreSQL with serverless/PgBouncer-safe defaults:
+    /// - `statement_cache_capacity(0)` for transaction-mode poolers (Neon, PlanetScale PG, PgBouncer)
+    /// - `min_connections(0)` & idle timeout so Cloud Run + serverless PG can scale to zero cleanly
     pub async fn connect(
         database_url: &str,
         deployment_id: impl Into<String>,
     ) -> CoreResult<Self> {
-        let pool = PgPool::connect(database_url)
+        let connect_opts = PgConnectOptions::from_str(database_url)
+            .map_err(|e| CoreError::Storage(format!("invalid DATABASE_URL: {e}")))?
+            .statement_cache_capacity(0);
+
+        let max_conns: u32 = std::env::var("CONCAVE_PG_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+
+        let pool = PgPoolOptions::new()
+            .max_connections(max_conns)
+            .min_connections(0)
+            .acquire_timeout(Duration::from_secs(10))
+            .idle_timeout(Duration::from_secs(30))
+            .connect_with(connect_opts)
             .await
             .map_err(|e| CoreError::Storage(e.to_string()))?;
+
         Ok(Self {
             pool,
             deployment_id: deployment_id.into(),

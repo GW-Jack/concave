@@ -104,6 +104,13 @@ test("end-to-end native Roc platform: WS reactivity, index-range isolation, comp
 
   await waitForHealth(serverUrl);
 
+  // Verify readiness probe reports storage commit_ts.
+  const readyResp = await fetch(`${serverUrl}/ready`);
+  assert.equal(readyResp.status, 200);
+  const readyBody = await readyResp.json();
+  assert.equal(readyBody.status, "ready");
+  assert.equal(typeof readyBody.commit_ts, "number");
+
   // Verify zero-npm TypeScript serving via Concave's built-in Rust `oxc` transpiler!
   const indexHtml = await fetch(`${serverUrl}/`);
   assert.equal(indexHtml.status, 200);

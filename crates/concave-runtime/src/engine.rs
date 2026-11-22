@@ -1,11 +1,13 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use concave_core::{AppManifest, CoreError, ReadSet, StorageBackend, WriteSet};
 use reqwest::Method;
 use serde_json::Value;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -38,6 +40,8 @@ pub struct ConcaveEngine {
     auth_config: AuthConfig,
     http_client: reqwest::Client,
     clients: RwLock<HashMap<Uuid, ClientSession>>,
+    last_broadcast_ts: AtomicI64,
+    sync_lock: Mutex<()>,
 }
 
 impl ConcaveEngine {
@@ -48,6 +52,7 @@ impl ConcaveEngine {
     ) -> Result<Arc<Self>, CoreError> {
         let manifest = executor.manifest();
         storage.init_schema(&manifest).await?;
+        let initial_ts = storage.latest_commit_ts().await?;
 
         Ok(Arc::new(Self {
             storage,
@@ -56,7 +61,58 @@ impl ConcaveEngine {
             auth_config,
             http_client: reqwest::Client::new(),
             clients: RwLock::new(HashMap::new()),
+            last_broadcast_ts: AtomicI64::new(initial_ts),
+            sync_lock: Mutex::new(()),
         }))
+    }
+
+    /// Readiness check verifying storage connectivity (used by Cloud Run `/ready` probe).
+    pub async fn ready_check(&self) -> Result<i64, CoreError> {
+        self.storage.latest_commit_ts().await
+    }
+
+    /// Poll `commit_log` for commits written by other autoscaled instances and push
+    /// matching `Transition` frames to local WebSocket subscribers.
+    ///
+    /// Returns the number of remote commits processed. Skips database traffic entirely
+    /// when no clients are connected so Cloud Run and serverless Postgres can scale to zero.
+    pub async fn poll_commit_log(&self) -> Result<usize, CoreError> {
+        if self.clients.read().await.is_empty() {
+            return Ok(0);
+        }
+
+        let _guard = self.sync_lock.lock().await;
+        let since = self.last_broadcast_ts.load(Ordering::Acquire);
+        let entries = self.storage.commits_since(since).await?;
+        let count = entries.len();
+        for entry in entries {
+            if !entry.write_set.is_empty() {
+                self.broadcast_invalidation(entry.commit_ts, &entry.write_set)
+                    .await;
+            }
+            self.last_broadcast_ts
+                .store(entry.commit_ts, Ordering::Release);
+        }
+        Ok(count)
+    }
+
+    /// Spawn a background `commit_log` tailer enabling horizontal autoscaling across
+    /// multiple Cloud Run / container instances backed by shared PostgreSQL.
+    pub fn spawn_commit_tailer(
+        self: &Arc<Self>,
+        poll_interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(poll_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                if let Err(err) = engine.poll_commit_log().await {
+                    warn!("commit_log tailer error: {err}");
+                }
+            }
+        })
     }
 
     pub fn manifest(&self) -> Arc<AppManifest> {
@@ -274,7 +330,7 @@ impl ConcaveEngine {
             {
                 Ok(commit) => {
                     if !commit.write_set.is_empty() {
-                        self.broadcast_invalidation(commit.commit_ts, &commit.write_set)
+                        self.handle_local_commit(commit.commit_ts, &commit.write_set)
                             .await;
                     }
                     return Ok((value, commit.commit_ts));
@@ -310,6 +366,41 @@ impl ConcaveEngine {
         });
         let mut env = ExecutionEnv::Action { bridge, auth };
         self.executor.execute_action(name, args, &mut env).await
+    }
+
+    async fn handle_local_commit(&self, commit_ts: i64, write_set: &WriteSet) {
+        let _guard = self.sync_lock.lock().await;
+        let since = self.last_broadcast_ts.load(Ordering::Acquire);
+
+        if commit_ts == since + 1 {
+            // Fast path: no commits from other instances in between — zero extra DB query.
+            self.broadcast_invalidation(commit_ts, write_set).await;
+            self.last_broadcast_ts.store(commit_ts, Ordering::Release);
+            return;
+        }
+
+        if commit_ts <= since {
+            return;
+        }
+
+        // Catch up any intermediate commits from other instances before broadcasting ours.
+        match self.storage.commits_since(since).await {
+            Ok(entries) => {
+                for entry in entries {
+                    if !entry.write_set.is_empty() {
+                        self.broadcast_invalidation(entry.commit_ts, &entry.write_set)
+                            .await;
+                    }
+                    self.last_broadcast_ts
+                        .store(entry.commit_ts, Ordering::Release);
+                }
+            }
+            Err(err) => {
+                warn!("failed to catch up commit_log before local broadcast: {err}");
+                self.broadcast_invalidation(commit_ts, write_set).await;
+                self.last_broadcast_ts.store(commit_ts, Ordering::Release);
+            }
+        }
     }
 
     async fn broadcast_invalidation(&self, commit_ts: i64, write_set: &WriteSet) {
@@ -610,6 +701,97 @@ mod tests {
         assert!(
             rx_b.try_recv().is_err(),
             "client_b watching #roc must NOT be invalidated by #general write"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_instance_commit_log_tailer_pushes_transitions_to_remote_subscribers() {
+        let manifest = Arc::new(AppManifest {
+            app_name: "chat".into(),
+            tables: vec![TableSpec {
+                name: "messages".into(),
+                document_schema: SchemaType::Any,
+                indexes: vec![IndexSpec {
+                    name: "by_room".into(),
+                    fields: vec!["room".into()],
+                }],
+            }],
+            components: vec![],
+            functions: vec![],
+        });
+
+        // Two separate ConcaveEngine replicas sharing the exact same StorageBackend
+        // (simulating two autoscaled Cloud Run instances sharing PostgreSQL).
+        let shared_storage = Arc::new(SqliteStorage::open_in_memory("cloud-run-dep").unwrap());
+        let executor_a = Arc::new(MockChatExecutor {
+            manifest: manifest.clone(),
+        });
+        let executor_b = Arc::new(MockChatExecutor { manifest });
+
+        let engine_a = ConcaveEngine::new(shared_storage.clone(), executor_a, AuthConfig::default())
+            .await
+            .unwrap();
+        let engine_b = ConcaveEngine::new(shared_storage, executor_b, AuthConfig::default())
+            .await
+            .unwrap();
+
+        let (tx_general, mut rx_general) = mpsc::unbounded_channel();
+        let (tx_roc, mut rx_roc) = mpsc::unbounded_channel();
+        let client_general = engine_b.register_client(tx_general).await;
+        let client_roc = engine_b.register_client(tx_roc).await;
+
+        engine_b
+            .subscribe(
+                client_general,
+                "sub_g".into(),
+                "messages.list".into(),
+                json!({ "room": "general" }),
+            )
+            .await;
+        engine_b
+            .subscribe(
+                client_roc,
+                "sub_r".into(),
+                "messages.list".into(),
+                json!({ "room": "roc" }),
+            )
+            .await;
+
+        // Drain initial empty snapshots on replica B.
+        let _ = rx_general.recv().await.unwrap();
+        let _ = rx_roc.recv().await.unwrap();
+
+        // Commit a mutation on replica A!
+        engine_a
+            .execute_mutation(
+                "messages.send",
+                json!({ "room": "general", "body": "cross-instance hello" }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Replica B's commit_log tailer catches up and pushes ONLY to client_general.
+        let processed = engine_b.poll_commit_log().await.unwrap();
+        assert_eq!(processed, 1);
+
+        let frame = rx_general
+            .try_recv()
+            .expect("subscriber on replica B must receive transition for replica A commit");
+        match frame {
+            ServerMessage::Transition { to_ts, updates } => {
+                assert_eq!(to_ts, 1);
+                assert_eq!(updates.len(), 1);
+                assert_eq!(
+                    updates[0].value.as_ref().unwrap()[0]["body"],
+                    "cross-instance hello"
+                );
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+        assert!(
+            rx_roc.try_recv().is_err(),
+            "unrelated room subscriber on replica B must NOT be invalidated"
         );
     }
 }

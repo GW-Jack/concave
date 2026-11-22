@@ -631,18 +631,43 @@ struct HostCli {
     database_url: Option<String>,
     deployment_id: String,
     static_dir: Option<PathBuf>,
+    commit_poll_ms: u64,
 }
 
 fn parse_cli(args: &[String]) -> Result<HostCli, String> {
+    // Cloud Run injects `PORT` (typically 8080) and expects binding on `0.0.0.0`.
+    let env_port = std::env::var("PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok());
+    let default_host: IpAddr = std::env::var("CONCAVE_HOST")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            if env_port.is_some() {
+                IpAddr::from([0, 0, 0, 0])
+            } else {
+                IpAddr::from([127, 0, 0, 1])
+            }
+        });
+
     let mut cli = HostCli {
         introspect: false,
-        host: IpAddr::from([127, 0, 0, 1]),
-        port: 3210,
-        db_path: PathBuf::from(".concave/dev.db"),
-        database_url: std::env::var("DATABASE_URL").ok(),
+        host: default_host,
+        port: env_port.unwrap_or(3210),
+        db_path: PathBuf::from(
+            std::env::var("CONCAVE_DB_PATH").unwrap_or_else(|_| ".concave/dev.db".to_string()),
+        ),
+        database_url: std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty()),
         deployment_id: std::env::var("CONCAVE_DEPLOYMENT_ID")
             .unwrap_or_else(|_| "default".to_string()),
-        static_dir: None,
+        static_dir: std::env::var("CONCAVE_STATIC_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from),
+        commit_poll_ms: std::env::var("CONCAVE_COMMIT_POLL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100),
     };
 
     let mut i = 1;
@@ -679,6 +704,13 @@ fn parse_cli(args: &[String]) -> Result<HostCli, String> {
                 i += 1;
                 let v = args.get(i).ok_or("--static-dir requires a value")?;
                 cli.static_dir = Some(PathBuf::from(v));
+            }
+            "--commit-poll-ms" => {
+                i += 1;
+                let v = args.get(i).ok_or("--commit-poll-ms requires a value")?;
+                cli.commit_poll_ms = v
+                    .parse()
+                    .map_err(|e| format!("invalid --commit-poll-ms `{v}`: {e}"))?;
             }
             "--help" | "-h" => {
                 println!(
@@ -770,9 +802,25 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
             )
         };
 
-        let engine = ConcaveEngine::new(storage, executor, AuthConfig::default())
+        let allow_dev_tokens = std::env::var("CONCAVE_ALLOW_DEV_TOKENS")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
+        let auth_config = AuthConfig {
+            jwt_secret: std::env::var("CONCAVE_JWT_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            allow_dev_tokens,
+        };
+
+        let engine = ConcaveEngine::new(storage, executor, auth_config)
             .await
             .map_err(|e| format!("failed to start ConcaveEngine: {e}"))?;
+
+        let _tailer = if cli.commit_poll_ms > 0 {
+            Some(engine.spawn_commit_tailer(std::time::Duration::from_millis(cli.commit_poll_ms)))
+        } else {
+            None
+        };
 
         serve(
             engine,
