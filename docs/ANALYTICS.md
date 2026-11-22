@@ -82,12 +82,14 @@ place_order! = |ctx, args| {
 - `<ns>.funnel` — Ordered multi-step conversion funnel with conversion window, step/overall conversion rates, and average time-to-convert.
 - `<ns>.retention` — Cohort retention matrix (`cohort_event`, `return_event`, `period_ms`, `num_periods`; pass `from_ms < 0` to default to the trailing window).
 
-## Optional Browser / Node Client Helper (`packages/analytics/client.js`)
+## Optional Browser / Node Client Helper (`/_concave/analytics.js`)
+
+The Zig host embeds `packages/analytics/client.js` directly at `/_concave/analytics.js` alongside `/_concave/index.js` — zero `npm`, zero bundler:
 
 ```js
 import { ConcaveClient } from "/_concave/index.js";
+import { createAnalytics } from "/_concave/analytics.js";
 import { api } from "./_generated/api.js";
-import { createAnalytics } from "./packages/analytics/client.js";
 
 const client = new ConcaveClient(window.location.origin);
 const posthog = createAnalytics(client, api.analytics);
@@ -99,8 +101,10 @@ await posthog.identify("alice", {
 });
 await posthog.capture("message_sent", { room_id: "general" });
 
-// Reactive feature flags signal (updates live when flags change):
-const flags = posthog.subscribeFlags();
+// Reactive feature flags & live insights (update automatically over WebSockets):
+const flags = posthog.subscribeFlags({}, () => client.identity()?.subject ?? posthog.distinctId);
+const summary = posthog.subscribeSummary();
+const funnel = posthog.subscribeFunnel(["room_viewed", "message_sent"]);
 ```
 
 ## Property Filter Operators

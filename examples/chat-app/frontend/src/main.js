@@ -14,6 +14,7 @@ import {
   show,
   signal,
 } from "/_concave/index.js";
+import { createAnalytics, fromProps } from "/_concave/analytics.js";
 import { api } from "./_generated/api.js";
 
 /** @typedef {import("./_generated/dataModel.d.ts").Id<"rooms">} RoomId */
@@ -34,6 +35,7 @@ const newRoomTopic = signal("");
 /** @type {import("/_concave/index.d.ts").Signal<string | null>} */
 const errorMessage = signal(null);
 const previewBusy = signal(false);
+const showAnalytics = signal(false);
 
 /** @param {string} handle */
 function makeDevToken(handle) {
@@ -45,12 +47,50 @@ function makeDevToken(handle) {
 const client = new ConcaveClient(SERVER_URL, {
   authToken: makeDevToken(storedHandle),
 });
+const analytics = createAnalytics(client, api.analytics);
 
-// Seed default rooms on boot if the database is empty.
+// Seed default rooms & feature flags on boot if the database is empty.
 void client.mutate(api.rooms.ensureDefaults, {}).then((rooms) => {
   if (!activeRoomId() && rooms.length > 0) {
     activeRoomId.set(rooms[0].id);
   }
+});
+
+// Capture initial `$pageview` once connected.
+let pageviewSent = false;
+effect(() => {
+  if (client.status() === "connected" && !pageviewSent) {
+    pageviewSent = true;
+    void analytics.capturePageview({ app: "concave-chat" }).catch(() => {});
+  }
+});
+
+// Identify the signed-in user in Analytics whenever identity changes (links anon_id -> subject).
+/** @type {string | null} */
+let lastIdentified = null;
+effect(() => {
+  const ident = client.identity();
+  if (!ident || ident.subject === lastIdentified) return;
+  lastIdentified = ident.subject;
+  void analytics
+    .identify(ident.subject, {
+      set: { name: ident.name ?? ident.subject },
+      setOnce: { first_handle: ident.name ?? ident.subject },
+    })
+    .catch(() => {});
+});
+
+// Track `room_viewed` whenever the user opens a room.
+/** @type {string | null} */
+let lastTrackedRoom = null;
+effect(() => {
+  const room = activeRoom();
+  const ident = client.identity();
+  if (!room || !ident || room.id === lastTrackedRoom) return;
+  lastTrackedRoom = room.id;
+  void analytics
+    .capture("room_viewed", { room_id: room.id, room_name: room.name })
+    .catch(() => {});
 });
 
 // Reactive queries directly wired to Concave WebSocket `commit_ts` transitions.
@@ -68,6 +108,27 @@ const rateLimitQuery = client.query(api.rate_limit.status, () => {
   return id ? { key: id.subject } : null;
 });
 
+// Live reactive Feature Flags (re-evaluates automatically on identity switch OR flag toggle!).
+const flagsQuery = analytics.subscribeFlags(
+  {},
+  () => client.identity()?.subject ?? analytics.distinctId,
+);
+
+// Lazy reactive Analytics dashboard queries (only active while the Analytics drawer is open).
+const summaryQuery = analytics.subscribeSummary(() =>
+  showAnalytics() ? { top_n: 6 } : null,
+);
+const funnelQuery = analytics.subscribeFunnel(
+  ["room_viewed", "message_sent", "link_preview_posted"],
+  () => (showAnalytics() ? { conversion_window_ms: 3600000 } : null),
+);
+const recentEventsQuery = analytics.subscribeRecentEvents(() =>
+  showAnalytics() ? { limit: 15 } : null,
+);
+const flagDefsQuery = client.query(api.analytics.listFlags, () =>
+  showAnalytics() ? {} : null,
+);
+
 const rooms = computed(() => roomsQuery().data ?? []);
 const activeRoom = computed(() => {
   const id = activeRoomId();
@@ -75,6 +136,16 @@ const activeRoom = computed(() => {
 });
 const messages = computed(() => messagesQuery().data ?? []);
 const onlineUsers = computed(() => presenceQuery().data ?? []);
+const linkPreviewsEnabled = computed(() =>
+  analytics.isEnabled(flagsQuery().data, "link-previews", true),
+);
+const composerCtaVariant = computed(() =>
+  analytics.getVariant(flagsQuery().data, "composer-cta", "control"),
+);
+const topEvents = computed(() => summaryQuery().data?.top_events ?? []);
+const funnelSteps = computed(() => funnelQuery().data?.steps ?? []);
+const recentEvents = computed(() => recentEventsQuery().data ?? []);
+const flagDefs = computed(() => flagDefsQuery().data ?? []);
 
 // Auto-select the first room as soon as rooms arrive.
 effect(() => {
@@ -209,10 +280,190 @@ function formatTime(ms) {
   });
 }
 
+/** @param {import("/_concave/analytics.js").FeatureFlagDoc} flag */
+async function toggleFlag(flag) {
+  try {
+    await analytics.upsertFlag({
+      key: flag.key,
+      name: flag.name,
+      active: !flag.active,
+      rollout_pct: flag.rollout_pct,
+      filters: flag.filters,
+      variants: flag.variants,
+    });
+  } catch (err) {
+    errorMessage.set(err instanceof Error ? err.message : String(err));
+  }
+}
+
+function AnalyticsPanel() {
+  return el(
+    "aside",
+    { class: "analytics-panel" },
+    el(
+      "div",
+      { class: "analytics-header" },
+      el("h3", null, "Live Analytics"),
+      el("span", { class: "badge connected" }, "reactive"),
+    ),
+    el(
+      "div",
+      { class: "kpi-grid" },
+      el(
+        "div",
+        { class: "kpi-card" },
+        el("div", { class: "kpi-label" }, "Events (24h)"),
+        el("div", { class: "kpi-value" }, () =>
+          String(summaryQuery().data?.total_events ?? 0),
+        ),
+      ),
+      el(
+        "div",
+        { class: "kpi-card" },
+        el("div", { class: "kpi-label" }, "Persons"),
+        el("div", { class: "kpi-value" }, () =>
+          String(summaryQuery().data?.unique_persons ?? 0),
+        ),
+      ),
+      el(
+        "div",
+        { class: "kpi-card" },
+        el("div", { class: "kpi-label" }, "Sessions"),
+        el("div", { class: "kpi-value" }, () =>
+          String(summaryQuery().data?.active_sessions ?? 0),
+        ),
+      ),
+    ),
+    el(
+      "div",
+      { class: "analytics-section" },
+      el("div", { class: "section-title" }, "Feature Flags & Experiments"),
+      each(
+        flagDefs,
+        (f) => f.key,
+        (flag) =>
+          el(
+            "div",
+            { class: "flag-row" },
+            el(
+              "div",
+              { class: "flag-info" },
+              el("div", { class: "flag-key" }, () => flag().key),
+              el("div", { class: "flag-meta" }, () => {
+                const evals = flagsQuery().data;
+                const v = analytics.getVariant(evals, flag().key, "off");
+                return `${flag().name} · you: ${v}`;
+              }),
+            ),
+            el(
+              "button",
+              {
+                class: () => `flag-toggle ${flag().active ? "on" : "off"}`,
+                type: "button",
+                onClick: () => void toggleFlag(flag()),
+              },
+              () => (flag().active ? "ON" : "OFF"),
+            ),
+          ),
+      ),
+    ),
+    el(
+      "div",
+      { class: "analytics-section" },
+      el("div", { class: "section-title" }, "Conversion Funnel"),
+      each(
+        funnelSteps,
+        (s) => s.event,
+        (step) =>
+          el(
+            "div",
+            { class: "funnel-row" },
+            el(
+              "div",
+              { class: "funnel-head" },
+              el("span", { class: "mono" }, () => `${step().step_index + 1}. ${step().event}`),
+              el(
+                "span",
+                { class: "mono muted" },
+                () =>
+                  `${step().count} (${Math.round(step().conversion_rate_from_start * 100)}%)`,
+              ),
+            ),
+            el(
+              "div",
+              { class: "bar-track" },
+              el("div", {
+                class: "bar-fill",
+                style: () =>
+                  `width: ${Math.max(4, Math.round(step().conversion_rate_from_start * 100))}%`,
+              }),
+            ),
+          ),
+      ),
+    ),
+    el(
+      "div",
+      { class: "analytics-section" },
+      el("div", { class: "section-title" }, "Top Events"),
+      each(
+        topEvents,
+        (e) => e.event,
+        (ev) =>
+          el(
+            "div",
+            { class: "top-event-row" },
+            el("span", { class: "mono" }, () => ev().event),
+            el(
+              "span",
+              { class: "mono muted" },
+              () => `${ev().count} (${ev().unique_persons}u)`,
+            ),
+          ),
+      ),
+    ),
+    el(
+      "div",
+      { class: "analytics-section" },
+      el("div", { class: "section-title" }, "Live Event Stream"),
+      el(
+        "div",
+        { class: "event-stream" },
+        each(
+          recentEvents,
+          (e) => e.id,
+          (ev) =>
+            el(
+              "div",
+              { class: "event-row" },
+              el(
+                "div",
+                { class: "event-head" },
+                el("span", { class: "event-name" }, () => ev().event),
+                el("span", { class: "event-time" }, () =>
+                  formatTime(ev().timestamp_ms),
+                ),
+              ),
+              el("div", { class: "event-sub" }, () => {
+                const props = fromProps(ev().properties);
+                const summary = Object.entries(props)
+                  .slice(0, 2)
+                  .map(([k, v]) => `${k}=${v}`)
+                  .join(" · ");
+                return summary
+                  ? `${ev().distinct_id} · ${summary}`
+                  : ev().distinct_id;
+              }),
+            ),
+        ),
+      ),
+    ),
+  );
+}
+
 function AppView() {
   return el(
     "div",
-    { class: "layout" },
+    { class: () => `layout ${showAnalytics() ? "with-analytics" : ""}` },
     el(
       "aside",
       { class: "sidebar" },
@@ -314,6 +565,15 @@ function AppView() {
             const ident = client.identity();
             return ident ? `as ${ident.name ?? ident.subject}` : "unauthenticated";
           }),
+          el(
+            "button",
+            {
+              class: () => `btn secondary toggle-analytics ${showAnalytics() ? "active" : ""}`,
+              type: "button",
+              onClick: () => showAnalytics.set(!showAnalytics()),
+            },
+            () => (showAnalytics() ? "Hide Analytics" : "Analytics"),
+          ),
         ),
       ),
       el(
@@ -363,8 +623,10 @@ function AppView() {
         { class: "composer", onSubmit: handleSend },
         el("input", {
           class: "input",
-          placeholder:
-            "Type a message, or `/preview https://example.com` to run an external Action...",
+          placeholder: () =>
+            linkPreviewsEnabled()
+              ? "Type a message, or `/preview https://example.com` to run an external Action..."
+              : "Type a message (/preview disabled by feature flag)...",
           value: () => draft(),
           disabled: () => previewBusy(),
           onInput: (/** @type {Event} */ e) => {
@@ -378,10 +640,14 @@ function AppView() {
         el(
           "button",
           { class: "btn", type: "submit", disabled: () => previewBusy() },
-          () => (previewBusy() ? "Fetching..." : "Send"),
+          () => {
+            if (previewBusy()) return "Fetching...";
+            return composerCtaVariant() === "rocket" ? "Send 🚀" : "Send";
+          },
         ),
       ),
     ),
+    show(showAnalytics, () => AnalyticsPanel()),
   );
 }
 

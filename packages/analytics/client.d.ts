@@ -24,6 +24,30 @@ export interface FlagEvaluation {
   reason: string;
 }
 
+export interface FeatureFlagDoc {
+  id: string;
+  created_at: number;
+  key: string;
+  name: string;
+  active: boolean;
+  rollout_pct: number;
+  filters: PropertyFilter[];
+  variants: FlagVariant[];
+  updated_at_ms: number;
+}
+
+export interface EventDoc {
+  id: string;
+  created_at: number;
+  distinct_id: string;
+  event: string;
+  timestamp_ms: number;
+  session_id: string;
+  group_type: string;
+  group_key: string;
+  properties: Prop[];
+}
+
 export interface PersonProfile {
   found: boolean;
   distinct_id: string;
@@ -32,6 +56,46 @@ export interface PersonProfile {
   first_seen_ms: number;
   last_seen_ms: number;
   event_count: number;
+}
+
+export interface SummaryResult {
+  total_events: number;
+  unique_persons: number;
+  active_sessions: number;
+  top_events: Array<{
+    event: string;
+    count: number;
+    unique_persons: number;
+  }>;
+}
+
+export interface TrendResult {
+  event: string;
+  total_events: number;
+  unique_persons: number;
+  buckets: Array<{
+    bucket_start_ms: number;
+    count: number;
+    unique_persons: number;
+  }>;
+  breakdown: Array<{
+    value: string;
+    count: number;
+    unique_persons: number;
+  }>;
+}
+
+export interface FunnelResult {
+  total_entered: number;
+  overall_conversion_rate: number;
+  steps: Array<{
+    step_index: number;
+    event: string;
+    count: number;
+    conversion_rate_from_prev: number;
+    conversion_rate_from_start: number;
+    avg_time_from_prev_ms: number;
+  }>;
 }
 
 export interface CreateAnalyticsOptions {
@@ -50,19 +114,21 @@ export interface CaptureMeta {
   timestampMs?: number;
 }
 
+export type PropsInput = Record<string, unknown> | Prop[];
+
 export interface AnalyticsClient {
   readonly distinctId: string;
   readonly anonId: string;
   readonly sessionId: string;
   capture(
     event: string,
-    properties?: Record<string, unknown> | Prop[],
+    properties?: PropsInput,
     meta?: CaptureMeta,
   ): Promise<string>;
   captureBatch(
     events: Array<{
       event: string;
-      properties?: Record<string, unknown> | Prop[];
+      properties?: PropsInput;
       distinctId?: string;
       sessionId?: string;
       groupType?: string;
@@ -83,19 +149,67 @@ export interface AnalyticsClient {
   group(type: string, key: string): void;
   reset(): void;
   subscribeFlags(
-    overrideProperties?: Record<string, unknown> | Prop[],
-    targetDistinctId?: string,
+    overrideProperties?: PropsInput | (() => PropsInput),
+    targetDistinctId?: string | (() => string | null | undefined),
   ): Accessor<QueryState<FlagEvaluation[]>> & { dispose: Dispose };
   subscribeFlag(
     key: string,
-    overrideProperties?: Record<string, unknown> | Prop[],
-    targetDistinctId?: string,
+    overrideProperties?: PropsInput | (() => PropsInput),
+    targetDistinctId?: string | (() => string | null | undefined),
   ): Accessor<QueryState<FlagEvaluation>> & { dispose: Dispose };
+  subscribeListFlags(): Accessor<QueryState<FeatureFlagDoc[]>> & { dispose: Dispose };
+  subscribeSummary(
+    opts?:
+      | { from_ms?: number; to_ms?: number; top_n?: number }
+      | (() => { from_ms?: number; to_ms?: number; top_n?: number } | null),
+  ): Accessor<QueryState<SummaryResult>> & { dispose: Dispose };
+  subscribeTrends(
+    event: string,
+    opts?: {
+      from_ms?: number;
+      to_ms?: number;
+      bucket_ms?: number;
+      breakdown_property?: string;
+      filters?: PropertyFilter[];
+    },
+  ): Accessor<QueryState<TrendResult>> & { dispose: Dispose };
+  subscribeFunnel(
+    steps: string[],
+    opts?:
+      | {
+          from_ms?: number;
+          to_ms?: number;
+          conversion_window_ms?: number;
+          filters?: PropertyFilter[];
+        }
+      | (() => {
+          from_ms?: number;
+          to_ms?: number;
+          conversion_window_ms?: number;
+          filters?: PropertyFilter[];
+        } | null),
+  ): Accessor<QueryState<FunnelResult>> & { dispose: Dispose };
+  subscribeRecentEvents(
+    opts?:
+      | { event?: string; limit?: number }
+      | (() => { event?: string; limit?: number } | null),
+  ): Accessor<QueryState<EventDoc[]>> & { dispose: Dispose };
   evaluateFlagAndTrack(
     key: string,
-    overrideProperties?: Record<string, unknown> | Prop[],
+    overrideProperties?: PropsInput,
     targetDistinctId?: string,
   ): Promise<FlagEvaluation>;
+  upsertFlag(flag: {
+    key: string;
+    name?: string;
+    active: boolean;
+    rollout_pct?: number;
+    filters?: PropertyFilter[];
+    variants?: FlagVariant[];
+  }): Promise<string>;
+  deleteFlag(key: string): Promise<boolean>;
+  isEnabled(evals: FlagEvaluation[] | undefined, key: string, fallback?: boolean): boolean;
+  getVariant(evals: FlagEvaluation[] | undefined, key: string, fallback?: string): string;
   toProps: typeof toProps;
   fromProps: typeof fromProps;
 }

@@ -1296,18 +1296,28 @@ Analytics := [Analytics].{
     }
 
     ## Real-time overview KPIs (`total_events`, `unique_persons`, `active_sessions`, `top_events`).
+    ## When `to_ms <= 0`, scans `[from_ms, +∞)` so live WebSocket subscriptions automatically
+    ## receive every newly captured event without needing to advance `to_ms`.
     summary! : Ctx.QueryCtx, SummaryArgs => Try(Insights.SummaryResult, Str)
     summary! = |ctx, args| {
         now_ms! = ctx.now_ms!
-        to_ms = if args.to_ms <= 0 { now_ms!() } else { args.to_ms }
-        from_ms = if args.to_ms <= 0 and args.from_ms <= 0 { to_ms - 86400000 } else { args.from_ms }
+        is_live = args.to_ms <= 0
+        to_ms = if is_live { now_ms!() } else { args.to_ms }
+        from_ms = if is_live and args.from_ms <= 0 { to_ms - 86400000 } else { args.from_ms }
 
         docs =
-            Db.from_index(events_by_timestamp)
-            |> Db.gte([Key.int(from_ms)])
-            |> Db.lt([Key.int(to_ms + 1)])
-            |> Db.asc()
-            |> Db.collect!(ctx.db)?
+            if is_live {
+                Db.from_index(events_by_timestamp)
+                |> Db.gte([Key.int(from_ms)])
+                |> Db.asc()
+                |> Db.collect!(ctx.db)?
+            } else {
+                Db.from_index(events_by_timestamp)
+                |> Db.gte([Key.int(from_ms)])
+                |> Db.lt([Key.int(to_ms + 1)])
+                |> Db.asc()
+                |> Db.collect!(ctx.db)?
+            }
 
         aliases = load_aliases!(ctx.db)?
         records = docs |> List.map(event_doc_to_record)
@@ -1315,6 +1325,8 @@ Analytics := [Analytics].{
     }
 
     ## Real-time time-bucketed event Trends (uses `by_event_time` index for surgical ReadSet isolation!).
+    ## When `to_ms <= 0`, brackets `[ (event, from_ms), Prefix(event) )` so new events of the same name
+    ## trigger live WebSocket updates while unrelated event names never invalidate the subscription.
     trends! : Ctx.QueryCtx, TrendsArgs => Try(Insights.TrendResult, Str)
     trends! = |ctx, args| {
         event_name = Str.trim(args.event)
@@ -1322,15 +1334,24 @@ Analytics := [Analytics].{
             return Err("Trend event name cannot be empty")
         }
         now_ms! = ctx.now_ms!
-        to_ms = if args.to_ms <= 0 { now_ms!() } else { args.to_ms }
-        from_ms = if args.to_ms <= 0 and args.from_ms <= 0 { to_ms - 86400000 } else { args.from_ms }
+        is_live = args.to_ms <= 0
+        to_ms = if is_live { now_ms!() } else { args.to_ms }
+        from_ms = if is_live and args.from_ms <= 0 { to_ms - 86400000 } else { args.from_ms }
 
         docs =
-            Db.from_index(events_by_event_time)
-            |> Db.gte([Key.str(event_name), Key.int(from_ms)])
-            |> Db.lt([Key.str(event_name), Key.int(to_ms + 1)])
-            |> Db.asc()
-            |> Db.collect!(ctx.db)?
+            if is_live {
+                Db.from_index(events_by_event_time)
+                |> Db.eq([Key.str(event_name)])
+                |> Db.gte([Key.str(event_name), Key.int(from_ms)])
+                |> Db.asc()
+                |> Db.collect!(ctx.db)?
+            } else {
+                Db.from_index(events_by_event_time)
+                |> Db.gte([Key.str(event_name), Key.int(from_ms)])
+                |> Db.lt([Key.str(event_name), Key.int(to_ms + 1)])
+                |> Db.asc()
+                |> Db.collect!(ctx.db)?
+            }
 
         aliases = load_aliases!(ctx.db)?
         records = docs |> List.map(event_doc_to_record)
@@ -1349,20 +1370,29 @@ Analytics := [Analytics].{
     }
 
     ## Real-time multi-step Conversion Funnel with conversion window & avg time-to-convert.
+    ## When `to_ms <= 0`, scans `[from_ms, +∞)` so live WebSocket subscriptions stay reactive.
     funnel! : Ctx.QueryCtx, FunnelArgs => Try(Insights.FunnelResult, Str)
     funnel! = |ctx, args| {
         now_ms! = ctx.now_ms!
-        to_ms = if args.to_ms <= 0 { now_ms!() } else { args.to_ms }
-        from_ms = if args.to_ms <= 0 and args.from_ms <= 0 { to_ms - 86400000 } else { args.from_ms }
+        is_live = args.to_ms <= 0
+        to_ms = if is_live { now_ms!() } else { args.to_ms }
+        from_ms = if is_live and args.from_ms <= 0 { to_ms - 86400000 } else { args.from_ms }
         window_ms = if args.conversion_window_ms <= 0 { 86400000 } else { args.conversion_window_ms }
         scan_end = to_ms + window_ms
 
         docs =
-            Db.from_index(events_by_timestamp)
-            |> Db.gte([Key.int(from_ms)])
-            |> Db.lt([Key.int(scan_end + 1)])
-            |> Db.asc()
-            |> Db.collect!(ctx.db)?
+            if is_live {
+                Db.from_index(events_by_timestamp)
+                |> Db.gte([Key.int(from_ms)])
+                |> Db.asc()
+                |> Db.collect!(ctx.db)?
+            } else {
+                Db.from_index(events_by_timestamp)
+                |> Db.gte([Key.int(from_ms)])
+                |> Db.lt([Key.int(scan_end + 1)])
+                |> Db.asc()
+                |> Db.collect!(ctx.db)?
+            }
 
         aliases = load_aliases!(ctx.db)?
         records = docs |> List.map(event_doc_to_record)
@@ -1370,6 +1400,7 @@ Analytics := [Analytics].{
     }
 
     ## Real-time Cohort Retention table.
+    ## Pass `from_ms < 0` to default to the trailing `num_periods * period_ms` window with live reactivity.
     retention! : Ctx.QueryCtx, RetentionArgs => Try(Insights.RetentionResult, Str)
     retention! = |ctx, args| {
         cohort_ev = Str.trim(args.cohort_event)
@@ -1389,15 +1420,23 @@ Analytics := [Analytics].{
             }
 
         now_ms! = ctx.now_ms!
-        from_ms = if args.from_ms < 0 { now_ms!() - (num_periods * period_ms) } else { args.from_ms }
+        is_live = args.from_ms < 0
+        from_ms = if is_live { now_ms!() - (num_periods * period_ms) } else { args.from_ms }
         end_ms = from_ms + (num_periods * period_ms)
 
         docs =
-            Db.from_index(events_by_timestamp)
-            |> Db.gte([Key.int(from_ms)])
-            |> Db.lt([Key.int(end_ms)])
-            |> Db.asc()
-            |> Db.collect!(ctx.db)?
+            if is_live {
+                Db.from_index(events_by_timestamp)
+                |> Db.gte([Key.int(from_ms)])
+                |> Db.asc()
+                |> Db.collect!(ctx.db)?
+            } else {
+                Db.from_index(events_by_timestamp)
+                |> Db.gte([Key.int(from_ms)])
+                |> Db.lt([Key.int(end_ms)])
+                |> Db.asc()
+                |> Db.collect!(ctx.db)?
+            }
 
         aliases = load_aliases!(ctx.db)?
         records = docs |> List.map(event_doc_to_record)
@@ -1453,6 +1492,20 @@ Analytics := [Analytics].{
             override_properties: [],
         })?
         Ok(eval.enabled)
+    }
+
+    ## Create or update a feature flag from inside a parent app mutation (e.g., seeding defaults).
+    upsert_flag_in_tx! : Mount, Ctx.MutationCtx, UpsertFlagArgs => Try(Str, Str)
+    upsert_flag_in_tx! = |m, parent_ctx, args| {
+        scoped = Ctx.scope_mutation(parent_ctx, m.namespace)
+        upsert_flag!(False, scoped, args)
+    }
+
+    ## List all feature flags from inside a parent app query or mutation (via `Ctx.as_query_ctx`).
+    list_flags_in_query! : Mount, Ctx.QueryCtx => Try(List(FeatureFlagDoc), Str)
+    list_flags_in_query! = |m, parent_ctx| {
+        scoped = Ctx.scope_query(parent_ctx, m.namespace)
+        list_flags!(scoped, {})
     }
 
     # -------------------------------------------------------------------------

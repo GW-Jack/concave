@@ -13,6 +13,13 @@ const WriteOp = storage_mod.WriteOp;
 const CommitEntry = storage_mod.CommitEntry;
 const CommitResult = storage_mod.CommitResult;
 
+pub const TlsMode = enum {
+    disable,
+    require,
+    verify_ca,
+    verify_full,
+};
+
 pub const PgUrl = struct {
     host: []u8,
     port: u16,
@@ -20,6 +27,7 @@ pub const PgUrl = struct {
     password: []u8,
     database: []u8,
     use_tls: bool,
+    tls_mode: TlsMode = .verify_full,
 
     pub fn deinit(self: *const PgUrl, allocator: Allocator) void {
         allocator.free(self.host);
@@ -81,18 +89,22 @@ pub const PgUrl = struct {
         }
         if (host_raw.len == 0) return error.InvalidDatabaseUrl;
 
-        var use_tls = !std.mem.eql(u8, host_raw, "localhost") and !std.mem.eql(u8, host_raw, "127.0.0.1");
+        var tls_mode: TlsMode = if (!std.mem.eql(u8, host_raw, "localhost") and !std.mem.eql(u8, host_raw, "127.0.0.1"))
+            .verify_full
+        else
+            .disable;
         var qit = std.mem.splitScalar(u8, query_part, '&');
         while (qit.next()) |kv| {
             if (std.mem.startsWith(u8, kv, "sslmode=")) {
                 const mode = kv["sslmode=".len..];
                 if (std.mem.eql(u8, mode, "disable")) {
-                    use_tls = false;
-                } else if (std.mem.eql(u8, mode, "require") or
-                    std.mem.eql(u8, mode, "verify-ca") or
-                    std.mem.eql(u8, mode, "verify-full"))
-                {
-                    use_tls = true;
+                    tls_mode = .disable;
+                } else if (std.mem.eql(u8, mode, "require")) {
+                    tls_mode = .require;
+                } else if (std.mem.eql(u8, mode, "verify-ca")) {
+                    tls_mode = .verify_ca;
+                } else if (std.mem.eql(u8, mode, "verify-full")) {
+                    tls_mode = .verify_full;
                 }
             }
         }
@@ -103,7 +115,8 @@ pub const PgUrl = struct {
             .user = try percentDecode(allocator, user_raw),
             .password = try percentDecode(allocator, pass_raw),
             .database = try percentDecode(allocator, db_raw),
-            .use_tls = use_tls,
+            .use_tls = tls_mode != .disable,
+            .tls_mode = tls_mode,
         };
     }
 };
@@ -169,7 +182,7 @@ const PgConn = struct {
         self.stream_reader = self.stream.reader(io, &self.net_read_buf);
         self.stream_writer = self.stream.writer(io, &self.net_write_buf);
 
-        if (url.use_tls) {
+        if (url.tls_mode != .disable) {
             // PostgreSQL SSLRequest: length=8, code=80877103 (0x04d2162f).
             var ssl_req: [8]u8 = undefined;
             std.mem.writeInt(u32, ssl_req[0..4], 8, .big);
@@ -181,7 +194,9 @@ const PgConn = struct {
             if (reply != 'S') return error.PostgresTlsRejected;
 
             const now = std.Io.Clock.real.now(io);
-            try self.ca_bundle.rescan(allocator, io, now);
+            if (url.tls_mode == .verify_ca or url.tls_mode == .verify_full) {
+                try self.ca_bundle.rescan(allocator, io, now);
+            }
             errdefer self.ca_bundle.deinit(allocator);
 
             var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
@@ -191,13 +206,16 @@ const PgConn = struct {
                 &self.stream_reader.interface,
                 &self.stream_writer.interface,
                 .{
-                    .host = .{ .explicit = url.host },
-                    .ca = .{ .bundle = .{
-                        .gpa = allocator,
-                        .io = io,
-                        .lock = &self.ca_lock,
-                        .bundle = &self.ca_bundle,
-                    } },
+                    .host = if (url.tls_mode == .verify_full) .{ .explicit = url.host } else .no_verification,
+                    .ca = if (url.tls_mode == .require)
+                        .no_verification
+                    else
+                        .{ .bundle = .{
+                            .gpa = allocator,
+                            .io = io,
+                            .lock = &self.ca_lock,
+                            .bundle = &self.ca_bundle,
+                        } },
                     .read_buffer = &self.tls_read_buf,
                     .write_buffer = &self.tls_write_buf,
                     .entropy = &entropy,
@@ -215,6 +233,9 @@ const PgConn = struct {
         const term = [5]u8{ 'X', 0, 0, 0, 4 };
         self.writer().writeAll(&term) catch {};
         self.writer().flush() catch {};
+        if (self.tls_client != null) {
+            self.stream_writer.interface.flush() catch {};
+        }
         self.ca_bundle.deinit(self.allocator);
         self.stream.close(self.io);
         self.allocator.destroy(self);
@@ -252,6 +273,9 @@ const PgConn = struct {
         try w.writeAll(&len_buf);
         try w.writeAll(payload);
         try w.flush();
+        if (self.tls_client != null) {
+            try self.stream_writer.interface.flush();
+        }
     }
 
     fn startupAndAuth(self: *PgConn, url: *const PgUrl) !void {

@@ -3,6 +3,7 @@ app [concave_app] {
     sdk: "../../../packages/concave-sdk/main.roc",
     presence: "../../../packages/presence/main.roc",
     ratelimit: "../../../packages/rate-limiter/main.roc",
+    analytics: "../../../packages/analytics/main.roc",
 }
 
 import sdk.App
@@ -12,6 +13,9 @@ import sdk.Key
 import sdk.Schema
 import presence.Presence
 import ratelimit.RateLimiter
+import analytics.Analytics
+import analytics.Flags
+import analytics.Props
 import Room
 import Message
 
@@ -22,6 +26,9 @@ chat_presence = Presence.mount("presence", 30000)
 
 send_limiter : RateLimiter.Mount
 send_limiter = RateLimiter.mount("rate_limit", 12, 60000)
+
+chat_analytics : Analytics.Mount
+chat_analytics = Analytics.mount("analytics")
 
 ## Queries
 
@@ -43,6 +50,30 @@ list_messages! = |ctx, args|
 
 ensure_defaults! : Ctx.MutationCtx, {} => Try(List(Room.Doc), Str)
 ensure_defaults! = |ctx, _| {
+    # Seed default feature flags & A/B experiments if none exist yet.
+    existing_flags = Analytics.list_flags_in_query!(chat_analytics, Ctx.as_query_ctx(ctx))?
+    if List.is_empty(existing_flags) {
+        _ = Analytics.upsert_flag_in_tx!(chat_analytics, ctx, {
+            key: "link-previews",
+            name: "Allow /preview URL Actions",
+            active: True,
+            rollout_pct: 100,
+            filters: [],
+            variants: [],
+        })?
+        _ = Analytics.upsert_flag_in_tx!(chat_analytics, ctx, {
+            key: "composer-cta",
+            name: "Send button A/B test",
+            active: True,
+            rollout_pct: 100,
+            filters: [],
+            variants: [
+                Flags.variant("control", 50),
+                Flags.variant("rocket", 50),
+            ],
+        })?
+    }
+
     existing = Db.query(Room.table) |> Db.asc() |> Db.collect!(Ctx.as_reader(ctx.db))?
     if List.is_empty(existing) {
         general_id = Db.insert!(ctx.db, Room.table, {
@@ -88,12 +119,18 @@ create_room! = |ctx, args| {
         |> Db.first!(Ctx.as_reader(ctx.db))?
     match dup {
         Found(_) => Err("Room `#${trimmed}` already exists")
-        NotFound =>
-            Db.insert!(ctx.db, Room.table, {
+        NotFound => {
+            room_id = Db.insert!(ctx.db, Room.table, {
                 name: trimmed,
                 topic: Str.trim(args.topic),
                 created_by: user.name,
-            })
+            })?
+            _ = Analytics.track_event!(chat_analytics, ctx, user.subject, "room_created", [
+                Props.prop("room_id", room_id),
+                Props.prop("room_name", trimmed),
+            ])?
+            Ok(room_id)
+        }
     }
 }
 
@@ -124,19 +161,38 @@ send_message! = |ctx, args| {
         kind: "text",
     })?
 
+    # Record analytics atomically in the exact same ACID transaction.
+    _ = Analytics.track_event!(chat_analytics, ctx, user.subject, "message_sent", [
+        Props.prop("room_id", args.room_id),
+        Props.prop("author", user.name),
+    ])?
+
     Ok(msg_id)
 }
 
 post_preview! : Ctx.MutationCtx, Message.PostPreviewArgs => Try(Str, Str)
 post_preview! = |ctx, args| {
     user = Ctx.require_auth!(ctx.auth!)?
-    Db.insert!(ctx.db, Message.table, {
+    previews_enabled = Analytics.is_flag_enabled!(
+        chat_analytics,
+        Ctx.as_query_ctx(ctx),
+        "link-previews",
+        user.subject,
+    )?
+    if !previews_enabled {
+        return Err("Link previews are disabled by feature flag `link-previews`")
+    }
+    msg_id = Db.insert!(ctx.db, Message.table, {
         room_id: args.room_id,
         author_id: user.subject,
         author_name: "${user.name} (link preview)",
         body: args.body,
         kind: "preview",
-    })
+    })?
+    _ = Analytics.track_event!(chat_analytics, ctx, user.subject, "link_preview_posted", [
+        Props.prop("room_id", args.room_id),
+    ])?
+    Ok(msg_id)
 }
 
 ## External Action: fetch a URL over HTTP and commit a preview message via `run_mutation!`.
@@ -188,6 +244,7 @@ concave_app = ||
     |> App.table(Message.table)
     |> Presence.attach(chat_presence)
     |> RateLimiter.attach(send_limiter)
+    |> Analytics.attach(chat_analytics)
     |> App.query("rooms.list", Schema.record([]), Schema.list(Room.doc_schema), list_rooms!)
     |> App.query("messages.list", Message.list_args_schema, Schema.list(Message.doc_schema), list_messages!)
     |> App.mutation("rooms.ensureDefaults", Schema.record([]), Schema.list(Room.doc_schema), ensure_defaults!)

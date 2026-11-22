@@ -10,6 +10,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .pic = true,
     });
     host_mod.addAnonymousImport("concave_client_index_js", .{
         .root_source_file = b.path("client/concave-client/src/index.js"),
@@ -23,12 +24,16 @@ pub fn build(b: *std.Build) void {
     host_mod.addAnonymousImport("concave_client_dom_js", .{
         .root_source_file = b.path("client/concave-client/src/dom.js"),
     });
+    host_mod.addAnonymousImport("concave_analytics_client_js", .{
+        .root_source_file = b.path("packages/analytics/client.js"),
+    });
 
     const host_lib = b.addLibrary(.{
         .name = "host",
         .linkage = .static,
         .root_module = host_mod,
     });
+    host_lib.bundle_compiler_rt = true;
     b.installArtifact(host_lib);
 
     // 2. Zero-dependency `concave` CLI (`init`, `dev`, `codegen`, `build`)
@@ -74,6 +79,9 @@ pub fn build(b: *std.Build) void {
     });
     test_mod.addAnonymousImport("concave_client_dom_js", .{
         .root_source_file = b.path("client/concave-client/src/dom.js"),
+    });
+    test_mod.addAnonymousImport("concave_analytics_client_js", .{
+        .root_source_file = b.path("packages/analytics/client.js"),
     });
     const unit_tests = b.addTest(.{
         .root_module = test_mod,

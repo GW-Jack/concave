@@ -9,6 +9,7 @@ const CLIENT_INDEX_JS = @embedFile("concave_client_index_js");
 const CLIENT_SIGNALS_JS = @embedFile("concave_client_signals_js");
 const CLIENT_CLIENT_JS = @embedFile("concave_client_client_js");
 const CLIENT_DOM_JS = @embedFile("concave_client_dom_js");
+const ANALYTICS_CLIENT_JS = @embedFile("concave_analytics_client_js");
 
 pub const ServerConfig = struct {
     host: []const u8 = "127.0.0.1",
@@ -219,6 +220,8 @@ fn handleConnection(
             CLIENT_CLIENT_JS
         else if (std.mem.eql(u8, file, "dom.js"))
             CLIENT_DOM_JS
+        else if (std.mem.eql(u8, file, "analytics.js"))
+            ANALYTICS_CLIENT_JS
         else
             null;
         if (js) |content| {

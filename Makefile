@@ -4,6 +4,8 @@ UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
 ifeq ($(UNAME_S),Darwin)
+  ZIG_HOST_FLAGS :=
+  MUSL_LIB :=
   ifeq ($(UNAME_M),arm64)
     ROC_TARGET := arm64mac
   else
@@ -11,23 +13,29 @@ ifeq ($(UNAME_S),Darwin)
   endif
 else
   ifeq ($(UNAME_M),aarch64)
-    ROC_TARGET := arm64linux
+    ROC_TARGET := arm64musl
+    ZIG_HOST_FLAGS := -Dtarget=aarch64-linux-musl
+    MUSL_LIB := /usr/lib/aarch64-linux-musl
   else
-    ROC_TARGET := x64linux
+    ROC_TARGET := x64musl
+    ZIG_HOST_FLAGS := -Dtarget=x86_64-linux-musl
+    MUSL_LIB := /usr/lib/x86_64-linux-musl
   endif
 endif
 
 ## Build zero-dependency Zig `libhost.a` and `concave` CLI
 host:
-	zig build
+	zig build $(ZIG_HOST_FLAGS)
 	mkdir -p platform/targets/$(ROC_TARGET)
 	cp zig-out/lib/libhost.a platform/targets/$(ROC_TARGET)/libhost.a
+	@if [ -n "$(MUSL_LIB)" ]; then cp "$(MUSL_LIB)/rcrt1.o" "platform/targets/$(ROC_TARGET)/crt1.o" && cp "$(MUSL_LIB)/libc.a" "platform/targets/$(ROC_TARGET)/libc.a"; fi
 
 ## Build ReleaseSafe `libhost.a` and `concave` CLI for production binaries
 host-release:
-	zig build -Doptimize=ReleaseSafe
+	zig build -Doptimize=ReleaseSafe $(ZIG_HOST_FLAGS)
 	mkdir -p platform/targets/$(ROC_TARGET)
 	cp zig-out/lib/libhost.a platform/targets/$(ROC_TARGET)/libhost.a
+	@if [ -n "$(MUSL_LIB)" ]; then cp "$(MUSL_LIB)/rcrt1.o" "platform/targets/$(ROC_TARGET)/crt1.o" && cp "$(MUSL_LIB)/libc.a" "platform/targets/$(ROC_TARGET)/libc.a"; fi
 
 test-zig:
 	zig build test

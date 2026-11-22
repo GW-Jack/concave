@@ -48,7 +48,31 @@ test("Wave 3 Real PostgreSQL 16 (SCRAM-SHA-256) + PgBouncer (transaction mode): 
   );
   assert.equal(rocBuild.status, 0, `roc build failed:\n${rocBuild.stderr}`);
 
-  // 2. Start PostgreSQL 16 (default SCRAM-SHA-256 auth) + PgBouncer (pool_mode=transaction) in Docker!
+  // 2. Generate ephemeral self-signed TLS cert on host and start PostgreSQL 16 (SCRAM-SHA-256 + TLS 1.3)!
+  const tlsDir = path.join(ROOT, ".zig-cache/wave3-pg-tls");
+  fs.mkdirSync(tlsDir, { recursive: true });
+  const keyFile = path.join(tlsDir, "server.key");
+  const crtFile = path.join(tlsDir, "server.crt");
+  execFileSync(
+    "openssl",
+    [
+      "req",
+      "-new",
+      "-x509",
+      "-days",
+      "1",
+      "-nodes",
+      "-out",
+      crtFile,
+      "-keyout",
+      keyFile,
+      "-subj",
+      "/CN=localhost",
+    ],
+    { stdio: "ignore" },
+  );
+  fs.chmodSync(keyFile, 0o600);
+
   execFileSync("docker", ["network", "create", netName], { stdio: "ignore" });
   execFileSync(
     "docker",
@@ -61,6 +85,8 @@ test("Wave 3 Real PostgreSQL 16 (SCRAM-SHA-256) + PgBouncer (transaction mode): 
       netName,
       "-p",
       "15432:5432",
+      "-v",
+      `${tlsDir}:/pg-tls-in:ro`,
       "-e",
       "POSTGRES_USER=concave",
       "-e",
@@ -71,7 +97,11 @@ test("Wave 3 Real PostgreSQL 16 (SCRAM-SHA-256) + PgBouncer (transaction mode): 
       "POSTGRES_HOST_AUTH_METHOD=scram-sha-256",
       "-e",
       "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256",
+      "--entrypoint",
+      "sh",
       "postgres:16-alpine",
+      "-c",
+      "cp /pg-tls-in/server.crt /pg-tls-in/server.key /tmp/ && chmod 600 /tmp/server.key && chown postgres:postgres /tmp/server.key /tmp/server.crt && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/tmp/server.crt -c ssl_key_file=/tmp/server.key",
     ],
     { stdio: "pipe" },
   );
@@ -119,7 +149,21 @@ test("Wave 3 Real PostgreSQL 16 (SCRAM-SHA-256) + PgBouncer (transaction mode): 
   // Wait a moment for PgBouncer to accept connections.
   await new Promise((r) => setTimeout(r, 1500));
 
-  // 3. Run Zig `pg-diff` directly against PostgreSQL 16 (SCRAM-SHA-256)!
+  // 3a. Run Zig `pg-diff` directly against PostgreSQL 16 over native Zig TLS 1.3 (`sslmode=require` + SCRAM-SHA-256)!
+  const tlsUrl = "postgres://concave:concave_secret@127.0.0.1:15432/concave?sslmode=require";
+  const tlsDiff = spawnSync(
+    path.join(ROOT, "zig-out/bin/pg-diff"),
+    [tlsUrl, "tls13-pg16"],
+    { cwd: ROOT, encoding: "utf8" },
+  );
+  assert.equal(
+    tlsDiff.status,
+    0,
+    `pg-diff TLS 1.3 Postgres 16 failed:\nstdout: ${tlsDiff.stdout}\nstderr: ${tlsDiff.stderr}`,
+  );
+  assert.match(tlsDiff.stderr + tlsDiff.stdout, /pg-diff PASSED/);
+
+  // 3b. Run Zig `pg-diff` directly against PostgreSQL 16 (plaintext + SCRAM-SHA-256)!
   const directUrl = "postgres://concave:concave_secret@127.0.0.1:15432/concave?sslmode=disable";
   const directDiff = spawnSync(
     path.join(ROOT, "zig-out/bin/pg-diff"),

@@ -1,0 +1,102 @@
+name: Concave CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Zig + Roc + Client + E2E + Conformance + Stress
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Zig 0.17.1, Roc 0.1.0_RC1, and musl-dev
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-dev
+          mkdir -p "$HOME/.local/zig" "$HOME/.local/roc" "$HOME/.local/bin"
+          curl -fsSL "https://ziglang.org/download/0.17.1/zig-x86_64-linux-0.17.1.tar.xz" \
+            | tar -xJ --strip-components=1 -C "$HOME/.local/zig"
+          ln -sf "$HOME/.local/zig/zig" "$HOME/.local/bin/zig"
+          curl -fsSL "https://github.com/roc-lang/roc/releases/download/0.1.0_RC1/roc-linux_x86_64-0.1.0_RC1.tar.gz" \
+            | tar -xz --strip-components=1 -C "$HOME/.local/roc"
+          ln -sf "$HOME/.local/roc/roc" "$HOME/.local/bin/roc"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/zig" version
+          "$HOME/.local/bin/roc" version
+
+      - name: Run full test suite (Zig DST/crash/fuzz + Roc + Client + E2E + WS + Stress)
+        run: make test
+
+  formal-verification:
+    name: Formal Specs (Lean 4 + Maude + Z3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Z3 & Maude
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends z3 unzip curl
+          curl -fsSL "https://github.com/maude-lang/Maude/releases/download/Maude3.5.1/Maude-3.5.1-linux-x86_64.zip" -o /tmp/maude.zip
+          mkdir -p "$HOME/.local/maude" "$HOME/.local/bin"
+          unzip -q /tmp/maude.zip -d "$HOME/.local/maude"
+          ln -sf "$HOME/.local/maude/maude.linux64" "$HOME/.local/bin/maude"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install Lean 4 (elan)
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain leanprover/lean4:v4.36.0
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Verify Lean 4 proofs, Maude models, and Z3 SMT obligations
+        run: make verify-formal
+
+  postgres-differential:
+    name: PostgreSQL 16 (SCRAM-SHA-256 + TLS) & PgBouncer Differential
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Zig 0.17.1, Roc 0.1.0_RC1, and musl-dev
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-dev
+          mkdir -p "$HOME/.local/zig" "$HOME/.local/roc" "$HOME/.local/bin"
+          curl -fsSL "https://ziglang.org/download/0.17.1/zig-x86_64-linux-0.17.1.tar.xz" \
+            | tar -xJ --strip-components=1 -C "$HOME/.local/zig"
+          ln -sf "$HOME/.local/zig/zig" "$HOME/.local/bin/zig"
+          curl -fsSL "https://github.com/roc-lang/roc/releases/download/0.1.0_RC1/roc-linux_x86_64-0.1.0_RC1.tar.gz" \
+            | tar -xz --strip-components=1 -C "$HOME/.local/roc"
+          ln -sf "$HOME/.local/roc/roc" "$HOME/.local/bin/roc"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run PostgreSQL 16 + PgBouncer + 2-replica differential suite
+        run: make test-pg-docker
+
+  docker-build:
+    name: Production Multi-Stage Dockerfile (Cloud Run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build production container & smoke-test /health + /ready
+        run: |
+          docker build -t concave-chat:ci .
+          docker run -d --name ci-smoke -p 18080:8080 concave-chat:ci
+          trap "docker rm -f ci-smoke" EXIT
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/health; then break; fi
+            sleep 0.2
+          done
+          curl -fsS http://127.0.0.1:18080/ready
+          curl -fsS http://127.0.0.1:18080/_concave/index.js | grep -q "ConcaveClient"

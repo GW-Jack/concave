@@ -472,15 +472,49 @@ const RocAppExecutor = struct {
 // C Entrypoint (`--introspect` / `--serve`)
 // =============================================================================
 
-extern "c" fn getenv(name: [*:0]const u8) callconv(.c) ?[*:0]const u8;
+var g_envp: ?[*:null]const ?[*:0]const u8 = null;
 
-fn getEnvSlice(name: [*:0]const u8) ?[]const u8 {
-    const ptr = getenv(name) orelse return null;
-    const s = std.mem.span(ptr);
-    return if (s.len > 0) s else null;
+// Provide weak Linux fallbacks so `libhost.a` links cleanly against musl 1.2.3/1.2.4 (Ubuntu 24.04 / Debian bookworm)
+// as well as musl 1.2.5 (Debian trixie / Alpine).
+fn linuxGetAuxValFallback(_: c_ulong) callconv(.c) c_ulong {
+    return 0;
 }
 
-export fn main(argc: c_int, argv: [*]const [*:0]const u8) callconv(.c) c_int {
+fn linuxStatxFallback(
+    dirfd: i32,
+    pathname: [*:0]const u8,
+    flags: u32,
+    mask: u32,
+    statxbuf: *std.os.linux.Statx,
+) callconv(.c) i32 {
+    const rc = std.os.linux.statx(dirfd, pathname, flags, @bitCast(mask), statxbuf);
+    const signed: isize = @bitCast(rc);
+    if (signed < 0 and signed > -4096) return -1;
+    return @intCast(signed);
+}
+
+comptime {
+    if (@import("builtin").os.tag == .linux) {
+        @export(&linuxGetAuxValFallback, .{ .name = "getauxval", .linkage = .weak });
+        @export(&linuxStatxFallback, .{ .name = "statx", .linkage = .weak });
+    }
+}
+
+fn getEnvSlice(name: []const u8) ?[]const u8 {
+    const envp = g_envp orelse return null;
+    var idx: usize = 0;
+    while (envp[idx]) |entry_ptr| : (idx += 1) {
+        const entry = std.mem.span(entry_ptr);
+        if (entry.len > name.len and entry[name.len] == '=' and std.mem.startsWith(u8, entry, name)) {
+            const val = entry[name.len + 1 ..];
+            return if (val.len > 0) val else null;
+        }
+    }
+    return null;
+}
+
+export fn main(argc: c_int, argv: [*]const [*:0]const u8, envp: [*:null]const ?[*:0]const u8) callconv(.c) c_int {
+    g_envp = envp;
     initRocRuntime();
 
     var introspect = false;

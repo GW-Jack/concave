@@ -122,6 +122,12 @@ test("end-to-end native Roc platform: WS reactivity, index-range isolation, comp
   const builtinJs = await builtinClient.text();
   assert.ok(builtinJs.includes("ConcaveClient"));
 
+  const analyticsClientResp = await fetch(`${serverUrl}/_concave/analytics.js`);
+  assert.equal(analyticsClientResp.status, 200);
+  assert.match(analyticsClientResp.headers.get("content-type") ?? "", /text\/javascript/);
+  const analyticsClientJs = await analyticsClientResp.text();
+  assert.ok(analyticsClientJs.includes("createAnalytics"));
+
   const mainJsResp = await fetch(`${serverUrl}/src/main.js`);
   assert.equal(mainJsResp.status, 200);
   assert.match(mainJsResp.headers.get("content-type") ?? "", /text\/javascript/);
@@ -154,19 +160,39 @@ test("end-to-end native Roc platform: WS reactivity, index-range isolation, comp
   const rocRoom = rooms.find((r) => r.name === "roc-lang");
   assert.ok(generalRoom && rocRoom);
 
-  // Subscribe Alice to #general and Bob to #roc-lang.
+  // Subscribe Alice to #general and Bob to #roc-lang, plus live `to_ms: 0` Analytics summary & trends!
   const aliceMsgs = alice.query(api.messages.list, { room_id: generalRoom.id });
   const bobMsgs = bob.query(api.messages.list, { room_id: rocRoom.id });
   const alicePresence = alice.query(api.presence.listOnline, { room_id: generalRoom.id });
   const aliceQuota = alice.query(api.rate_limit.status, { key: "alice" });
+  const liveSummary = alice.query(api.analytics.summary, { from_ms: 0, to_ms: 0, top_n: 5 });
+  const liveMsgTrend = alice.query(api.analytics.trends, {
+    event: "message_sent",
+    from_ms: 0,
+    to_ms: 0,
+    bucket_ms: 60000,
+    breakdown_property: "",
+    filters: [],
+  });
+  const aliceFlags = alice.query(api.analytics.evaluateAllFlags, {
+    distinct_id: "alice",
+    override_properties: [],
+  });
 
   await waitForCondition(() => aliceMsgs().status === "ready", 5000, "aliceMsgs ready");
   await waitForCondition(() => bobMsgs().status === "ready", 5000, "bobMsgs ready");
   await waitForCondition(() => aliceQuota().status === "ready", 5000, "aliceQuota ready");
+  await waitForCondition(() => liveSummary().status === "ready", 5000, "liveSummary ready");
+  await waitForCondition(() => liveMsgTrend().status === "ready", 5000, "liveMsgTrend ready");
+  await waitForCondition(() => aliceFlags().status === "ready", 5000, "aliceFlags ready");
 
   assert.equal(aliceMsgs().data.length, 1);
   assert.equal(bobMsgs().data.length, 1);
   assert.equal(aliceQuota().data.remaining, 12);
+  assert.equal(liveSummary().data.total_events, 0);
+  assert.equal(liveMsgTrend().data.total_events, 0);
+  assert.equal(aliceFlags().data.find((f) => f.key === "link-previews")?.enabled, true);
+  assert.ok(["control", "rocket"].includes(aliceFlags().data.find((f) => f.key === "composer-cta")?.variant));
 
   // 5. Verify auth enforcement: unauthenticated `messages.send` must fail.
   await assert.rejects(
@@ -191,6 +217,12 @@ test("end-to-end native Roc platform: WS reactivity, index-range isolation, comp
     () => aliceQuota().data?.remaining === 11,
     5000,
     `transactional rate-limiter quota decremented (got: ${JSON.stringify(aliceQuota())}, stderr: ${stderrLog})`,
+  );
+  // Live `to_ms: 0` Analytics queries update automatically via WebSocket!
+  await waitForCondition(
+    () => liveMsgTrend().data?.total_events === 1 && liveSummary().data?.total_events === 1,
+    5000,
+    `live analytics summary/trends react to message_sent (summary: ${JSON.stringify(liveSummary())}, trend: ${JSON.stringify(liveMsgTrend())})`,
   );
 
   // Give a brief tick and verify Bob was NOT invalidated by #general write.
@@ -230,7 +262,31 @@ test("end-to-end native Roc platform: WS reactivity, index-range isolation, comp
     "preview message from Action propagates reactively",
   );
 
-  // 9. Verify transactional RateLimiter component rejects the 13th message in window (12 max).
+  // 8b. Verify toggling `link-previews` feature flag off live-gates `/preview` on the backend!
+  await alice.mutate(api.analytics.upsertFlag, {
+    key: "link-previews",
+    name: "Allow /preview URL Actions",
+    active: false,
+    rollout_pct: 100,
+    filters: [],
+    variants: [],
+  });
+  await waitForCondition(
+    () => aliceFlags().data?.find((f) => f.key === "link-previews")?.enabled === false,
+    5000,
+    "link-previews flag toggled off reactively",
+  );
+  await assert.rejects(
+    () =>
+      alice.action(api.messages.fetchPreview, {
+        room_id: generalRoom.id,
+        url: `http://127.0.0.1:${targetPort}/`,
+      }),
+    /disabled by feature flag/,
+  );
+
+  // 9. Verify transactional RateLimiter component rejects the 13th message in window (12 max),
+  //    and Analytics does NOT count the rejected message (ACID rollback!).
   for (let i = 0; i < 11; i += 1) {
     await alice.mutate(api.messages.send, {
       room_id: generalRoom.id,
@@ -245,9 +301,17 @@ test("end-to-end native Roc platform: WS reactivity, index-range isolation, comp
       }),
     /Rate limit exceeded/,
   );
+  await waitForCondition(
+    () => liveMsgTrend().data?.total_events === 12,
+    5000,
+    "analytics tracks exactly 12 committed messages (13th rejected message rolled back)",
+  );
 
   aliceMsgs.dispose();
   bobMsgs.dispose();
   alicePresence.dispose();
   aliceQuota.dispose();
+  liveSummary.dispose();
+  liveMsgTrend.dispose();
+  aliceFlags.dispose();
 });

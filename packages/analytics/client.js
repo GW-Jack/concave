@@ -171,20 +171,76 @@ export function createAnalytics(client, analyticsApi, options = {}) {
     storage?.setItem(SESSION_KEY, sessionId);
   }
 
-  /** Subscribe reactively to all feature flags for the current or specified user. */
+  /**
+   * Subscribe reactively to all feature flags.
+   * Pass a reactive accessor for `targetDistinctId` (e.g. `() => client.identity()?.subject ?? analytics.distinctId`)
+   * to automatically re-evaluate whenever the user switches identity.
+   *
+   * @param {Record<string, unknown> | Array<{ key: string, value: string }> | (() => Record<string, unknown> | Array<{ key: string, value: string }>)} [overrideProperties]
+   * @param {string | (() => string | null | undefined)} [targetDistinctId]
+   */
   function subscribeFlags(overrideProperties = {}, targetDistinctId) {
-    return client.query(analyticsApi.evaluateAllFlags, {
-      distinct_id: targetDistinctId ?? distinctId,
-      override_properties: toProps(overrideProperties),
+    const reactive =
+      typeof overrideProperties === "function" || typeof targetDistinctId === "function";
+    if (!reactive) {
+      return client.query(analyticsApi.evaluateAllFlags, {
+        distinct_id: /** @type {string | undefined} */ (targetDistinctId) ?? distinctId,
+        override_properties: toProps(
+          /** @type {Record<string, unknown> | Array<{ key: string, value: string }>} */ (
+            overrideProperties
+          ),
+        ),
+      });
+    }
+    return client.query(analyticsApi.evaluateAllFlags, () => {
+      const id =
+        typeof targetDistinctId === "function"
+          ? targetDistinctId()
+          : (targetDistinctId ?? distinctId);
+      if (!id) return null;
+      const rawProps =
+        typeof overrideProperties === "function" ? overrideProperties() : overrideProperties;
+      return {
+        distinct_id: id,
+        override_properties: toProps(rawProps),
+      };
     });
   }
 
-  /** Subscribe reactively to a single feature flag. */
+  /**
+   * Subscribe reactively to a single feature flag.
+   *
+   * @param {string} key
+   * @param {Record<string, unknown> | Array<{ key: string, value: string }> | (() => Record<string, unknown> | Array<{ key: string, value: string }>)} [overrideProperties]
+   * @param {string | (() => string | null | undefined)} [targetDistinctId]
+   */
   function subscribeFlag(key, overrideProperties = {}, targetDistinctId) {
-    return client.query(analyticsApi.evaluateFlag, {
-      key,
-      distinct_id: targetDistinctId ?? distinctId,
-      override_properties: toProps(overrideProperties),
+    const reactive =
+      typeof overrideProperties === "function" || typeof targetDistinctId === "function";
+    if (!reactive) {
+      return client.query(analyticsApi.evaluateFlag, {
+        key,
+        distinct_id: /** @type {string | undefined} */ (targetDistinctId) ?? distinctId,
+        override_properties: toProps(
+          /** @type {Record<string, unknown> | Array<{ key: string, value: string }>} */ (
+            overrideProperties
+          ),
+        ),
+      });
+    }
+    return client.query(analyticsApi.evaluateFlag, () => {
+      const id =
+        typeof targetDistinctId === "function"
+          ? targetDistinctId()
+          : (targetDistinctId ?? distinctId);
+      if (!id) return null;
+      const rawProps =
+        typeof overrideProperties === "function" ? overrideProperties() : overrideProperties;
+      return {
+        key,
+        distinct_id: id,
+        override_properties: toProps(rawProps),
+      };
     });
   }
 
@@ -196,6 +252,150 @@ export function createAnalytics(client, analyticsApi, options = {}) {
       override_properties: toProps(overrideProperties),
       session_id: sessionId,
     });
+  }
+
+  /** Subscribe reactively to all configured feature flag definitions. */
+  function subscribeListFlags() {
+    return client.query(analyticsApi.listFlags, {});
+  }
+
+  /**
+   * Create or update a feature flag / multivariate experiment.
+   *
+   * @param {{
+   *   key: string,
+   *   name?: string,
+   *   active: boolean,
+   *   rollout_pct?: number,
+   *   filters?: Array<{ key: string, op: string, value: string }>,
+   *   variants?: Array<{ key: string, weight: number }>,
+   * }} flag
+   */
+  async function upsertFlag(flag) {
+    return await client.mutate(analyticsApi.upsertFlag, {
+      key: flag.key,
+      name: flag.name ?? flag.key,
+      active: flag.active,
+      rollout_pct: flag.rollout_pct ?? 100,
+      filters: flag.filters ?? [],
+      variants: flag.variants ?? [],
+    });
+  }
+
+  /** @param {string} key */
+  async function deleteFlag(key) {
+    return await client.mutate(analyticsApi.deleteFlag, { key });
+  }
+
+  /**
+   * Subscribe reactively to live overview KPIs (`total_events`, `unique_persons`, `active_sessions`, `top_events`).
+   *
+   * @param {{ from_ms?: number, to_ms?: number, top_n?: number } | (() => { from_ms?: number, to_ms?: number, top_n?: number } | null)} [opts]
+   */
+  function subscribeSummary(opts = {}) {
+    if (typeof opts === "function") {
+      return client.query(analyticsApi.summary, () => {
+        const v = opts();
+        if (!v) return null;
+        return { from_ms: v.from_ms ?? 0, to_ms: v.to_ms ?? 0, top_n: v.top_n ?? 8 };
+      });
+    }
+    return client.query(analyticsApi.summary, {
+      from_ms: opts.from_ms ?? 0,
+      to_ms: opts.to_ms ?? 0,
+      top_n: opts.top_n ?? 8,
+    });
+  }
+
+  /**
+   * Subscribe reactively to time-bucketed event trends.
+   *
+   * @param {string} event
+   * @param {{ from_ms?: number, to_ms?: number, bucket_ms?: number, breakdown_property?: string, filters?: Array<{ key: string, op: string, value: string }> }} [opts]
+   */
+  function subscribeTrends(event, opts = {}) {
+    return client.query(analyticsApi.trends, {
+      event,
+      from_ms: opts.from_ms ?? 0,
+      to_ms: opts.to_ms ?? 0,
+      bucket_ms: opts.bucket_ms ?? 60000,
+      breakdown_property: opts.breakdown_property ?? "",
+      filters: opts.filters ?? [],
+    });
+  }
+
+  /**
+   * Subscribe reactively to an ordered multi-step conversion funnel.
+   *
+   * @param {string[]} steps
+   * @param {{ from_ms?: number, to_ms?: number, conversion_window_ms?: number, filters?: Array<{ key: string, op: string, value: string }> } | (() => { from_ms?: number, to_ms?: number, conversion_window_ms?: number, filters?: Array<{ key: string, op: string, value: string }> } | null)} [opts]
+   */
+  function subscribeFunnel(steps, opts = {}) {
+    if (typeof opts === "function") {
+      return client.query(analyticsApi.funnel, () => {
+        const v = opts();
+        if (!v) return null;
+        return {
+          steps,
+          from_ms: v.from_ms ?? 0,
+          to_ms: v.to_ms ?? 0,
+          conversion_window_ms: v.conversion_window_ms ?? 3600000,
+          filters: v.filters ?? [],
+        };
+      });
+    }
+    return client.query(analyticsApi.funnel, {
+      steps,
+      from_ms: opts.from_ms ?? 0,
+      to_ms: opts.to_ms ?? 0,
+      conversion_window_ms: opts.conversion_window_ms ?? 3600000,
+      filters: opts.filters ?? [],
+    });
+  }
+
+  /**
+   * Subscribe reactively to the live event stream (optionally filtered to a single event name).
+   *
+   * @param {{ event?: string, limit?: number } | (() => { event?: string, limit?: number } | null)} [opts]
+   */
+  function subscribeRecentEvents(opts = {}) {
+    if (typeof opts === "function") {
+      return client.query(analyticsApi.recentEvents, () => {
+        const v = opts();
+        if (!v) return null;
+        return { event: v.event ?? "", limit: v.limit ?? 25 };
+      });
+    }
+    return client.query(analyticsApi.recentEvents, {
+      event: opts.event ?? "",
+      limit: opts.limit ?? 25,
+    });
+  }
+
+  /**
+   * Helper to read a flag's boolean status from a `subscribeFlags()` query state.
+   *
+   * @param {Array<{ key: string, enabled: boolean, variant: string }> | undefined} evals
+   * @param {string} key
+   * @param {boolean} [fallback]
+   */
+  function isEnabled(evals, key, fallback = false) {
+    if (!evals) return fallback;
+    const match = evals.find((f) => f.key === key);
+    return match ? match.enabled : fallback;
+  }
+
+  /**
+   * Helper to read a flag's variant string from a `subscribeFlags()` query state.
+   *
+   * @param {Array<{ key: string, enabled: boolean, variant: string }> | undefined} evals
+   * @param {string} key
+   * @param {string} [fallback]
+   */
+  function getVariant(evals, key, fallback = "") {
+    if (!evals) return fallback;
+    const match = evals.find((f) => f.key === key);
+    return match && match.enabled ? match.variant : fallback;
   }
 
   return {
@@ -217,7 +417,16 @@ export function createAnalytics(client, analyticsApi, options = {}) {
     reset,
     subscribeFlags,
     subscribeFlag,
+    subscribeListFlags,
+    subscribeSummary,
+    subscribeTrends,
+    subscribeFunnel,
+    subscribeRecentEvents,
     evaluateFlagAndTrack,
+    upsertFlag,
+    deleteFlag,
+    isEnabled,
+    getVariant,
     toProps,
     fromProps,
   };

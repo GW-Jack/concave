@@ -8,7 +8,7 @@ ARG FRONTEND_DIR=examples/chat-app/frontend
 ARG ROC_VERSION=0.1.0_RC1
 ARG ZIG_VERSION=0.17.1
 
-FROM debian:bookworm-slim AS builder
+FROM debian:trixie-slim AS builder
 ARG TARGETARCH
 ARG APP_ENTRY
 ARG FRONTEND_DIR
@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     xz-utils \
+    musl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Zig 0.17.1 and Roc 0.1.0_RC1 for the container architecture (amd64 / arm64).
@@ -29,11 +30,11 @@ RUN set -eux; \
       amd64) \
         ZIG_ARCH="x86_64"; \
         ROC_ASSET="roc-linux_x86_64-${ROC_VERSION}.tar.gz"; \
-        ROC_TARGET="x64linux" ;; \
+        ROC_TARGET="x64musl" ;; \
       arm64) \
         ZIG_ARCH="aarch64"; \
         ROC_ASSET="roc-linux_arm64-${ROC_VERSION}.tar.gz"; \
-        ROC_TARGET="arm64linux" ;; \
+        ROC_TARGET="arm64musl" ;; \
       *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     mkdir -p /opt/zig /opt/roc; \
@@ -44,19 +45,25 @@ RUN set -eux; \
       | tar -xz --strip-components=1 -C /opt/roc; \
     ln -s /opt/roc/roc /usr/local/bin/roc; \
     echo "${ROC_TARGET}" > /opt/roc-target; \
+    echo "${ZIG_ARCH}-linux-musl" > /opt/zig-target; \
+    echo "/usr/lib/${ZIG_ARCH}-linux-musl" > /opt/musl-lib; \
     zig version; \
     roc version
 
 COPY . .
 
-# 1. Build zero-dependency release Zig host (`libhost.a`) and `concave` CLI.
+# 1. Build zero-dependency static musl Zig host (`libhost.a`) and `concave` CLI.
 RUN set -eux; \
     ROC_TARGET="$(cat /opt/roc-target)"; \
-    zig build -Doptimize=ReleaseSafe; \
+    ZIG_TARGET="$(cat /opt/zig-target)"; \
+    MUSL_LIB="$(cat /opt/musl-lib)"; \
+    zig build -Doptimize=ReleaseSafe -Dtarget="${ZIG_TARGET}"; \
     mkdir -p "platform/targets/${ROC_TARGET}"; \
-    cp zig-out/lib/libhost.a "platform/targets/${ROC_TARGET}/libhost.a"
+    cp zig-out/lib/libhost.a "platform/targets/${ROC_TARGET}/libhost.a"; \
+    cp "${MUSL_LIB}/rcrt1.o" "platform/targets/${ROC_TARGET}/crt1.o"; \
+    cp "${MUSL_LIB}/libc.a" "platform/targets/${ROC_TARGET}/libc.a"
 
-# 2. Compile the Roc backend + Zig host into a standalone native binary and generate typed client API.
+# 2. Compile the Roc backend + Zig host into a 100% static Linux binary and generate typed client API.
 RUN set -eux; \
     ROC_TARGET="$(cat /opt/roc-target)"; \
     mkdir -p /out/frontend; \
@@ -67,11 +74,9 @@ RUN set -eux; \
       --out "/out/frontend/src/_generated" \
       --opt=dev
 
-FROM debian:bookworm-slim AS runtime
+FROM alpine:3.21 AS runtime
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache ca-certificates
 
 WORKDIR /app
 COPY --from=builder /out/concave-server /app/concave-server

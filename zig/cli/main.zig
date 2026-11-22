@@ -192,7 +192,11 @@ fn introspectBinary(allocator: Allocator, io: std.Io, bin: []const u8) !manifest
 
     switch (res.term) {
         .exited => |code| if (code != 0) {
-            std.debug.print("--introspect failed:\n{s}\n", .{res.stderr});
+            std.debug.print("--introspect exited {d}:\n{s}\n", .{ code, res.stderr });
+            return error.IntrospectFailed;
+        },
+        .signal => |sig| {
+            std.debug.print("--introspect killed by signal {any}:\n{s}\n", .{ sig, res.stderr });
             return error.IntrospectFailed;
         },
         else => return error.IntrospectFailed,
