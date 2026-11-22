@@ -11,4 +11,11 @@ comptime {
     _ = @import("runtime/http_client.zig");
     _ = @import("runtime/tx.zig");
     _ = @import("runtime/engine.zig");
+    _ = @import("runtime/server.zig");
+
+    // Wave 1 Verification Suites: Property Tests, Crash Recovery, DST, Security/RFC & Fuzz Targets
+    _ = @import("verify/key_props.zig");
+    _ = @import("verify/wal_crash.zig");
+    _ = @import("verify/dst_engine.zig");
+    _ = @import("verify/protocol_fuzz.zig");
 }

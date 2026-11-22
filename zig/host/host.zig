@@ -172,9 +172,13 @@ export fn roc_host_db_query(req_raw: RocStr) callconv(.c) RocStr {
     if (parsed != .object) return wireErr("invalid query JSON object");
     const obj = parsed.object;
 
-    const ns = (obj.get("namespace") orelse return wireErr("missing namespace")).string;
-    const table = (obj.get("table") orelse return wireErr("missing table")).string;
-    const index_name = (obj.get("index_name") orelse return wireErr("missing index_name")).string;
+    const ns_v = obj.get("namespace") orelse return wireErr("missing namespace");
+    const table_v = obj.get("table") orelse return wireErr("missing table");
+    const index_v = obj.get("index_name") orelse return wireErr("missing index_name");
+    if (ns_v != .string or table_v != .string or index_v != .string) return wireErr("invalid string field");
+    const ns = ns_v.string;
+    const table = table_v.string;
+    const index_name = index_v.string;
     const start = parseWireBound(a, obj.get("start") orelse return wireErr("missing start")) catch
         return wireErr("invalid start bound");
     const end = parseWireBound(a, obj.get("end") orelse return wireErr("missing end")) catch

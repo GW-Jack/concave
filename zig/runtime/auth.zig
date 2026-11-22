@@ -52,6 +52,7 @@ pub const AuthError = error{
     UnsupportedAlg,
     InvalidSignature,
     ExpiredToken,
+    NotYetValid,
     MissingSubject,
     OutOfMemory,
 };
@@ -136,11 +137,22 @@ fn verifyHs256Jwt(allocator: Allocator, io: std.Io, secret: []const u8, token: [
     const claims = std.json.parseFromSliceLeaky(std.json.Value, a, pay_bytes, .{}) catch return error.MalformedJwt;
     if (claims != .object) return error.MalformedJwt;
 
+    const now_secs = @divTrunc(storage_mod.nowMillis(io), 1000);
+
     if (claims.object.get("exp")) |exp_v| {
-        if (exp_v == .integer) {
-            const now_secs = @divTrunc(storage_mod.nowMillis(io), 1000);
-            if (now_secs >= exp_v.integer) return error.ExpiredToken;
-        }
+        const exp_secs: i64 = switch (exp_v) {
+            .integer => |i| i,
+            else => return error.MalformedJwt,
+        };
+        if (now_secs >= exp_secs) return error.ExpiredToken;
+    }
+
+    if (claims.object.get("nbf")) |nbf_v| {
+        const nbf_secs: i64 = switch (nbf_v) {
+            .integer => |i| i,
+            else => return error.MalformedJwt,
+        };
+        if (now_secs < nbf_secs) return error.NotYetValid;
     }
 
     const sub_v = claims.object.get("sub") orelse return error.MissingSubject;

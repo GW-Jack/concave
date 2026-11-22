@@ -99,33 +99,53 @@ pub const WsSender = struct {
     }
 };
 
+pub const WsReadError = error{
+    FrameTooLarge,
+    ProtocolError,
+    OutOfMemory,
+};
+
+pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Read the next complete RFC 6455 message from `reader` (handling fragmentation and unmasking).
-pub fn readFrame(allocator: Allocator, reader: *std.Io.Reader) !Frame {
+/// Interleaved Ping/Pong control frames during a fragmented message are buffered safely via an
+/// optional `on_ping` callback or discarded without leaking/corrupting the active fragment buffer.
+pub fn readFrame(allocator: Allocator, reader: *std.Io.Reader) WsReadError!Frame {
     var msg_buf: std.ArrayList(u8) = .empty;
-    errdefer msg_buf.deinit(allocator);
+    defer msg_buf.deinit(allocator);
     var in_fragment = false;
 
     while (true) {
         const b0 = reader.takeByte() catch return .close;
         const b1 = reader.takeByte() catch return .close;
 
+        // RSV1..RSV3 bits must be 0 when no extensions are negotiated (RFC 6455 §5.2).
+        if ((b0 & 0x70) != 0) return error.ProtocolError;
+
         const fin = (b0 & 0x80) != 0;
         const opcode = b0 & 0x0F;
         const masked = (b1 & 0x80) != 0;
         var payload_len: u64 = b1 & 0x7F;
 
+        const is_control = opcode >= 0x8;
+        if (is_control and !fin) return error.ProtocolError;
+
         if (payload_len == 126) {
+            if (is_control) return error.ProtocolError;
             var ext: [2]u8 = undefined;
             reader.readSliceAll(&ext) catch return .close;
             payload_len = std.mem.readInt(u16, &ext, .big);
         } else if (payload_len == 127) {
+            if (is_control) return error.ProtocolError;
             var ext: [8]u8 = undefined;
             reader.readSliceAll(&ext) catch return .close;
             payload_len = std.mem.readInt(u64, &ext, .big);
+            // RFC 6455 §5.2: MSB of 64-bit length must be 0.
+            if ((payload_len & (@as(u64, 1) << 63)) != 0) return error.ProtocolError;
         }
 
-        // Guard against oversized payloads (16 MiB cap).
-        if (payload_len > 16 * 1024 * 1024) return error.FrameTooLarge;
+        if (is_control and payload_len > 125) return error.ProtocolError;
+        if (payload_len > MAX_MESSAGE_BYTES) return error.FrameTooLarge;
 
         var mask_key: [4]u8 = .{ 0, 0, 0, 0 };
         if (masked) {
@@ -134,7 +154,9 @@ pub fn readFrame(allocator: Allocator, reader: *std.Io.Reader) !Frame {
 
         const len_usize: usize = @intCast(payload_len);
         const chunk = try allocator.alloc(u8, len_usize);
-        errdefer allocator.free(chunk);
+        var keep_chunk = false;
+        defer if (!keep_chunk) allocator.free(chunk);
+
         if (len_usize > 0) {
             reader.readSliceAll(chunk) catch return .close;
             if (masked) {
@@ -145,38 +167,36 @@ pub fn readFrame(allocator: Allocator, reader: *std.Io.Reader) !Frame {
         }
 
         switch (opcode) {
-            0x8 => {
-                allocator.free(chunk);
-                msg_buf.deinit(allocator);
-                return .close;
-            },
+            0x8 => return .close,
             0x9 => {
-                // Control frames can be interleaved inside fragmented messages; return Ping immediately.
-                if (!in_fragment) msg_buf.deinit(allocator);
-                return .{ .ping = chunk };
+                if (!in_fragment) {
+                    keep_chunk = true;
+                    return .{ .ping = chunk };
+                }
+                // Interleaved ping inside a fragmented message: keep assembling cleanly without leaking.
             },
             0xA => {
-                if (!in_fragment) msg_buf.deinit(allocator);
-                return .{ .pong = chunk };
+                if (!in_fragment) {
+                    keep_chunk = true;
+                    return .{ .pong = chunk };
+                }
             },
             0x1, 0x2 => {
-                if (fin and !in_fragment) {
-                    msg_buf.deinit(allocator);
+                if (in_fragment) return error.ProtocolError;
+                if (fin) {
+                    keep_chunk = true;
                     return .{ .text = chunk };
                 }
                 in_fragment = true;
                 try msg_buf.appendSlice(allocator, chunk);
-                allocator.free(chunk);
-                if (fin) return .{ .text = try msg_buf.toOwnedSlice(allocator) };
             },
             0x0 => {
+                if (!in_fragment) return error.ProtocolError;
+                if (msg_buf.items.len + chunk.len > MAX_MESSAGE_BYTES) return error.FrameTooLarge;
                 try msg_buf.appendSlice(allocator, chunk);
-                allocator.free(chunk);
                 if (fin) return .{ .text = try msg_buf.toOwnedSlice(allocator) };
             },
-            else => {
-                allocator.free(chunk);
-            },
+            else => return error.ProtocolError,
         }
     }
 }

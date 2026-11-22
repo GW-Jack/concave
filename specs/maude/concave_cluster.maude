@@ -1,0 +1,561 @@
+*** ============================================================================
+*** Concave Multi-Replica Cluster Sync - Model Checking
+*** Matches zig/runtime/engine.zig:
+***   subscribe, pollCommitLog, handleLocalCommit, broadcastInvalidation
+***
+*** Architecture:
+***   - 2 Concave replicas (Replica A and Replica B) sharing storage DB + commit_log.
+***   - Up to 2 commits may execute on either Replica A (remote commit, picked up
+***     by Replica B via pollCommitLog) or Replica B (local commit, followed by
+***     handleLocalCommit).
+***   - Client C is connected to Replica B via an ordered WebSocket stream and
+***     subscribes concurrently with commits and invalidation broadcasts.
+***
+*** Modules:
+***   1. CLUSTER-BUGGY : Exact current engine.zig subscribe() (lines 383-426),
+***      where subscribe runs runQueryInternal before locking/registering and
+***      calls sink.send() outside the lock without sync_mutex. Reproduces:
+***        a) Lost update during subscribe (quiescent client stuck on stale value)
+***        b) Out-of-order commit_ts delivery (client receives ts=0 after ts=1)
+***   2. CLUSTER-FIXED : Fixed subscribe() acquires sync_mutex, catches up if
+***      snapshot_ts < last_broadcast_ts, registers sub with last_ts, and sends
+***      the initial transition under session ordering; broadcastInvalidation
+***      skips commits <= sub.last_ts and stamps to_ts = max(commit_ts, ran_ts).
+***      Proves ZERO lost updates, ZERO out-of-order commit_ts, ZERO deadlocks,
+***      and exact quiescent convergence across all interleavings.
+*** ============================================================================
+
+fmod CLUSTER-SYNTAX is
+  protecting NAT .
+  protecting BOOL .
+
+  --- WebSocket transition frames delivered FIFO on Client C's connection.
+  sorts WsFrame WsQueue .
+  subsort WsFrame < WsQueue .
+  op tr : Nat Nat -> WsFrame [ctor] .
+  op nilWs : -> WsQueue [ctor] .
+  op _::_ : WsQueue WsQueue -> WsQueue [ctor assoc id: nilWs] .
+
+  --- Pending local commit notifications (between storage.commitTx and handleLocalCommit).
+  sorts PendTsSet .
+  subsort Nat < PendTsSet .
+  op emptyPT : -> PendTsSet [ctor] .
+  op _#_ : PendTsSet PendTsSet -> PendTsSet [ctor assoc comm id: emptyPT] .
+  var T : Nat .
+  eq T # T = T .
+
+  --- Subscription table entry on Replica B.
+  sort SubReg .
+  op unreg : -> SubReg [ctor] .
+  --- reg(lastPayload, subLastTs)
+  op reg : Nat Nat -> SubReg [ctor] .
+
+  --- Execution phase of the concurrent subscribe() handler on Replica B.
+  sort SubPhase .
+  op sIdle : -> SubPhase [ctor] .
+  op sQueried : Nat Nat -> SubPhase [ctor] .
+  op sRegistered : Nat Nat -> SubPhase [ctor] .
+  op sLocked : Nat Nat -> SubPhase [ctor] .
+  op sCaughtUp : Nat Nat -> SubPhase [ctor] .
+  op sDone : -> SubPhase [ctor] .
+
+  --- Shared DB + commit_log (log holds all commits 1..dbTs; each commit writes
+  --- the subscribed table so dbVal == dbTs uniquely identifies every commit).
+  sorts DbState RepAState RepBState CliState ClusterState .
+  op db : Nat Nat Nat -> DbState [ctor] .             --- db(dbTs, dbVal, commitsLeft)
+  op repA : Nat PendTsSet -> RepAState [ctor] .       --- repA(lastBcastA, pendLocalA)
+  op repB : Nat Bool SubReg SubPhase PendTsSet -> RepBState [ctor] .
+  --- repB(lastBcastB, syncLocked, subReg, subPhase, pendLocalB)
+  op cli : Bool Nat Nat Bool WsQueue -> CliState [ctor] .
+  --- cli(hasRecv, cliLastTs, cliVal, oooFlag, wsQueue)
+
+  op _||_||_||_ : DbState RepAState RepBState CliState -> ClusterState [ctor] .
+
+  --- Initial cluster state: DB at ts=0, val=0, 2 commits remaining,
+  --- both replicas at last_broadcast_ts=0, client connected to Replica B
+  --- and ready to subscribe concurrently with commits.
+  op initCluster : -> ClusterState .
+  eq initCluster =
+    db(0, 0, 2)
+    || repA(0, emptyPT)
+    || repB(0, false, unreg, sIdle, emptyPT)
+    || cli(false, 0, 0, false, nilWs) .
+endfm
+
+*** ----------------------------------------------------------------------------
+*** 1. CLUSTER-BUGGY: Current zig/runtime/engine.zig concurrency model
+***
+*** Faithfully models:
+***   - subscribe() lines 383-426:
+***       1. runQueryInternal() outside all locks
+***       2. lock clients_mutex -> insert into sess.subscriptions -> unlock
+***       3. sink.send(frame_json) outside all locks
+***   - executeMutation() lines 530-548:
+***       1. storage.commitTx() updates shared DB + commit_log
+***       2. handleLocalCommit(ts) acquires sync_mutex and broadcasts
+***   - pollCommitLog() lines 578-603:
+***       acquires sync_mutex, processes commits > last_broadcast_ts
+***   - broadcastInvalidation() lines 650-754:
+***       if subscribed, re-runs query on DB, compares last_payload, sends frame
+***       with to_ts = commit_ts.
+*** ----------------------------------------------------------------------------
+mod CLUSTER-BUGGY is
+  including CLUSTER-SYNTAX .
+
+  vars DBTS DBVAL REM LA LB TS VAL STS SVAL CLTS CVAL LVAL LT : Nat .
+  vars SLOCK HRECV OOO : Bool .
+  var SREG : SubReg .
+  var SPHASE : SubPhase .
+  vars PLA PLB : PendTsSet .
+  var WQ : WsQueue .
+
+  --- Commit executed on Replica A: atomically appends commit to shared DB/log.
+  rl [commit-on-A] :
+    db(DBTS, DBVAL, s(REM))
+    || repA(LA, PLA)
+    || repB(LB, SLOCK, SREG, SPHASE, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS + 1, DBVAL + 1, REM)
+    || repA(LA, PLA # (DBTS + 1))
+    || repB(LB, SLOCK, SREG, SPHASE, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ) .
+
+  --- Replica A handles its own local commit (advances Replica A's last_broadcast_ts).
+  rl [handle-local-A] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, TS # PLA)
+    || repB(LB, SLOCK, SREG, SPHASE, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(max(LA, TS), PLA)
+    || repB(LB, SLOCK, SREG, SPHASE, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ) .
+
+  --- Commit executed on Replica B: appends commit to shared DB/log, then schedules
+  --- handleLocalCommit(commit_ts) on Replica B.
+  rl [commit-on-B] :
+    db(DBTS, DBVAL, s(REM))
+    || repA(LA, PLA)
+    || repB(LB, SLOCK, SREG, SPHASE, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS + 1, DBVAL + 1, REM)
+    || repA(LA, PLA)
+    || repB(LB, SLOCK, SREG, SPHASE, PLB # (DBTS + 1))
+    || cli(HRECV, CLTS, CVAL, OOO, WQ) .
+
+  --- Replica B handleLocalCommit: processes next commit LB + 1 up to TS
+  --- while holding sync_mutex, matching engine.zig lines 620-648.
+  crl [local-bcast-B-unreg] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, false, unreg, SPHASE, TS # PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB + 1, false, unreg, SPHASE, if LB + 1 == TS then PLB else TS # PLB fi)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    if TS > LB .
+
+  crl [local-bcast-B-reg] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, false, reg(LVAL, LT), SPHASE, TS # PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB + 1, false, reg(DBVAL, LB + 1), SPHASE,
+            if LB + 1 == TS then PLB else TS # PLB fi)
+    || cli(HRECV, CLTS, CVAL, OOO,
+           if DBVAL =/= LVAL then WQ :: tr(LB + 1, DBVAL) else WQ fi)
+    if TS > LB .
+
+  crl [local-bcast-B-already] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, false, SREG, SPHASE, TS # PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, false, SREG, SPHASE, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    if TS <= LB .
+
+  --- Replica B pollCommitLog: tails next unseen commit LB + 1 from shared commit_log,
+  --- matching engine.zig lines 578-603 and 650-754.
+  crl [poll-B-unreg] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, false, unreg, SPHASE, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB + 1, false, unreg, SPHASE, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    if DBTS > LB .
+
+  crl [poll-B-reg] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, false, reg(LVAL, LT), SPHASE, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB + 1, false, reg(DBVAL, LB + 1), SPHASE, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO,
+           if DBVAL =/= LVAL then WQ :: tr(LB + 1, DBVAL) else WQ fi)
+    if DBTS > LB .
+
+  --- BUGGY subscribe() step 1: runQueryInternal() BEFORE locking/registering!
+  rl [buggy-sub-query] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, SLOCK, SREG, sIdle, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, SLOCK, SREG, sQueried(DBTS, DBVAL), PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ) .
+
+  --- BUGGY subscribe() step 2: lock clients_mutex, register sub, unlock clients_mutex.
+  rl [buggy-sub-register] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, SLOCK, unreg, sQueried(STS, SVAL), PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, SLOCK, reg(SVAL, STS), sRegistered(STS, SVAL), PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ) .
+
+  --- BUGGY subscribe() step 3: send initial transition OUTSIDE the lock!
+  rl [buggy-sub-send] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, SLOCK, SREG, sRegistered(STS, SVAL), PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, SLOCK, SREG, sDone, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ :: tr(STS, SVAL)) .
+
+  --- Client C delivers next WebSocket frame in FIFO order and checks monotonicity.
+  rl [cli-recv-first] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, SLOCK, SREG, SPHASE, PLB)
+    || cli(false, CLTS, CVAL, OOO, tr(TS, VAL) :: WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, SLOCK, SREG, SPHASE, PLB)
+    || cli(true, TS, VAL, OOO, WQ) .
+
+  rl [cli-recv-next] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, SLOCK, SREG, SPHASE, PLB)
+    || cli(true, CLTS, CVAL, OOO, tr(TS, VAL) :: WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, SLOCK, SREG, SPHASE, PLB)
+    || cli(true, max(CLTS, TS), VAL, OOO or (TS < CLTS), WQ) .
+endm
+
+*** ----------------------------------------------------------------------------
+*** 2. CLUSTER-FIXED: Synchronized subscribe + monotonic broadcastInvalidation
+***
+*** Fix:
+***   1. subscribe() runs initial query (even outside lock), then acquires
+***      sync_mutex on Replica B.
+***   2. While holding sync_mutex, if snapshot_ts < last_broadcast_ts (meaning
+***      a commit after snapshot_ts was already broadcast while sub was absent),
+***      subscribe() catches up by re-running the query so final_ts >= last_broadcast_ts.
+***   3. subscribe() registers reg(final_val, final_ts) AND sends the initial
+***      transition frame under session ordering BEFORE releasing sync_mutex.
+***   4. broadcastInvalidation(commit_ts) under sync_mutex skips any subscription
+***      with commit_ts <= sub.last_ts, and otherwise stamps to_ts = max(commit_ts, dbTs)
+***      so every frame sent to Client C has strictly increasing commit_ts.
+*** ----------------------------------------------------------------------------
+mod CLUSTER-FIXED is
+  including CLUSTER-SYNTAX .
+
+  vars DBTS DBVAL REM LA LB TS VAL STS SVAL CLTS CVAL LVAL LT : Nat .
+  vars SLOCK HRECV OOO : Bool .
+  var SREG : SubReg .
+  var SPHASE : SubPhase .
+  vars PLA PLB : PendTsSet .
+  var WQ : WsQueue .
+
+  --- Commit on Replica A (can run concurrently even while Replica B holds sync_mutex!).
+  rl [commit-on-A] :
+    db(DBTS, DBVAL, s(REM))
+    || repA(LA, PLA)
+    || repB(LB, SLOCK, SREG, SPHASE, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS + 1, DBVAL + 1, REM)
+    || repA(LA, PLA # (DBTS + 1))
+    || repB(LB, SLOCK, SREG, SPHASE, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ) .
+
+  rl [handle-local-A] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, TS # PLA)
+    || repB(LB, SLOCK, SREG, SPHASE, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(max(LA, TS), PLA)
+    || repB(LB, SLOCK, SREG, SPHASE, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ) .
+
+  --- Commit on Replica B (storage.commitTx runs before acquiring sync_mutex).
+  rl [commit-on-B] :
+    db(DBTS, DBVAL, s(REM))
+    || repA(LA, PLA)
+    || repB(LB, SLOCK, SREG, SPHASE, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS + 1, DBVAL + 1, REM)
+    || repA(LA, PLA)
+    || repB(LB, SLOCK, SREG, SPHASE, PLB # (DBTS + 1))
+    || cli(HRECV, CLTS, CVAL, OOO, WQ) .
+
+  --- Replica B handleLocalCommit under sync_mutex (requires SLOCK == false).
+  crl [fixed-local-B-unreg] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, false, unreg, SPHASE, TS # PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB + 1, false, unreg, SPHASE, if LB + 1 == TS then PLB else TS # PLB fi)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    if TS > LB .
+
+  crl [fixed-local-B-reg-skip] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, false, reg(LVAL, LT), SPHASE, TS # PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB + 1, false, reg(LVAL, LT), SPHASE,
+            if LB + 1 == TS then PLB else TS # PLB fi)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    if TS > LB /\ (LB + 1) <= LT .
+
+  crl [fixed-local-B-reg-send] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, false, reg(LVAL, LT), SPHASE, TS # PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB + 1, false, reg(DBVAL, max(LB + 1, DBTS)), SPHASE,
+            if LB + 1 == TS then PLB else TS # PLB fi)
+    || cli(HRECV, CLTS, CVAL, OOO,
+           if DBVAL =/= LVAL then WQ :: tr(max(LB + 1, DBTS), DBVAL) else WQ fi)
+    if TS > LB /\ (LB + 1) > LT .
+
+  crl [fixed-local-B-already] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, false, SREG, SPHASE, TS # PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, false, SREG, SPHASE, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    if TS <= LB .
+
+  --- Replica B pollCommitLog under sync_mutex (requires SLOCK == false).
+  crl [fixed-poll-B-unreg] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, false, unreg, SPHASE, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB + 1, false, unreg, SPHASE, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    if DBTS > LB .
+
+  crl [fixed-poll-B-reg-skip] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, false, reg(LVAL, LT), SPHASE, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB + 1, false, reg(LVAL, LT), SPHASE, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    if DBTS > LB /\ (LB + 1) <= LT .
+
+  crl [fixed-poll-B-reg-send] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, false, reg(LVAL, LT), SPHASE, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB + 1, false, reg(DBVAL, max(LB + 1, DBTS)), SPHASE, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO,
+           if DBVAL =/= LVAL then WQ :: tr(max(LB + 1, DBTS), DBVAL) else WQ fi)
+    if DBTS > LB /\ (LB + 1) > LT .
+
+  --- FIXED subscribe() step 1: runQueryInternal outside sync_mutex.
+  rl [fixed-sub-query] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, SLOCK, unreg, sIdle, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, SLOCK, unreg, sQueried(DBTS, DBVAL), PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ) .
+
+  --- FIXED subscribe() step 2: acquire sync_mutex on Replica B.
+  rl [fixed-sub-acquire-sync] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, false, unreg, sQueried(STS, SVAL), PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, true, unreg, sLocked(STS, SVAL), PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ) .
+
+  --- FIXED subscribe() step 3a: if snapshot_ts < last_broadcast_ts, catch up by
+  --- re-running query against current DB (guaranteed DBTS >= LB).
+  crl [fixed-sub-catchup] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, true, unreg, sLocked(STS, SVAL), PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, true, unreg, sCaughtUp(DBTS, DBVAL), PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    if STS < LB .
+
+  --- FIXED subscribe() step 3b: snapshot_ts >= last_broadcast_ts, no missed commits.
+  crl [fixed-sub-fresh] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, true, unreg, sLocked(STS, SVAL), PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, true, unreg, sCaughtUp(STS, SVAL), PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    if STS >= LB .
+
+  --- FIXED subscribe() step 4: register sub, send initial transition under
+  --- session ordering while still holding sync_mutex, then release sync_mutex.
+  rl [fixed-sub-register-send-unlock] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, true, unreg, sCaughtUp(STS, SVAL), PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, false, reg(SVAL, STS), sDone, PLB)
+    || cli(HRECV, CLTS, CVAL, OOO, WQ :: tr(STS, SVAL)) .
+
+  --- Client C delivers next WebSocket frame in FIFO order and checks monotonicity.
+  rl [cli-recv-first] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, SLOCK, SREG, SPHASE, PLB)
+    || cli(false, CLTS, CVAL, OOO, tr(TS, VAL) :: WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, SLOCK, SREG, SPHASE, PLB)
+    || cli(true, TS, VAL, OOO, WQ) .
+
+  rl [cli-recv-next] :
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, SLOCK, SREG, SPHASE, PLB)
+    || cli(true, CLTS, CVAL, OOO, tr(TS, VAL) :: WQ)
+    =>
+    db(DBTS, DBVAL, REM)
+    || repA(LA, PLA)
+    || repB(LB, SLOCK, SREG, SPHASE, PLB)
+    || cli(true, max(CLTS, TS), VAL, OOO or (TS < CLTS), WQ) .
+endm
+
+*** ============================================================================
+*** MODEL CHECKING QUERIES
+*** ============================================================================
+
+--- [CLUSTER-BUGGY a] Reproduce LOST UPDATE during subscribe:
+--- System is completely quiescent (all commits done, subscribe done, Replica B
+--- caught up to dbTs, WebSocket queue drained), yet client has stale value!
+search [1] in CLUSTER-BUGGY :
+  initCluster =>!
+    db(DBTS:Nat, DBVAL:Nat, 0)
+    || repA(LA:Nat, emptyPT)
+    || repB(DBTS:Nat, false, SREG:SubReg, sDone, emptyPT)
+    || cli(true, CLTS:Nat, CVAL:Nat, OOO:Bool, nilWs)
+  such that (CVAL:Nat =/= DBVAL:Nat) or (CLTS:Nat < DBTS:Nat) .
+
+--- [CLUSTER-BUGGY b] Reproduce OUT-OF-ORDER commit_ts delivery:
+--- Client receives a transition with to_ts < previous commit_ts!
+search [1] in CLUSTER-BUGGY :
+  initCluster =>*
+    db(DBTS:Nat, DBVAL:Nat, REM:Nat)
+    || repA(LA:Nat, PLA:PendTsSet)
+    || repB(LB:Nat, SLOCK:Bool, SREG:SubReg, SPHASE:SubPhase, PLB:PendTsSet)
+    || cli(true, CLTS:Nat, CVAL:Nat, true, WQ:WsQueue) .
+
+--- [CLUSTER-FIXED 1] Prove ZERO out-of-order commit_ts deliveries across ALL states!
+--- Expected: No solution.
+search in CLUSTER-FIXED :
+  initCluster =>*
+    db(DBTS:Nat, DBVAL:Nat, REM:Nat)
+    || repA(LA:Nat, PLA:PendTsSet)
+    || repB(LB:Nat, SLOCK:Bool, SREG:SubReg, SPHASE:SubPhase, PLB:PendTsSet)
+    || cli(HRECV:Bool, CLTS:Nat, CVAL:Nat, true, WQ:WsQueue) .
+
+--- [CLUSTER-FIXED 2] Prove ZERO lost updates, ZERO deadlocks, and EXACT convergence
+--- in EVERY terminal state across ALL interleavings!
+--- Expected: No solution.
+search in CLUSTER-FIXED :
+  initCluster =>!
+    db(DBTS:Nat, DBVAL:Nat, REM:Nat)
+    || repA(LA:Nat, PLA:PendTsSet)
+    || repB(LB:Nat, SLOCK:Bool, SREG:SubReg, SPHASE:SubPhase, PLB:PendTsSet)
+    || cli(HRECV:Bool, CLTS:Nat, CVAL:Nat, OOO:Bool, WQ:WsQueue)
+  such that (REM:Nat =/= 0) or (SPHASE:SubPhase =/= sDone)
+         or (LB:Nat =/= DBTS:Nat) or (WQ:WsQueue =/= nilWs)
+         or (not HRECV:Bool) or (CVAL:Nat =/= DBVAL:Nat)
+         or (CLTS:Nat =/= DBTS:Nat) or OOO:Bool .
+
+quit

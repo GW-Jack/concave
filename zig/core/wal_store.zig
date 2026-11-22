@@ -218,20 +218,48 @@ pub const WalStore = struct {
             };
         }
 
-        // 2. Validate that target docs exist for Replace/Patch before mutating state.
-        for (writes) |op| {
-            switch (op) {
-                .replace => |r| {
-                    const k = try makeDocKey(self.allocator, r.namespace, r.table, r.doc_id);
-                    defer self.allocator.free(k);
-                    if (!self.docs.contains(k)) return storage_mod.StorageError.NotFound;
-                },
-                .patch => |p| {
-                    const k = try makeDocKey(self.allocator, p.namespace, p.table, p.doc_id);
-                    defer self.allocator.free(k);
-                    if (!self.docs.contains(k)) return storage_mod.StorageError.NotFound;
-                },
-                else => {},
+        // 2. Validate that target docs exist for Replace/Patch against intra-tx virtual existence state
+        //    so `[insert(x), patch(x)]` succeeds and `[delete(x), patch(x)]` fails atomically.
+        {
+            var v_exists: std.StringHashMapUnmanaged(bool) = .empty;
+            defer {
+                var vit = v_exists.keyIterator();
+                while (vit.next()) |kp| self.allocator.free(kp.*);
+                v_exists.deinit(self.allocator);
+            }
+            for (writes) |op| {
+                switch (op) {
+                    .insert => |ins| {
+                        const k = try makeDocKey(self.allocator, ins.namespace, ins.table, ins.doc_id);
+                        if (v_exists.getPtr(k)) |ptr| {
+                            self.allocator.free(k);
+                            ptr.* = true;
+                        } else {
+                            try v_exists.put(self.allocator, k, true);
+                        }
+                    },
+                    .replace => |r| {
+                        const k = try makeDocKey(self.allocator, r.namespace, r.table, r.doc_id);
+                        defer self.allocator.free(k);
+                        const exists = v_exists.get(k) orelse self.docs.contains(k);
+                        if (!exists) return storage_mod.StorageError.NotFound;
+                    },
+                    .patch => |p| {
+                        const k = try makeDocKey(self.allocator, p.namespace, p.table, p.doc_id);
+                        defer self.allocator.free(k);
+                        const exists = v_exists.get(k) orelse self.docs.contains(k);
+                        if (!exists) return storage_mod.StorageError.NotFound;
+                    },
+                    .delete => |d| {
+                        const k = try makeDocKey(self.allocator, d.namespace, d.table, d.doc_id);
+                        if (v_exists.getPtr(k)) |ptr| {
+                            self.allocator.free(k);
+                            ptr.* = false;
+                        } else {
+                            try v_exists.put(self.allocator, k, false);
+                        }
+                    },
+                }
             }
         }
 
@@ -421,9 +449,9 @@ pub const WalStore = struct {
     }
 
     fn appendWalLocked(self: *WalStore, path: []const u8, commit_ts: i64, writes: []const WriteOp) !void {
-        var line: std.Io.Writer.Allocating = .init(self.allocator);
-        defer line.deinit();
-        const w = &line.writer;
+        var payload: std.Io.Writer.Allocating = .init(self.allocator);
+        defer payload.deinit();
+        const w = &payload.writer;
 
         try w.print("{{\"ts\":{d},\"ops\":[", .{commit_ts});
         for (writes, 0..) |op, idx| {
@@ -473,7 +501,12 @@ pub const WalStore = struct {
                 },
             }
         }
-        try w.writeAll("]}\n");
+        try w.writeAll("]}");
+
+        const crc = std.hash.Crc32.hash(payload.written());
+        var line: std.Io.Writer.Allocating = .init(self.allocator);
+        defer line.deinit();
+        try line.writer.print("{x:0>8}|{s}\n", .{ crc, payload.written() });
 
         const file = std.Io.Dir.cwd().createFile(self.io, path, .{
             .truncate = false,
@@ -484,79 +517,243 @@ pub const WalStore = struct {
         const stat = file.stat(self.io) catch return storage_mod.StorageError.StorageFailure;
         file.writePositionalAll(self.io, line.written(), stat.size) catch
             return storage_mod.StorageError.StorageFailure;
+        file.sync(self.io) catch {};
     }
 
     fn replayWalLocked(self: *WalStore, path: []const u8, manifest: *const manifest_mod.AppManifest) !void {
         const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(64 * 1024 * 1024)) catch
             return;
         defer self.allocator.free(bytes);
+        try self.replayWalBytesLocked(bytes, manifest);
+    }
 
-        var lines = std.mem.splitScalar(u8, bytes, '\n');
-        while (lines.next()) |raw_line| {
-            const trimmed = std.mem.trim(u8, raw_line, " \t\r");
-            if (trimmed.len == 0) continue;
+    /// Replay a WAL byte buffer into this store (also used directly by crash-recovery & fuzz tests).
+    /// - Only newline-terminated frames are considered committed (trailing partial frames are torn writes).
+    /// - CRC32-framed lines (`<8-hex-crc>|<json>`) reject any bit-flip corruption atomically.
+    /// - Every op in a line is fully validated before any state is mutated.
+    pub fn replayWalBytes(self: *WalStore, bytes: []const u8, manifest: *const manifest_mod.AppManifest) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.replayWalBytesLocked(bytes, manifest);
+        try self.rebuildIndexesLocked(manifest);
+    }
+
+    fn replayWalBytesLocked(self: *WalStore, bytes: []const u8, manifest: *const manifest_mod.AppManifest) !void {
+        var pos: usize = 0;
+        while (pos < bytes.len) {
+            const nl = std.mem.indexOfScalarPos(u8, bytes, pos, '\n') orelse {
+                // Unterminated trailing line => torn write from crash; stop replay cleanly.
+                break;
+            };
+            const raw_line = std.mem.trim(u8, bytes[pos..nl], " \t\r");
+            pos = nl + 1;
+            if (raw_line.len == 0) continue;
+
+            // Verify CRC32 framing if present (`<8-hex-crc>|<json>`).
+            var json_slice = raw_line;
+            if (raw_line.len >= 9 and raw_line[8] == '|') {
+                const expected_crc = std.fmt.parseInt(u32, raw_line[0..8], 16) catch break;
+                const payload = raw_line[9..];
+                if (std.hash.Crc32.hash(payload) != expected_crc) {
+                    // Corrupted WAL record => stop replay at the last valid committed prefix.
+                    break;
+                }
+                json_slice = payload;
+            } else if (raw_line[0] != '{') {
+                break;
+            }
 
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
             const a = arena.allocator();
 
-            const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, trimmed, .{}) catch continue;
-            if (parsed != .object) continue;
-            const ts_v = parsed.object.get("ts") orelse continue;
-            if (ts_v != .integer) continue;
-            const ops_v = parsed.object.get("ops") orelse continue;
-            if (ops_v != .array) continue;
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, json_slice, .{}) catch break;
+            if (parsed != .object) break;
+            const ts_v = parsed.object.get("ts") orelse break;
+            if (ts_v != .integer or ts_v.integer <= 0) break;
+            const ops_v = parsed.object.get("ops") orelse break;
+            if (ops_v != .array) break;
 
-            var ws: readset_mod.WriteSet = .{};
-            defer ws.deinit(self.allocator);
-
+            // Validate and decode all ops in this transaction before applying any of them.
+            var decoded_ops: std.ArrayList(WriteOp) = .empty;
+            var valid_line = true;
             for (ops_v.array.items) |op_v| {
-                if (op_v != .object) continue;
-                const kind = (op_v.object.get("op") orelse continue).string;
-                const ns = (op_v.object.get("ns") orelse continue).string;
-                const tbl = (op_v.object.get("table") orelse continue).string;
-                const id = (op_v.object.get("id") orelse continue).string;
+                if (op_v != .object) {
+                    valid_line = false;
+                    break;
+                }
+                const kind = jsonStrField(op_v.object, "op") orelse {
+                    valid_line = false;
+                    break;
+                };
+                const ns = jsonStrField(op_v.object, "ns") orelse {
+                    valid_line = false;
+                    break;
+                };
+                const tbl = jsonStrField(op_v.object, "table") orelse {
+                    valid_line = false;
+                    break;
+                };
+                const id = jsonStrField(op_v.object, "id") orelse {
+                    valid_line = false;
+                    break;
+                };
 
                 if (std.mem.eql(u8, kind, "insert")) {
-                    const ct = (op_v.object.get("ct") orelse continue).integer;
-                    const body = (op_v.object.get("body") orelse continue).string;
-                    try self.applyOpLocked(manifest, .{ .insert = .{
+                    const ct = jsonIntField(op_v.object, "ct") orelse {
+                        valid_line = false;
+                        break;
+                    };
+                    const body = jsonStrField(op_v.object, "body") orelse {
+                        valid_line = false;
+                        break;
+                    };
+                    try decoded_ops.append(a, .{ .insert = .{
                         .namespace = @constCast(ns),
                         .table = @constCast(tbl),
                         .doc_id = @constCast(id),
                         .creation_time_ms = ct,
                         .body_json = @constCast(body),
-                    } }, &ws);
+                    } });
                 } else if (std.mem.eql(u8, kind, "replace")) {
-                    const body = (op_v.object.get("body") orelse continue).string;
-                    try self.applyOpLocked(manifest, .{ .replace = .{
+                    const body = jsonStrField(op_v.object, "body") orelse {
+                        valid_line = false;
+                        break;
+                    };
+                    try decoded_ops.append(a, .{ .replace = .{
                         .namespace = @constCast(ns),
                         .table = @constCast(tbl),
                         .doc_id = @constCast(id),
                         .body_json = @constCast(body),
-                    } }, &ws);
+                    } });
                 } else if (std.mem.eql(u8, kind, "patch")) {
-                    const patch = (op_v.object.get("patch") orelse continue).string;
-                    try self.applyOpLocked(manifest, .{ .patch = .{
+                    const patch = jsonStrField(op_v.object, "patch") orelse {
+                        valid_line = false;
+                        break;
+                    };
+                    try decoded_ops.append(a, .{ .patch = .{
                         .namespace = @constCast(ns),
                         .table = @constCast(tbl),
                         .doc_id = @constCast(id),
                         .patch_json = @constCast(patch),
-                    } }, &ws);
+                    } });
                 } else if (std.mem.eql(u8, kind, "delete")) {
-                    try self.applyOpLocked(manifest, .{ .delete = .{
+                    try decoded_ops.append(a, .{ .delete = .{
                         .namespace = @constCast(ns),
                         .table = @constCast(tbl),
                         .doc_id = @constCast(id),
-                    } }, &ws);
+                    } });
+                } else {
+                    valid_line = false;
+                    break;
                 }
+            }
+            if (!valid_line) break;
+
+            // Validate doc existence for replace/patch before mutating state.
+            var v_exists: std.StringHashMapUnmanaged(bool) = .empty;
+            var ops_applicable = true;
+            for (decoded_ops.items) |op| {
+                switch (op) {
+                    .insert => |ins| {
+                        const k = try makeDocKey(a, ins.namespace, ins.table, ins.doc_id);
+                        try v_exists.put(a, k, true);
+                    },
+                    .replace => |r| {
+                        const k = try makeDocKey(a, r.namespace, r.table, r.doc_id);
+                        if (!(v_exists.get(k) orelse self.docs.contains(k))) {
+                            ops_applicable = false;
+                            break;
+                        }
+                    },
+                    .patch => |p| {
+                        const k = try makeDocKey(a, p.namespace, p.table, p.doc_id);
+                        if (!(v_exists.get(k) orelse self.docs.contains(k))) {
+                            ops_applicable = false;
+                            break;
+                        }
+                    },
+                    .delete => |d| {
+                        const k = try makeDocKey(a, d.namespace, d.table, d.doc_id);
+                        try v_exists.put(a, k, false);
+                    },
+                }
+            }
+            if (!ops_applicable) break;
+
+            var ws: readset_mod.WriteSet = .{};
+            defer ws.deinit(self.allocator);
+            for (decoded_ops.items) |op| {
+                self.applyOpLocked(manifest, op, &ws) catch break;
             }
             if (ts_v.integer > self.latest_ts) {
                 self.latest_ts = ts_v.integer;
             }
         }
     }
+
+    /// Assert that `self.indexes` matches `computeIndexEntries` across every live document (no orphan or missing rows).
+    pub fn verifyIndexIntegrity(self: *WalStore, allocator: Allocator, manifest: *const manifest_mod.AppManifest) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        var expected: std.StringHashMapUnmanaged(usize) = .empty;
+        defer {
+            var it = expected.keyIterator();
+            while (it.next()) |kp| allocator.free(kp.*);
+            expected.deinit(allocator);
+        }
+
+        var dit = self.docs.iterator();
+        while (dit.next()) |entry| {
+            var parts = std.mem.splitScalar(u8, entry.key_ptr.*, 0x1F);
+            const ns = parts.next() orelse continue;
+            const tbl = parts.next() orelse continue;
+            const rows = try storage_mod.computeIndexEntries(allocator, manifest, ns, tbl, entry.value_ptr);
+            defer {
+                for (rows) |*r| r.deinit(allocator);
+                allocator.free(rows);
+            }
+            for (rows) |r| {
+                const sig = try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{x}", .{
+                    ns, tbl, r.index_name, entry.value_ptr.id, r.encoded_key,
+                });
+                const gop = try expected.getOrPut(allocator, sig);
+                if (gop.found_existing) {
+                    allocator.free(sig);
+                    gop.value_ptr.* += 1;
+                } else {
+                    gop.value_ptr.* = 1;
+                }
+            }
+        }
+
+        for (self.indexes.items) |row| {
+            const sig = try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{x}", .{
+                row.namespace, row.table, row.index_name, row.doc_id, row.encoded_key,
+            });
+            defer allocator.free(sig);
+            const cnt = expected.getPtr(sig) orelse return error.IndexIntegrityViolation;
+            if (cnt.* == 0) return error.IndexIntegrityViolation;
+            cnt.* -= 1;
+        }
+
+        var eit = expected.valueIterator();
+        while (eit.next()) |rem| {
+            if (rem.* != 0) return error.IndexIntegrityViolation;
+        }
+    }
 };
+
+fn jsonStrField(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
+    const v = obj.get(name) orelse return null;
+    return if (v == .string) v.string else null;
+}
+
+fn jsonIntField(obj: std.json.ObjectMap, name: []const u8) ?i64 {
+    const v = obj.get(name) orelse return null;
+    return if (v == .integer) v.integer else null;
+}
 
 fn makeDocKey(allocator: Allocator, ns: []const u8, table: []const u8, doc_id: []const u8) ![]u8 {
     return try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}", .{ ns, table, doc_id });

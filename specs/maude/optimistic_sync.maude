@@ -1,0 +1,575 @@
+*** ============================================================================
+*** Concave Client Optimistic Sync Protocol - Model Checking
+*** Matches client/concave-client/src/client.js
+***
+*** Models:
+***   - Frame protocol: subscribe, unsubscribe, mutation, transition, mutation_result
+***   - Client state: connection epoch, connected flag, subscription state,
+***     outboundQueue, pendingMutations, inFlight set, optimisticQueue with
+***     resolvedCommitTs pruning, serverState, commitTs, and recomputed UI signal.
+***   - Network: arbitrary out-of-order delivery between transition frames and
+***     mutation_result frames, nondeterministic mutation commit or rejection,
+***     and WebSocket disconnect / reconnect with none, partial, or total c2s loss.
+***   - Two distinct mutations: m1 (+1) and m2 (+10), so every subset produces a
+***     unique sum in {0, 1, 10, 11}.
+***
+*** Modules:
+***   1. OPTIMISTIC-SYNC-BUGGY : Exact current client.js close handler, lines 83-89,
+***      which does NOT roll back in-flight pending mutations or optimistic entries
+***      on socket drop. Reproduces stuck optimistic entries and divergent UI state.
+***   2. OPTIMISTIC-SYNC-FIXED : Rolls back in-flight mutations on socket close while
+***      preserving outboundQueue mutations and non-clobbering per-reqId rollback.
+***      Proves rollback safety, 0 stuck entries, and exact quiescent convergence.
+*** ============================================================================
+
+fmod OPTIMISTIC-SYNC-SYNTAX is
+  protecting NAT .
+  protecting BOOL .
+
+  sorts MutId MutSet OptTs OptEntry OptQueue .
+  subsort MutId < MutSet .
+  subsort OptEntry < OptQueue .
+
+  ops m1 m2 : -> MutId [ctor] .
+
+  op delta : MutId -> Nat .
+  eq delta(m1) = 1 .
+  eq delta(m2) = 10 .
+
+  --- Finite set of MutIds for pendingMutations, inFlight, rejected.
+  op emptyMS : -> MutSet [ctor] .
+  op _|_ : MutSet MutSet -> MutSet [ctor assoc comm id: emptyMS] .
+  var M : MutId .
+  var MS : MutSet .
+  eq M | M = M .
+
+  op inMS : MutId MutSet -> Bool .
+  eq inMS(M, emptyMS) = false .
+  eq inMS(M, M | MS) = true .
+  eq inMS(M, MS) = false [owise] .
+
+  op delMS : MutId MutSet -> MutSet .
+  eq delMS(M, M | MS) = delMS(M, MS) .
+  eq delMS(M, MS) = MS [owise] .
+
+  op delMSSet : MutSet MutSet -> MutSet .
+  var MS1 MS2 : MutSet .
+  eq delMSSet(emptyMS, MS2) = emptyMS .
+  eq delMSSet(M | MS1, MS2) =
+       if inMS(M, MS2) then delMSSet(MS1, MS2) else M | delMSSet(MS1, MS2) fi .
+
+  --- resolvedCommitTs: either none (unresolved) or ts(N).
+  op none : -> OptTs [ctor] .
+  op ts : Nat -> OptTs [ctor] .
+
+  --- Optimistic queue entry: opt(reqId, delta, resolvedCommitTs).
+  op opt : MutId Nat OptTs -> OptEntry [ctor] .
+  op nilOpt : -> OptQueue [ctor] .
+  op _;_ : OptQueue OptQueue -> OptQueue [ctor assoc id: nilOpt] .
+
+  vars D T CUR : Nat .
+  var OT : OptTs .
+  var OQ : OptQueue .
+  var M2 : MutId .
+
+  --- Check membership in optimistic queue.
+  op hasOpt : OptQueue MutId -> Bool .
+  eq hasOpt(nilOpt, M) = false .
+  eq hasOpt(opt(M, D, OT) ; OQ, M) = true .
+  eq hasOpt(opt(M2, D, OT) ; OQ, M) = hasOpt(OQ, M) [owise] .
+
+  --- Set resolvedCommitTs on a matching entry, matching client.js lines 143-145.
+  op setResolvedTs : OptQueue MutId Nat -> OptQueue .
+  eq setResolvedTs(nilOpt, M, T) = nilOpt .
+  eq setResolvedTs(opt(M, D, OT) ; OQ, M, T) = opt(M, D, ts(T)) ; OQ .
+  eq setResolvedTs(opt(M2, D, OT) ; OQ, M, T) =
+       opt(M2, D, OT) ; setResolvedTs(OQ, M, T) [owise] .
+
+  --- _pruneOptimistic(currentCommitTs), matching client.js lines 174-181.
+  op pruneOpt : OptQueue Nat -> OptQueue .
+  eq pruneOpt(nilOpt, CUR) = nilOpt .
+  eq pruneOpt(opt(M, D, none) ; OQ, CUR) = opt(M, D, none) ; pruneOpt(OQ, CUR) .
+  eq pruneOpt(opt(M, D, ts(T)) ; OQ, CUR) =
+       if CUR >= T then pruneOpt(OQ, CUR)
+       else opt(M, D, ts(T)) ; pruneOpt(OQ, CUR) fi .
+
+  --- _removeOptimistic(reqId), matching client.js lines 183-189.
+  op removeOpt : OptQueue MutId -> OptQueue .
+  eq removeOpt(nilOpt, M) = nilOpt .
+  eq removeOpt(opt(M, D, OT) ; OQ, M) = removeOpt(OQ, M) .
+  eq removeOpt(opt(M2, D, OT) ; OQ, M) =
+       opt(M2, D, OT) ; removeOpt(OQ, M) [owise] .
+
+  --- Remove all entries whose reqId is in a given MutSet for disconnect rollback.
+  op removeOptSet : OptQueue MutSet -> OptQueue .
+  eq removeOptSet(nilOpt, MS) = nilOpt .
+  eq removeOptSet(opt(M, D, OT) ; OQ, MS) =
+       if inMS(M, MS) then removeOptSet(OQ, MS)
+       else opt(M, D, OT) ; removeOptSet(OQ, MS) fi .
+
+  --- _recomputeOptimisticSignals(), matching client.js lines 191-223.
+  op recomputeUi : Nat OptQueue -> Nat .
+  eq recomputeUi(CUR, nilOpt) = CUR .
+  eq recomputeUi(CUR, opt(M, D, OT) ; OQ) = recomputeUi(CUR + D, OQ) .
+
+  --- Outbound frames queued while socket is closed.
+  sorts OutFrame OutQueue .
+  subsort OutFrame < OutQueue .
+  op outMut : MutId Nat -> OutFrame [ctor] .
+  op outSub : -> OutFrame [ctor] .
+  op outUnsub : -> OutFrame [ctor] .
+  op nilOut : -> OutQueue [ctor] .
+  op _++_ : OutQueue OutQueue -> OutQueue [ctor assoc id: nilOut] .
+
+  --- Client-to-server wire frames as a bag so old/new conn frames can interleave.
+  sorts C2SFrame C2SBag .
+  subsort C2SFrame < C2SBag .
+  op c2sMut : Nat MutId Nat -> C2SFrame [ctor] .
+  op c2sSub : Nat -> C2SFrame [ctor] .
+  op c2sUnsub : Nat -> C2SFrame [ctor] .
+  op emptyC2S : -> C2SBag [ctor] .
+  op _#_ : C2SBag C2SBag -> C2SBag [ctor assoc comm id: emptyC2S] .
+
+  --- Server-to-client transition queue (FIFO per server broadcast stream)
+  --- and mutation_result bag (allowing arbitrary reordering vs transitions).
+  sorts TrFrame TrQueue MrFrame MrBag .
+  subsort TrFrame < TrQueue .
+  subsort MrFrame < MrBag .
+
+  --- tr(connId, toTs, serverVal)
+  op tr : Nat Nat Nat -> TrFrame [ctor] .
+  op nilTr : -> TrQueue [ctor] .
+  op _::_ : TrQueue TrQueue -> TrQueue [ctor assoc id: nilTr] .
+
+  --- mr(connId, reqId, ok?, commitTs)
+  op mr : Nat MutId Bool Nat -> MrFrame [ctor] .
+  op emptyMr : -> MrBag [ctor] .
+  op _%_ : MrBag MrBag -> MrBag [ctor assoc comm id: emptyMr] .
+
+  --- Flush outboundQueue onto a connection epoch C, recording sent mutations in inFlight.
+  op flushOutToC2S : Nat OutQueue -> C2SBag .
+  op flushOutMutIds : OutQueue -> MutSet .
+
+  var C : Nat .
+  var OQ2 : OutQueue .
+  eq flushOutToC2S(C, nilOut) = emptyC2S .
+  eq flushOutToC2S(C, outMut(M, D) ++ OQ2) = c2sMut(C, M, D) # flushOutToC2S(C, OQ2) .
+  eq flushOutToC2S(C, outSub ++ OQ2) = c2sSub(C) # flushOutToC2S(C, OQ2) .
+  eq flushOutToC2S(C, outUnsub ++ OQ2) = c2sUnsub(C) # flushOutToC2S(C, OQ2) .
+
+  eq flushOutMutIds(nilOut) = emptyMS .
+  eq flushOutMutIds(outMut(M, D) ++ OQ2) = M | flushOutMutIds(OQ2) .
+  eq flushOutMutIds(outSub ++ OQ2) = flushOutMutIds(OQ2) .
+  eq flushOutMutIds(outUnsub ++ OQ2) = flushOutMutIds(OQ2) .
+
+  --- Drop all frames belonging to a closed connection C.
+  op dropTrConn : TrQueue Nat -> TrQueue .
+  op dropMrConn : MrBag Nat -> MrBag .
+  op dropC2SConn : C2SBag Nat -> C2SBag .
+  vars C2 TS V : Nat .
+  var OK : Bool .
+  var TQ : TrQueue .
+  var MB : MrBag .
+  var C2S : C2SBag .
+
+  eq dropTrConn(nilTr, C) = nilTr .
+  eq dropTrConn(tr(C, TS, V) :: TQ, C) = dropTrConn(TQ, C) .
+  eq dropTrConn(tr(C2, TS, V) :: TQ, C) = tr(C2, TS, V) :: dropTrConn(TQ, C) [owise] .
+
+  eq dropMrConn(emptyMr, C) = emptyMr .
+  eq dropMrConn(mr(C, M, OK, TS) % MB, C) = dropMrConn(MB, C) .
+  eq dropMrConn(mr(C2, M, OK, TS) % MB, C) = mr(C2, M, OK, TS) % dropMrConn(MB, C) [owise] .
+
+  eq dropC2SConn(emptyC2S, C) = emptyC2S .
+  eq dropC2SConn(c2sMut(C, M, D) # C2S, C) = dropC2SConn(C2S, C) .
+  eq dropC2SConn(c2sSub(C) # C2S, C) = dropC2SConn(C2S, C) .
+  eq dropC2SConn(c2sUnsub(C) # C2S, C) = dropC2SConn(C2S, C) .
+  eq dropC2SConn(C2S, C) = C2S [owise] .
+
+  --- System configuration:
+  ---   cli(connId, connected, cliSub, nextStep, cliTs, cliSrvVal, uiVal,
+  ---       pending, inFlight, rejected, optQ, outQ, dropsLeft)
+  ---   srv(srvTs, srvVal, srvSubConn)
+  ---   net(c2s, s2cTr, s2cMr)
+  sorts ClientState ServerState NetState SysState .
+  op cli : Nat Bool Bool Nat Nat Nat Nat MutSet MutSet MutSet OptQueue OutQueue Nat
+        -> ClientState [ctor] .
+  op srv : Nat Nat Nat -> ServerState [ctor] .
+  op net : C2SBag TrQueue MrBag -> NetState [ctor] .
+  op _||_||_ : ClientState ServerState NetState -> SysState [ctor] .
+
+  --- Initial state: connected on epoch 1, subscribed on both client and server,
+  --- serverVal = 0, ready to issue m1 (+1) and m2 (+10) with up to 1 socket drop.
+  op initSync : -> SysState .
+  eq initSync =
+    cli(1, true, true, 1, 0, 0, 0, emptyMS, emptyMS, emptyMS, nilOpt, nilOut, 1)
+    || srv(0, 0, 1)
+    || net(emptyC2S, nilTr, emptyMr) .
+endfm
+
+*** ----------------------------------------------------------------------------
+*** Base protocol rules shared by both BUGGY and FIXED clients:
+*** normal mutation issue, server commit/reject, out-of-order transition vs
+*** mutation_result delivery, subscribe/unsubscribe, and reconnect.
+*** ----------------------------------------------------------------------------
+mod OPTIMISTIC-SYNC-BASE is
+  including OPTIMISTIC-SYNC-SYNTAX .
+
+  vars C C2 NEXT CTS CSV UIV DROPS STS SVAL SSUB TS V D : Nat .
+  vars CONN CSUB OK : Bool .
+  vars PEND INFL REJ : MutSet .
+  var OQ : OptQueue .
+  var OUTQ : OutQueue .
+  var C2S : C2SBag .
+  var TQ : TrQueue .
+  var MB : MrBag .
+  var M : MutId .
+
+  --- Issue m1 (+1) while connected, matching client.js lines 307-326.
+  rl [issue-m1-online] :
+    cli(C, true, CSUB, 1, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(C2S, TQ, MB)
+    =>
+    cli(C, true, CSUB, 2, CTS, CSV, recomputeUi(CSV, OQ ; opt(m1, 1, none)),
+        PEND | m1, INFL | m1, REJ, OQ ; opt(m1, 1, none), OUTQ, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(C2S # c2sMut(C, m1, 1), TQ, MB) .
+
+  --- Issue m1 (+1) while disconnected -> queued in _outboundQueue.
+  rl [issue-m1-offline] :
+    cli(C, false, CSUB, 1, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(C2S, TQ, MB)
+    =>
+    cli(C, false, CSUB, 2, CTS, CSV, recomputeUi(CSV, OQ ; opt(m1, 1, none)),
+        PEND | m1, INFL, REJ, OQ ; opt(m1, 1, none), OUTQ ++ outMut(m1, 1), DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(C2S, TQ, MB) .
+
+  --- Issue m2 (+10) while connected.
+  rl [issue-m2-online] :
+    cli(C, true, CSUB, 2, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(C2S, TQ, MB)
+    =>
+    cli(C, true, CSUB, 3, CTS, CSV, recomputeUi(CSV, OQ ; opt(m2, 10, none)),
+        PEND | m2, INFL | m2, REJ, OQ ; opt(m2, 10, none), OUTQ, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(C2S # c2sMut(C, m2, 10), TQ, MB) .
+
+  --- Issue m2 (+10) while disconnected -> queued in _outboundQueue.
+  rl [issue-m2-offline] :
+    cli(C, false, CSUB, 2, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(C2S, TQ, MB)
+    =>
+    cli(C, false, CSUB, 3, CTS, CSV, recomputeUi(CSV, OQ ; opt(m2, 10, none)),
+        PEND | m2, INFL, REJ, OQ ; opt(m2, 10, none), OUTQ ++ outMut(m2, 10), DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(C2S, TQ, MB) .
+
+  --- Server executes mutation and COMMITS:
+  --- advances serverTs and serverVal, sends mutation_result(ok) on originating
+  --- connection C, and broadcasts transition to currently subscribed connection SSUB.
+  rl [srv-mut-commit] :
+    cli(C2, CONN, CSUB, NEXT, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(c2sMut(C, M, D) # C2S, TQ, MB)
+    =>
+    cli(C2, CONN, CSUB, NEXT, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, DROPS)
+    || srv(STS + 1, SVAL + D, SSUB)
+    || net(C2S,
+           if SSUB > 0 then TQ :: tr(SSUB, STS + 1, SVAL + D) else TQ fi,
+           MB % mr(C, M, true, STS + 1)) .
+
+  --- Server executes mutation and REJECTS due to validation, OCC, or auth error.
+  rl [srv-mut-reject] :
+    cli(C2, CONN, CSUB, NEXT, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(c2sMut(C, M, D) # C2S, TQ, MB)
+    =>
+    cli(C2, CONN, CSUB, NEXT, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(C2S, TQ, MB % mr(C, M, false, 0)) .
+
+  --- Server handles subscribe on connection C: registers SSUB = C and sends
+  --- authoritative snapshot transition.
+  rl [srv-subscribe] :
+    cli(C2, CONN, CSUB, NEXT, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(c2sSub(C) # C2S, TQ, MB)
+    =>
+    cli(C2, CONN, CSUB, NEXT, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, DROPS)
+    || srv(STS, SVAL, C)
+    || net(C2S, TQ :: tr(C, STS, SVAL), MB) .
+
+  --- Server handles unsubscribe on connection C.
+  rl [srv-unsubscribe] :
+    cli(C2, CONN, CSUB, NEXT, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(c2sUnsub(C) # C2S, TQ, MB)
+    =>
+    cli(C2, CONN, CSUB, NEXT, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, DROPS)
+    || srv(STS, SVAL, if SSUB == C then 0 else SSUB fi)
+    || net(C2S, TQ, MB) .
+
+  --- Client receives transition frame on active connection C, client.js lines 124-138.
+  rl [cli-recv-transition] :
+    cli(C, true, true, NEXT, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(C2S, tr(C, TS, V) :: TQ, MB)
+    =>
+    cli(C, true, true, NEXT, max(CTS, TS), V,
+        recomputeUi(V, pruneOpt(OQ, max(CTS, TS))),
+        PEND, INFL, REJ, pruneOpt(OQ, max(CTS, TS)), OUTQ, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(C2S, TQ, MB) .
+
+  --- Stale transition from closed connection epoch is ignored, client.js line 74.
+  crl [cli-drop-stale-tr] :
+    cli(C, CONN, CSUB, NEXT, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(C2S, tr(C2, TS, V) :: TQ, MB)
+    =>
+    cli(C, CONN, CSUB, NEXT, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(C2S, TQ, MB)
+    if (C2 =/= C) or (not CONN) .
+
+  --- Client receives mutation_result(ok = true) on active connection C,
+  --- matching client.js lines 139-149. May arrive BEFORE or AFTER its transition!
+  rl [cli-recv-mr-ok] :
+    cli(C, true, CSUB, NEXT, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(C2S, TQ, mr(C, M, true, TS) % MB)
+    =>
+    cli(C, true, CSUB, NEXT, CTS, CSV,
+        recomputeUi(CSV, pruneOpt(setResolvedTs(OQ, M, TS), CTS)),
+        delMS(M, PEND), delMS(M, INFL), REJ,
+        pruneOpt(setResolvedTs(OQ, M, TS), CTS), OUTQ, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(C2S, TQ, MB) .
+
+  --- Client receives mutation_result(ok = false) on active connection C,
+  --- matching client.js lines 150-153: removes ONLY reqId M from optimisticQueue!
+  rl [cli-recv-mr-err] :
+    cli(C, true, CSUB, NEXT, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(C2S, TQ, mr(C, M, false, TS) % MB)
+    =>
+    cli(C, true, CSUB, NEXT, CTS, CSV,
+        recomputeUi(CSV, removeOpt(OQ, M)),
+        delMS(M, PEND), delMS(M, INFL), REJ | M,
+        removeOpt(OQ, M), OUTQ, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(C2S, TQ, MB) .
+
+  --- Stale mutation_result from closed connection epoch is ignored, client.js line 74.
+  crl [cli-drop-stale-mr] :
+    cli(C, CONN, CSUB, NEXT, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(C2S, TQ, mr(C2, M, OK, TS) % MB)
+    =>
+    cli(C, CONN, CSUB, NEXT, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(C2S, TQ, MB)
+    if (C2 =/= C) or (not CONN) .
+
+  --- Reconnect: opens new connection epoch C + 1, re-subscribes, and flushes
+  --- _outboundQueue, matching client.js lines 50-71.
+  rl [cli-reconnect] :
+    cli(C, false, true, NEXT, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(C2S, TQ, MB)
+    =>
+    cli(C + 1, true, true, NEXT, CTS, CSV, UIV,
+        PEND, INFL | flushOutMutIds(OUTQ), REJ, OQ, nilOut, DROPS)
+    || srv(STS, SVAL, SSUB)
+    || net(C2S # c2sSub(C + 1) # flushOutToC2S(C + 1, OUTQ), TQ, MB) .
+endm
+
+*** ----------------------------------------------------------------------------
+*** 1. OPTIMISTIC-SYNC-BUGGY: Current client.js close behavior, lines 83-89
+***
+*** On WebSocket close:
+***   - Server closes session (SSUB := 0), in-flight s2c frames on old conn drop.
+***   - In-flight c2s mutations may be kept, partially lost, or totally lost.
+***   - BUG: client.js NEVER clears/rejects _pendingMutations or rolls back
+***     in-flight entries from _optimisticQueue!
+*** ----------------------------------------------------------------------------
+mod OPTIMISTIC-SYNC-BUGGY is
+  including OPTIMISTIC-SYNC-BASE .
+
+  vars C NEXT CTS CSV UIV DROPS STS SVAL SSUB D : Nat .
+  var CSUB : Bool .
+  vars PEND INFL REJ : MutSet .
+  var OQ : OptQueue .
+  var OUTQ : OutQueue .
+  var C2S : C2SBag .
+  var TQ : TrQueue .
+  var MB : MrBag .
+  var M : MutId .
+
+  --- Socket drops; c2s frames already buffered at server still execute.
+  crl [disconnect-buggy-keep-c2s] :
+    cli(C, true, CSUB, NEXT, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, s(DROPS))
+    || srv(STS, SVAL, SSUB)
+    || net(C2S, TQ, MB)
+    =>
+    cli(C, false, CSUB, NEXT, CTS, CSV, UIV, PEND, emptyMS, REJ, OQ, OUTQ, DROPS)
+    || srv(STS, SVAL, 0)
+    || net(C2S, dropTrConn(TQ, C), dropMrConn(MB, C))
+    if INFL =/= emptyMS .
+
+  --- Socket drops AND loses one in-flight c2s mutation before reaching server.
+  rl [disconnect-buggy-lose-one-c2s] :
+    cli(C, true, CSUB, NEXT, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, s(DROPS))
+    || srv(STS, SVAL, SSUB)
+    || net(c2sMut(C, M, D) # C2S, TQ, MB)
+    =>
+    cli(C, false, CSUB, NEXT, CTS, CSV, UIV, PEND, emptyMS, REJ, OQ, OUTQ, DROPS)
+    || srv(STS, SVAL, 0)
+    || net(C2S, dropTrConn(TQ, C), dropMrConn(MB, C)) .
+
+  --- Socket drops AND loses all in-flight c2s frames of connection C.
+  rl [disconnect-buggy-lose-all-c2s] :
+    cli(C, true, CSUB, NEXT, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, s(DROPS))
+    || srv(STS, SVAL, SSUB)
+    || net(C2S, TQ, MB)
+    =>
+    cli(C, false, CSUB, NEXT, CTS, CSV, UIV, PEND, emptyMS, REJ, OQ, OUTQ, DROPS)
+    || srv(STS, SVAL, 0)
+    || net(dropC2SConn(C2S, C), dropTrConn(TQ, C), dropMrConn(MB, C)) .
+endm
+
+*** ----------------------------------------------------------------------------
+*** 2. OPTIMISTIC-SYNC-FIXED: Disconnect rollback of in-flight mutations
+***
+*** Fix on WebSocket close:
+***   - Reject & remove every in-flight mutation from _pendingMutations,
+***   - Remove every in-flight mutation from _optimisticQueue and recompute UI,
+***   - Preserve any mutations still queued in _outboundQueue,
+***   - On reconnect, re-subscribe for authoritative state and flush outboundQueue.
+*** ----------------------------------------------------------------------------
+mod OPTIMISTIC-SYNC-FIXED is
+  including OPTIMISTIC-SYNC-BASE .
+
+  vars C NEXT CTS CSV UIV DROPS STS SVAL SSUB D : Nat .
+  var CSUB : Bool .
+  vars PEND INFL REJ : MutSet .
+  var OQ : OptQueue .
+  var OUTQ : OutQueue .
+  var C2S : C2SBag .
+  var TQ : TrQueue .
+  var MB : MrBag .
+  var M : MutId .
+
+  --- Socket drops while keeping buffered c2s frames at server.
+  rl [disconnect-fixed-keep-c2s] :
+    cli(C, true, CSUB, NEXT, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, s(DROPS))
+    || srv(STS, SVAL, SSUB)
+    || net(C2S, TQ, MB)
+    =>
+    cli(C, false, CSUB, NEXT, CTS, CSV,
+        recomputeUi(CSV, removeOptSet(OQ, INFL)),
+        delMSSet(PEND, INFL), emptyMS, REJ,
+        removeOptSet(OQ, INFL), OUTQ, DROPS)
+    || srv(STS, SVAL, 0)
+    || net(C2S, dropTrConn(TQ, C), dropMrConn(MB, C)) .
+
+  --- Socket drops AND loses one in-flight c2s mutation in transit.
+  rl [disconnect-fixed-lose-one-c2s] :
+    cli(C, true, CSUB, NEXT, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, s(DROPS))
+    || srv(STS, SVAL, SSUB)
+    || net(c2sMut(C, M, D) # C2S, TQ, MB)
+    =>
+    cli(C, false, CSUB, NEXT, CTS, CSV,
+        recomputeUi(CSV, removeOptSet(OQ, INFL)),
+        delMSSet(PEND, INFL), emptyMS, REJ,
+        removeOptSet(OQ, INFL), OUTQ, DROPS)
+    || srv(STS, SVAL, 0)
+    || net(C2S, dropTrConn(TQ, C), dropMrConn(MB, C)) .
+
+  --- Socket drops AND loses all in-flight c2s frames of connection C.
+  rl [disconnect-fixed-lose-all-c2s] :
+    cli(C, true, CSUB, NEXT, CTS, CSV, UIV, PEND, INFL, REJ, OQ, OUTQ, s(DROPS))
+    || srv(STS, SVAL, SSUB)
+    || net(C2S, TQ, MB)
+    =>
+    cli(C, false, CSUB, NEXT, CTS, CSV,
+        recomputeUi(CSV, removeOptSet(OQ, INFL)),
+        delMSSet(PEND, INFL), emptyMS, REJ,
+        removeOptSet(OQ, INFL), OUTQ, DROPS)
+    || srv(STS, SVAL, 0)
+    || net(dropC2SConn(C2S, C), dropTrConn(TQ, C), dropMrConn(MB, C)) .
+endm
+
+*** ============================================================================
+*** MODEL CHECKING QUERIES
+*** ============================================================================
+
+--- [BUGGY 1] Current client.js on socket drop: reproduce STUCK pending mutation
+--- and STUCK optimistic entry in a quiescent state after reconnect!
+search [1] in OPTIMISTIC-SYNC-BUGGY :
+  initSync =>*
+    cli(C:Nat, true, true, 3, CTS:Nat, CSV:Nat, UIV:Nat,
+        PEND:MutSet, INFL:MutSet, REJ:MutSet, OQ:OptQueue, nilOut, DROPS:Nat)
+    || srv(STS:Nat, SVAL:Nat, C:Nat)
+    || net(emptyC2S, nilTr, emptyMr)
+  such that (PEND:MutSet =/= emptyMS) or (OQ:OptQueue =/= nilOpt) .
+
+--- [BUGGY 2] Current client.js on socket drop: reproduce DIVERGENT quiescent UI
+--- state where uiVal =/= serverVal permanently after reconnect!
+search [1] in OPTIMISTIC-SYNC-BUGGY :
+  initSync =>*
+    cli(C:Nat, true, true, 3, CTS:Nat, CSV:Nat, UIV:Nat,
+        PEND:MutSet, INFL:MutSet, REJ:MutSet, OQ:OptQueue, nilOut, DROPS:Nat)
+    || srv(STS:Nat, SVAL:Nat, C:Nat)
+    || net(emptyC2S, nilTr, emptyMr)
+  such that UIV:Nat =/= SVAL:Nat .
+
+--- [FIXED 0] Sanity check: confirm rollback scenario (m1 rejected while m2 is
+--- still pending) IS reachable and preserves m2 (+10) in UI!
+search [1] in OPTIMISTIC-SYNC-FIXED :
+  initSync =>*
+    cli(C:Nat, true, true, 3, CTS:Nat, CSV:Nat, UIV:Nat,
+        PEND:MutSet, INFL:MutSet, REJ:MutSet, OQ:OptQueue, OUTQ:OutQueue, DROPS:Nat)
+    || srv(STS:Nat, SVAL:Nat, SSUB:Nat)
+    || net(C2S:C2SBag, TQ:TrQueue, MB:MrBag)
+  such that inMS(m1, REJ:MutSet) and inMS(m2, PEND:MutSet) .
+
+--- [FIXED 1] Rollback safety: failed m1 NEVER clobbers a newer pending m2
+--- in optimisticQueue OR UI across ALL reachable states!
+--- Expected: No solution.
+search in OPTIMISTIC-SYNC-FIXED :
+  initSync =>*
+    cli(C:Nat, CONN:Bool, CSUB:Bool, NEXT:Nat, CTS:Nat, CSV:Nat, UIV:Nat,
+        PEND:MutSet, INFL:MutSet, REJ:MutSet, OQ:OptQueue, OUTQ:OutQueue, DROPS:Nat)
+    || srv(STS:Nat, SVAL:Nat, SSUB:Nat)
+    || net(C2S:C2SBag, TQ:TrQueue, MB:MrBag)
+  such that inMS(m1, REJ:MutSet) and inMS(m2, PEND:MutSet)
+            and ((not hasOpt(OQ:OptQueue, m2)) or (UIV:Nat < 10)) .
+
+--- [FIXED 2] Zero stuck pending mutations or optimistic entries at quiescence!
+--- Expected: No solution.
+search in OPTIMISTIC-SYNC-FIXED :
+  initSync =>*
+    cli(C:Nat, true, true, 3, CTS:Nat, CSV:Nat, UIV:Nat,
+        PEND:MutSet, INFL:MutSet, REJ:MutSet, OQ:OptQueue, nilOut, DROPS:Nat)
+    || srv(STS:Nat, SVAL:Nat, C:Nat)
+    || net(emptyC2S, nilTr, emptyMr)
+  such that (PEND:MutSet =/= emptyMS) or (OQ:OptQueue =/= nilOpt) .
+
+--- [FIXED 3] Exact quiescent convergence: after all frames drain, client UI
+--- value ALWAYS equals exact authoritative server state!
+--- Expected: No solution.
+search in OPTIMISTIC-SYNC-FIXED :
+  initSync =>*
+    cli(C:Nat, true, true, 3, CTS:Nat, CSV:Nat, UIV:Nat,
+        PEND:MutSet, INFL:MutSet, REJ:MutSet, OQ:OptQueue, nilOut, DROPS:Nat)
+    || srv(STS:Nat, SVAL:Nat, C:Nat)
+    || net(emptyC2S, nilTr, emptyMr)
+  such that (UIV:Nat =/= SVAL:Nat) or (CSV:Nat =/= SVAL:Nat) .
+
+quit

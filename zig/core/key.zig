@@ -60,7 +60,13 @@ pub const IndexValue = union(enum) {
         if (std.mem.eql(u8, kind, "int")) {
             return switch (payload) {
                 .integer => |i| .{ .int_val = i },
-                .float => |f| .{ .int_val = @intFromFloat(f) },
+                .float => |f| {
+                    if (!std.math.isFinite(f)) return error.InvalidKey;
+                    const min_f: f64 = @floatFromInt(std.math.minInt(i64));
+                    const max_f: f64 = 9223372036854774784.0; // largest exact f64 <= maxInt(i64)
+                    if (f < min_f or f > max_f) return error.InvalidKey;
+                    return .{ .int_val = @intFromFloat(f) };
+                },
                 else => error.InvalidKey,
             };
         }

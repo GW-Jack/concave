@@ -60,7 +60,7 @@ pub fn serve(
     }
 }
 
-const HttpRequest = struct {
+pub const HttpRequest = struct {
     method: []u8,
     path: []u8,
     authorization: ?[]u8 = null,
@@ -68,7 +68,7 @@ const HttpRequest = struct {
     ws_key: ?[]u8 = null,
     body: []u8,
 
-    fn deinit(self: *const HttpRequest, allocator: Allocator) void {
+    pub fn deinit(self: *const HttpRequest, allocator: Allocator) void {
         allocator.free(self.method);
         allocator.free(self.path);
         if (self.authorization) |a| allocator.free(a);
@@ -77,18 +77,20 @@ const HttpRequest = struct {
     }
 };
 
-fn readHttpRequest(allocator: Allocator, reader: *std.Io.Reader) !?HttpRequest {
+pub fn readHttpRequest(allocator: Allocator, reader: *std.Io.Reader) !?HttpRequest {
     var head: std.ArrayList(u8) = .empty;
     defer head.deinit(allocator);
 
+    var found_end = false;
     while (head.items.len < 64 * 1024) {
         const b = reader.takeByte() catch return null;
         try head.append(allocator, b);
         if (head.items.len >= 4 and std.mem.eql(u8, head.items[head.items.len - 4 ..], "\r\n\r\n")) {
+            found_end = true;
             break;
         }
     }
-    if (head.items.len < 4) return null;
+    if (!found_end) return error.HeadersTooLarge;
 
     var lines = std.mem.splitSequence(u8, head.items[0 .. head.items.len - 4], "\r\n");
     const req_line = lines.next() orelse return null;
@@ -305,18 +307,47 @@ fn sendHttpRpcResult(allocator: Allocator, io: std.Io, stream: std.Io.net.Stream
     }
 }
 
-fn serveStaticFile(allocator: Allocator, io: std.Io, stream: std.Io.net.Stream, root: []const u8, raw_path: []const u8) void {
-    const trimmed = std.mem.trimStart(u8, raw_path, "/");
-    const rel = if (trimmed.len == 0) "index.html" else trimmed;
+/// Decode percent-encoding and reject path traversal (`..`, `\`, NUL bytes, control chars).
+pub fn sanitizeStaticPath(allocator: Allocator, raw_path: []const u8) ![]u8 {
+    var decoded: std.ArrayList(u8) = .empty;
+    defer decoded.deinit(allocator);
 
-    // Guard against path traversal (`..`).
-    var segs = std.mem.splitScalar(u8, rel, '/');
-    while (segs.next()) |seg| {
-        if (std.mem.eql(u8, seg, "..")) {
-            writeHttpResponse(io, stream, 403, "Forbidden", "text/plain", "forbidden");
-            return;
+    var i: usize = 0;
+    while (i < raw_path.len) {
+        if (raw_path[i] == '%') {
+            if (i + 2 >= raw_path.len) return error.ForbiddenPath;
+            const byte = std.fmt.parseInt(u8, raw_path[i + 1 .. i + 3], 16) catch return error.ForbiddenPath;
+            try decoded.append(allocator, byte);
+            i += 3;
+        } else {
+            try decoded.append(allocator, raw_path[i]);
+            i += 1;
         }
     }
+
+    for (decoded.items) |b| {
+        if (b == 0 or b == '\\' or b < 0x20) return error.ForbiddenPath;
+    }
+
+    const trimmed = std.mem.trimStart(u8, decoded.items, "/");
+    const rel = if (trimmed.len == 0) "index.html" else trimmed;
+
+    var segs = std.mem.splitScalar(u8, rel, '/');
+    while (segs.next()) |seg| {
+        if (std.mem.eql(u8, seg, "..") or std.mem.eql(u8, seg, ".")) {
+            return error.ForbiddenPath;
+        }
+    }
+
+    return try allocator.dupe(u8, rel);
+}
+
+fn serveStaticFile(allocator: Allocator, io: std.Io, stream: std.Io.net.Stream, root: []const u8, raw_path: []const u8) void {
+    const rel = sanitizeStaticPath(allocator, raw_path) catch {
+        writeHttpResponse(io, stream, 403, "Forbidden", "text/plain", "forbidden");
+        return;
+    };
+    defer allocator.free(rel);
 
     const full_path = std.fs.path.join(allocator, &.{ root, rel }) catch return;
     defer allocator.free(full_path);
@@ -425,19 +456,19 @@ fn handleWsText(
         defer allocator.free(resp);
         sender.sendText(resp) catch {};
     } else if (std.mem.eql(u8, msg_type, "subscribe")) {
-        const sub_id = (parsed.object.get("sub_id") orelse return).string;
-        const name = (parsed.object.get("name") orelse return).string;
+        const sub_id = jsonStringField(parsed.object, "sub_id") orelse return;
+        const name = jsonStringField(parsed.object, "name") orelse return;
         const args_json = if (parsed.object.get("args")) |av|
             storage_mod.stringifyJsonValue(a, av) catch "{}"
         else
             "{}";
         engine.subscribe(client_id, sub_id, name, args_json) catch {};
     } else if (std.mem.eql(u8, msg_type, "unsubscribe")) {
-        const sub_id = (parsed.object.get("sub_id") orelse return).string;
+        const sub_id = jsonStringField(parsed.object, "sub_id") orelse return;
         engine.unsubscribe(client_id, sub_id);
     } else if (std.mem.eql(u8, msg_type, "mutation")) {
-        const req_id = (parsed.object.get("req_id") orelse return).string;
-        const name = (parsed.object.get("name") orelse return).string;
+        const req_id = jsonStringField(parsed.object, "req_id") orelse return;
+        const name = jsonStringField(parsed.object, "name") orelse return;
         const args_json = if (parsed.object.get("args")) |av|
             storage_mod.stringifyJsonValue(a, av) catch "{}"
         else
@@ -468,8 +499,8 @@ fn handleWsText(
         }
         sender.sendText(out.written()) catch {};
     } else if (std.mem.eql(u8, msg_type, "action")) {
-        const req_id = (parsed.object.get("req_id") orelse return).string;
-        const name = (parsed.object.get("name") orelse return).string;
+        const req_id = jsonStringField(parsed.object, "req_id") orelse return;
+        const name = jsonStringField(parsed.object, "name") orelse return;
         const args_json = if (parsed.object.get("args")) |av|
             storage_mod.stringifyJsonValue(a, av) catch "{}"
         else
@@ -505,4 +536,9 @@ fn handleWsText(
         defer allocator.free(pong);
         sender.sendText(pong) catch {};
     }
+}
+
+fn jsonStringField(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
+    const v = obj.get(name) orelse return null;
+    return if (v == .string) v.string else null;
 }

@@ -1,16 +1,20 @@
 /**
- * Zero-dependency fine-grained reactive signal primitives for Concave.
+ * Zero-dependency glitch-free fine-grained reactive signal primitives for Concave.
  * Native browser ESM — zero npm, zero transpiler, zero bundler.
+ *
+ * Uses push-pull dirty propagation with dependency version checking so diamond
+ * graphs (`src -> {left, right} -> sum -> effect`) never glitch and never
+ * over-execute when a memoized `computed` produces an equal value.
  */
 
 let currentObserver = null;
 let batchDepth = 0;
-const pendingComputations = new Set();
+const pendingEffects = new Set();
 const noopExecute = () => {};
 
 function cleanupComputation(comp) {
-  for (const dep of comp.dependencies) {
-    dep.delete(comp);
+  for (const dep of comp.dependencies.keys()) {
+    dep.subscribers.delete(comp);
   }
   comp.dependencies.clear();
   for (const fn of comp.cleanups) {
@@ -23,12 +27,38 @@ function cleanupComputation(comp) {
   comp.cleanups.length = 0;
 }
 
-function scheduleComputation(comp) {
-  if (comp.disposed) return;
-  if (batchDepth > 0) {
-    pendingComputations.add(comp);
-  } else {
-    comp.execute();
+function notifySubscribers(source) {
+  const subs = Array.from(source.subscribers);
+  for (const sub of subs) {
+    if (sub.disposed) continue;
+    if (sub.isComputed) {
+      sub.markDirty();
+    } else {
+      pendingEffects.add(sub);
+    }
+  }
+}
+
+function flushEffects() {
+  if (batchDepth > 0) return;
+  while (pendingEffects.size > 0) {
+    const queue = Array.from(pendingEffects);
+    pendingEffects.clear();
+    for (const eff of queue) {
+      if (eff.disposed) continue;
+      // Pull any dirty computed dependencies first; skip if no dependency version actually changed.
+      let changed = eff.dependencies.size === 0;
+      for (const [dep, seenVersion] of eff.dependencies) {
+        if (dep.refresh) dep.refresh();
+        if (dep.version !== seenVersion) {
+          changed = true;
+          break;
+        }
+      }
+      if (changed) {
+        eff.execute();
+      }
+    }
   }
 }
 
@@ -38,14 +68,8 @@ export function batch(fn) {
     return fn();
   } finally {
     batchDepth -= 1;
-    if (batchDepth === 0 && pendingComputations.size > 0) {
-      const queue = Array.from(pendingComputations);
-      pendingComputations.clear();
-      for (const comp of queue) {
-        if (!comp.disposed) {
-          comp.execute();
-        }
-      }
+    if (batchDepth === 0) {
+      flushEffects();
     }
   }
 }
@@ -68,7 +92,8 @@ export function onCleanup(fn) {
 
 export function createRoot(fn) {
   const scope = {
-    dependencies: new Set(),
+    isComputed: false,
+    dependencies: new Map(),
     cleanups: [],
     disposed: false,
     execute: noopExecute,
@@ -90,8 +115,12 @@ export function createRoot(fn) {
 }
 
 export function signal(initial, equals = Object.is) {
-  let value = initial;
-  const subscribers = new Set();
+  const node = {
+    value: initial,
+    version: 0,
+    subscribers: new Set(),
+    refresh: null,
+  };
 
   const read = () => {
     if (
@@ -99,27 +128,25 @@ export function signal(initial, equals = Object.is) {
       !currentObserver.disposed &&
       currentObserver.execute !== noopExecute
     ) {
-      subscribers.add(currentObserver);
-      currentObserver.dependencies.add(subscribers);
+      node.subscribers.add(currentObserver);
+      currentObserver.dependencies.set(node, node.version);
     }
-    return value;
+    return node.value;
   };
 
-  read.peek = () => value;
+  read.peek = () => node.value;
 
   read.set = (next) => {
-    if (equals(value, next)) return;
-    value = next;
-    const toRun = Array.from(subscribers);
+    if (equals(node.value, next)) return;
+    node.value = next;
+    node.version += 1;
     batch(() => {
-      for (const comp of toRun) {
-        scheduleComputation(comp);
-      }
+      notifySubscribers(node);
     });
   };
 
   read.update = (fn) => {
-    read.set(fn(value));
+    read.set(fn(node.value));
   };
 
   return read;
@@ -127,7 +154,8 @@ export function signal(initial, equals = Object.is) {
 
 export function effect(fn) {
   const comp = {
-    dependencies: new Set(),
+    isComputed: false,
+    dependencies: new Map(),
     cleanups: [],
     disposed: false,
     execute() {
@@ -151,7 +179,7 @@ export function effect(fn) {
   const dispose = () => {
     if (comp.disposed) return;
     comp.disposed = true;
-    pendingComputations.delete(comp);
+    pendingEffects.delete(comp);
     cleanupComputation(comp);
   };
 
@@ -163,12 +191,79 @@ export function effect(fn) {
 }
 
 export function computed(fn, equals = Object.is) {
-  const out = signal(undefined, equals);
-  const dispose = effect(() => {
-    out.set(fn());
-  });
+  const node = {
+    isComputed: true,
+    value: undefined,
+    initialized: false,
+    dirty: true,
+    version: 0,
+    subscribers: new Set(),
+    dependencies: new Map(),
+    cleanups: [],
+    disposed: false,
+    execute: null,
+    markDirty() {
+      if (node.dirty) return;
+      node.dirty = true;
+      notifySubscribers(node);
+    },
+    refresh() {
+      if (!node.dirty) return;
+      if (node.initialized) {
+        let depChanged = false;
+        for (const [dep, seenVersion] of node.dependencies) {
+          if (dep.refresh) dep.refresh();
+          if (dep.version !== seenVersion) {
+            depChanged = true;
+            break;
+          }
+        }
+        if (!depChanged) {
+          node.dirty = false;
+          return;
+        }
+      }
+
+      cleanupComputation(node);
+      const prev = currentObserver;
+      currentObserver = node;
+      let next;
+      try {
+        next = fn();
+      } finally {
+        currentObserver = prev;
+      }
+
+      node.dirty = false;
+      if (!node.initialized || !equals(node.value, next)) {
+        node.initialized = true;
+        node.value = next;
+        node.version += 1;
+      }
+    },
+  };
+  node.execute = node.refresh;
+
+  const dispose = () => {
+    if (node.disposed) return;
+    node.disposed = true;
+    cleanupComputation(node);
+    node.subscribers.clear();
+  };
   if (currentObserver) {
     onCleanup(dispose);
   }
-  return () => out();
+
+  return () => {
+    node.refresh();
+    if (
+      currentObserver &&
+      !currentObserver.disposed &&
+      currentObserver.execute !== noopExecute
+    ) {
+      node.subscribers.add(currentObserver);
+      currentObserver.dependencies.set(node, node.version);
+    }
+    return node.value;
+  };
 }

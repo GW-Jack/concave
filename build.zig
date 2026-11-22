@@ -43,11 +43,23 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(cli_exe);
 
-    // 3. All Zig unit tests (`zig build test`)
+    // 3. All Zig unit, DST, crash-recovery, and fuzz-corpus tests (`zig build test`)
     const test_mod = b.createModule(.{
         .root_source_file = b.path("zig/tests.zig"),
         .target = target,
         .optimize = optimize,
+    });
+    test_mod.addAnonymousImport("concave_client_index_js", .{
+        .root_source_file = b.path("client/concave-client/src/index.js"),
+    });
+    test_mod.addAnonymousImport("concave_client_signals_js", .{
+        .root_source_file = b.path("client/concave-client/src/signals.js"),
+    });
+    test_mod.addAnonymousImport("concave_client_client_js", .{
+        .root_source_file = b.path("client/concave-client/src/client.js"),
+    });
+    test_mod.addAnonymousImport("concave_client_dom_js", .{
+        .root_source_file = b.path("client/concave-client/src/dom.js"),
     });
     const unit_tests = b.addTest(.{
         .root_module = test_mod,

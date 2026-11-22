@@ -1,4 +1,4 @@
-.PHONY: host host-release test test-zig test-roc test-client test-e2e codegen-chat dev-chat
+.PHONY: host host-release test test-zig test-roc test-client test-e2e verify-formal codegen-chat dev-chat
 
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
@@ -45,12 +45,21 @@ test-roc:
 	roc check examples/chat-app/backend/main.roc
 
 test-client:
-	node --test client/concave-client/test/signals.test.mjs
+	node --test client/concave-client/test/*.test.mjs
 
 test-e2e: host codegen-chat
 	node --test --test-timeout=15000 tests/e2e_chat_platform.mjs
 
 test: test-zig test-roc test-client test-e2e
+
+## Run all Wave 2 machine-checked formal proofs & model checks (Lean 4, Maude, Z3)
+verify-formal:
+	lean specs/lean/KeyCodec.lean
+	lean specs/lean/ReadSetSoundness.lean
+	maude -no-banner specs/maude/signals.maude
+	maude -no-banner specs/maude/optimistic_sync.maude
+	maude -no-banner specs/maude/concave_cluster.maude
+	z3 specs/z3/key_and_occ.smt2
 
 codegen-chat: host
 	./zig-out/bin/concave codegen \

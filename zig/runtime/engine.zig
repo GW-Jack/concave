@@ -177,6 +177,7 @@ const ActiveSubscription = struct {
     args_json: []u8,
     read_set: readset_mod.ReadSet,
     last_payload: ?ExecResult = null,
+    last_sent_ts: i64 = 0,
 
     fn deinit(self: *ActiveSubscription, allocator: Allocator) void {
         allocator.free(self.sub_id);
@@ -300,7 +301,10 @@ pub const ConcaveEngine = struct {
                 return try formatAuthError(self.allocator, @errorName(err));
             };
         }
-        errdefer if (new_auth) |*a| a.deinit(self.allocator);
+        defer if (new_auth) |*a| a.deinit(self.allocator);
+
+        self.sync_mutex.lockUncancelable(self.io);
+        defer self.sync_mutex.unlock(self.io);
 
         const SubSpec = struct { sub_id: []u8, name: []u8, args_json: []u8 };
         var to_rerun: std.ArrayList(SubSpec) = .empty;
@@ -313,7 +317,6 @@ pub const ConcaveEngine = struct {
             to_rerun.deinit(self.allocator);
         }
 
-        var sink: ?ClientSink = null;
         {
             self.clients_mutex.lockUncancelable(self.io);
             defer self.clients_mutex.unlock(self.io);
@@ -321,7 +324,6 @@ pub const ConcaveEngine = struct {
                 return try formatAuthError(self.allocator, "client disconnected");
             if (sess.auth) |*old| old.deinit(self.allocator);
             sess.auth = if (new_auth) |*a| try a.clone(self.allocator) else null;
-            sink = sess.sink;
 
             var it = sess.subscriptions.valueIterator();
             while (it.next()) |sub| {
@@ -334,53 +336,56 @@ pub const ConcaveEngine = struct {
         }
 
         if (to_rerun.items.len > 0) {
-            if (sink) |client_sink| {
-                var updates: std.ArrayList(UpdateFrame) = .empty;
-                defer {
-                    for (updates.items) |*u| u.deinit(self.allocator);
-                    updates.deinit(self.allocator);
-                }
-                var to_ts: i64 = self.storage.latestCommitTs() catch 0;
+            var updates: std.ArrayList(UpdateFrame) = .empty;
+            defer {
+                for (updates.items) |*u| u.deinit(self.allocator);
+                updates.deinit(self.allocator);
+            }
+            var to_ts: i64 = self.storage.latestCommitTs() catch 0;
 
-                for (to_rerun.items) |item| {
-                    var ran = self.runQueryInternal(item.name, item.args_json, if (new_auth) |*a| a else null);
-                    defer ran.read_set.deinit(self.allocator);
-                    if (ran.snapshot_ts > to_ts) to_ts = ran.snapshot_ts;
+            for (to_rerun.items) |item| {
+                var ran = self.runQueryInternal(item.name, item.args_json, if (new_auth) |*a| a else null);
+                defer ran.read_set.deinit(self.allocator);
+                if (ran.snapshot_ts > to_ts) to_ts = ran.snapshot_ts;
 
-                    try updates.append(self.allocator, .{
-                        .sub_id = try self.allocator.dupe(u8, item.sub_id),
-                        .result = try ran.result.clone(self.allocator),
-                    });
+                try updates.append(self.allocator, .{
+                    .sub_id = try self.allocator.dupe(u8, item.sub_id),
+                    .result = try ran.result.clone(self.allocator),
+                });
 
-                    self.clients_mutex.lockUncancelable(self.io);
-                    if (self.clients.get(client_id)) |sess| {
-                        if (sess.subscriptions.getPtr(item.sub_id)) |sub| {
-                            sub.read_set.deinit(self.allocator);
-                            sub.read_set = ran.read_set;
-                            ran.read_set = .{};
-                            if (sub.last_payload) |*lp| lp.deinit(self.allocator);
-                            sub.last_payload = ran.result;
-                            ran.result = .{ .ok = &.{} };
-                        } else {
-                            ran.result.deinit(self.allocator);
-                        }
+                self.clients_mutex.lockUncancelable(self.io);
+                if (self.clients.get(client_id)) |sess| {
+                    if (sess.subscriptions.getPtr(item.sub_id)) |sub| {
+                        sub.read_set.deinit(self.allocator);
+                        sub.read_set = ran.read_set;
+                        ran.read_set = .{};
+                        if (sub.last_payload) |*lp| lp.deinit(self.allocator);
+                        sub.last_payload = ran.result;
+                        ran.result = .{ .ok = &.{} };
                     } else {
                         ran.result.deinit(self.allocator);
                     }
-                    self.clients_mutex.unlock(self.io);
+                } else {
+                    ran.result.deinit(self.allocator);
                 }
-
-                const frame_json = try formatTransition(self.allocator, to_ts, updates.items);
-                defer self.allocator.free(frame_json);
-                client_sink.send(frame_json);
+                self.clients_mutex.unlock(self.io);
             }
+
+            const frame_json = try formatTransition(self.allocator, to_ts, updates.items);
+            defer self.allocator.free(frame_json);
+            self.sendToClientLockedCheck(client_id, frame_json);
         }
 
-        defer if (new_auth) |*a| a.deinit(self.allocator);
         return try formatAuthOk(self.allocator, if (new_auth) |*a| a else null);
     }
 
     pub fn subscribe(self: *ConcaveEngine, client_id: u64, sub_id: []const u8, name: []const u8, args_json: []const u8) !void {
+        // Hold `sync_mutex` across initial query evaluation, subscription registration, and initial
+        // transition delivery so concurrent commits cannot slip between snapshot & registration
+        // (eliminating both lost-update races and out-of-order `commit_ts` frames).
+        self.sync_mutex.lockUncancelable(self.io);
+        defer self.sync_mutex.unlock(self.io);
+
         var auth_copy = self.cloneClientAuth(self.allocator, client_id);
         defer if (auth_copy) |*a| a.deinit(self.allocator);
 
@@ -397,12 +402,20 @@ pub const ConcaveEngine = struct {
         const frame_json = try formatTransition(self.allocator, ran.snapshot_ts, &single_upd);
         defer self.allocator.free(frame_json);
 
-        var sink: ?ClientSink = null;
+        var had_any_subs_before = false;
         {
             self.clients_mutex.lockUncancelable(self.io);
             defer self.clients_mutex.unlock(self.io);
+
+            var cit = self.clients.valueIterator();
+            while (cit.next()) |sp| {
+                if (sp.*.subscriptions.count() > 0) {
+                    had_any_subs_before = true;
+                    break;
+                }
+            }
+
             if (self.clients.get(client_id)) |sess| {
-                sink = sess.sink;
                 const key = try self.allocator.dupe(u8, sub_id);
                 if (sess.subscriptions.fetchRemove(key)) |old| {
                     self.allocator.free(old.key);
@@ -415,14 +428,34 @@ pub const ConcaveEngine = struct {
                     .args_json = try self.allocator.dupe(u8, args_json),
                     .read_set = ran.read_set,
                     .last_payload = ran.result,
+                    .last_sent_ts = ran.snapshot_ts,
                 });
+                // Send under `clients_mutex` so `unregisterClient` cannot free WsSender concurrently
+                // and initial frame strictly precedes any later broadcast.
+                sess.sink.send(frame_json);
             } else {
                 ran.read_set.deinit(self.allocator);
                 ran.result.deinit(self.allocator);
             }
         }
 
-        if (sink) |s| s.send(frame_json);
+        // If this replica was idle (zero active subscriptions), advance `last_broadcast_ts` to
+        // `ran.snapshot_ts` so `pollCommitLog` does not replay stale historical commits already
+        // included in this subscriber's initial snapshot.
+        if (!had_any_subs_before) {
+            const cur = self.last_broadcast_ts.load(.acquire);
+            if (ran.snapshot_ts > cur) {
+                self.last_broadcast_ts.store(ran.snapshot_ts, .release);
+            }
+        }
+    }
+
+    fn sendToClientLockedCheck(self: *ConcaveEngine, client_id: u64, payload: []const u8) void {
+        self.clients_mutex.lockUncancelable(self.io);
+        defer self.clients_mutex.unlock(self.io);
+        if (self.clients.get(client_id)) |sess| {
+            sess.sink.send(payload);
+        }
     }
 
     pub fn unsubscribe(self: *ConcaveEngine, client_id: u64, sub_id: []const u8) void {
@@ -679,6 +712,7 @@ pub const ConcaveEngine = struct {
                 var matching: std.ArrayList(SubJob) = .empty;
                 var sit = sess.subscriptions.valueIterator();
                 while (sit.next()) |sub| {
+                    if (commit_ts <= sub.last_sent_ts) continue;
                     if (sub.read_set.intersects(write_set)) {
                         matching.append(self.allocator, .{
                             .sub_id = self.allocator.dupe(u8, sub.sub_id) catch continue,
@@ -710,45 +744,80 @@ pub const ConcaveEngine = struct {
                 updates.deinit(self.allocator);
             }
 
-            for (cj.subs.items) |sj| {
-                var ran = self.runQueryInternal(sj.name, sj.args_json, if (cj.auth) |*a| a else null);
-                var changed = false;
+            // Evaluate all impacted subscriptions for this client at a consistent snapshot_ts
+            // (retrying up to 3 times if a concurrent write advances snapshot_ts mid-batch, preventing torn reads).
+            var effective_ts: i64 = commit_ts;
+            var consistent_attempt: usize = 0;
+            while (consistent_attempt < 3) : (consistent_attempt += 1) {
+                for (updates.items) |*u| u.deinit(self.allocator);
+                updates.clearRetainingCapacity();
 
-                {
-                    self.clients_mutex.lockUncancelable(self.io);
-                    defer self.clients_mutex.unlock(self.io);
-                    if (self.clients.get(cj.client_id)) |sess| {
-                        if (sess.subscriptions.getPtr(sj.sub_id)) |sub| {
-                            changed = if (sub.last_payload) |*prev| !prev.eql(&ran.result) else true;
-                            sub.read_set.deinit(self.allocator);
-                            sub.read_set = ran.read_set;
-                            ran.read_set = .{};
-                            if (sub.last_payload) |*lp| lp.deinit(self.allocator);
-                            sub.last_payload = ran.result.clone(self.allocator) catch null;
-                        }
+                var batch_min_ts: ?i64 = null;
+                var batch_max_ts: i64 = commit_ts;
+
+                const Evaluated = struct {
+                    sub_id: []const u8,
+                    read_set: readset_mod.ReadSet,
+                    result: ExecResult,
+                };
+                var evals: std.ArrayList(Evaluated) = .empty;
+                defer {
+                    for (evals.items) |*ev| {
+                        ev.read_set.deinit(self.allocator);
+                        ev.result.deinit(self.allocator);
                     }
+                    evals.deinit(self.allocator);
                 }
 
-                ran.read_set.deinit(self.allocator);
-                if (changed) {
-                    updates.append(self.allocator, .{
-                        .sub_id = self.allocator.dupe(u8, sj.sub_id) catch {
-                            ran.result.deinit(self.allocator);
-                            continue;
-                        },
+                for (cj.subs.items) |sj| {
+                    const ran = self.runQueryInternal(sj.name, sj.args_json, if (cj.auth) |*a| a else null);
+                    if (batch_min_ts == null or ran.snapshot_ts < batch_min_ts.?) batch_min_ts = ran.snapshot_ts;
+                    if (ran.snapshot_ts > batch_max_ts) batch_max_ts = ran.snapshot_ts;
+                    evals.append(self.allocator, .{
+                        .sub_id = sj.sub_id,
+                        .read_set = ran.read_set,
                         .result = ran.result,
                     }) catch {
+                        var rs = ran.read_set;
+                        rs.deinit(self.allocator);
                         ran.result.deinit(self.allocator);
                     };
-                } else {
-                    ran.result.deinit(self.allocator);
                 }
-            }
 
-            if (updates.items.len > 0) {
-                const frame_json = formatTransition(self.allocator, commit_ts, updates.items) catch continue;
-                defer self.allocator.free(frame_json);
-                cj.sink.send(frame_json);
+                effective_ts = batch_max_ts;
+                // If multiple subscriptions saw different snapshot timestamps, retry once to avoid torn state!
+                if (cj.subs.items.len > 1 and batch_min_ts != null and batch_min_ts.? != batch_max_ts and consistent_attempt + 1 < 3) {
+                    continue;
+                }
+
+                // Commit evaluated states & send atomically under `clients_mutex` (eliminating WsSender UAF!).
+                self.clients_mutex.lockUncancelable(self.io);
+                defer self.clients_mutex.unlock(self.io);
+                if (self.clients.get(cj.client_id)) |sess| {
+                    for (evals.items) |*ev| {
+                        if (sess.subscriptions.getPtr(ev.sub_id)) |sub| {
+                            const changed = if (sub.last_payload) |*prev| !prev.eql(&ev.result) else true;
+                            sub.read_set.deinit(self.allocator);
+                            sub.read_set = ev.read_set;
+                            ev.read_set = .{};
+                            if (sub.last_payload) |*lp| lp.deinit(self.allocator);
+                            sub.last_payload = ev.result.clone(self.allocator) catch null;
+                            if (effective_ts > sub.last_sent_ts) sub.last_sent_ts = effective_ts;
+                            if (changed) {
+                                updates.append(self.allocator, .{
+                                    .sub_id = self.allocator.dupe(u8, ev.sub_id) catch continue,
+                                    .result = ev.result.clone(self.allocator) catch continue,
+                                }) catch {};
+                            }
+                        }
+                    }
+                    if (updates.items.len > 0) {
+                        const frame_json = formatTransition(self.allocator, effective_ts, updates.items) catch break;
+                        defer self.allocator.free(frame_json);
+                        sess.sink.send(frame_json);
+                    }
+                }
+                break;
             }
         }
     }

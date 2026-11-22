@@ -34,6 +34,8 @@ export class ConcaveClient {
     this._subsById = new Map();
     this._pendingMutations = new Map();
     this._pendingActions = new Map();
+    this._inFlightMutations = new Set();
+    this._inFlightActions = new Set();
     this._optimisticQueue = [];
     this._outboundQueue = [];
 
@@ -66,7 +68,13 @@ export class ConcaveClient {
       }
 
       while (this._outboundQueue.length > 0) {
-        ws.send(this._outboundQueue.shift());
+        const frame = this._outboundQueue.shift();
+        if (frame.type === "mutation") {
+          this._inFlightMutations.add(frame.req_id);
+        } else if (frame.type === "action") {
+          this._inFlightActions.add(frame.req_id);
+        }
+        ws.send(JSON.stringify(frame));
       }
     });
 
@@ -83,6 +91,7 @@ export class ConcaveClient {
     ws.addEventListener("close", () => {
       if (this._ws !== ws) return;
       this._ws = null;
+      this._failInFlightOnDisconnect();
       if (!this._closed) {
         this._scheduleReconnect();
       }
@@ -101,12 +110,49 @@ export class ConcaveClient {
     }, delayMs);
   }
 
+  _failInFlightOnDisconnect() {
+    if (this._inFlightMutations.size === 0 && this._inFlightActions.size === 0) {
+      return;
+    }
+    const err = new Error("WebSocket disconnected");
+    let removedAnyOpt = false;
+    for (const reqId of this._inFlightMutations) {
+      const pending = this._pendingMutations.get(reqId);
+      this._pendingMutations.delete(reqId);
+      const idx = this._optimisticQueue.findIndex((o) => o.reqId === reqId);
+      if (idx !== -1) {
+        this._optimisticQueue.splice(idx, 1);
+        removedAnyOpt = true;
+      }
+      pending?.reject(err);
+    }
+    this._inFlightMutations.clear();
+
+    for (const reqId of this._inFlightActions) {
+      const pending = this._pendingActions.get(reqId);
+      this._pendingActions.delete(reqId);
+      pending?.reject(err);
+    }
+    this._inFlightActions.clear();
+
+    if (removedAnyOpt) {
+      this._recomputeOptimisticSignals();
+    }
+  }
+
   _sendRaw(payload) {
     const encoded = JSON.stringify(payload);
     if (this._ws && this._ws.readyState === this._WsCtor.OPEN) {
+      if (payload.type === "mutation") {
+        this._inFlightMutations.add(payload.req_id);
+      } else if (payload.type === "action") {
+        this._inFlightActions.add(payload.req_id);
+      }
       this._ws.send(encoded);
-    } else {
-      this._outboundQueue.push(encoded);
+    } else if (payload.type === "mutation" || payload.type === "action") {
+      // Only queue RPCs; `authenticate` and active `subscribe` frames are re-emitted cleanly on `open`
+      // without duplicating subscriptions or sending stale auth frames.
+      this._outboundQueue.push(payload);
     }
   }
 
@@ -137,6 +183,7 @@ export class ConcaveClient {
         break;
       }
       case "mutation_result": {
+        this._inFlightMutations.delete(frame.req_id);
         const pending = this._pendingMutations.get(frame.req_id);
         this._pendingMutations.delete(frame.req_id);
         if (frame.ok) {
@@ -154,6 +201,7 @@ export class ConcaveClient {
         break;
       }
       case "action_result": {
+        this._inFlightActions.delete(frame.req_id);
         const pending = this._pendingActions.get(frame.req_id);
         this._pendingActions.delete(frame.req_id);
         if (frame.ok) {

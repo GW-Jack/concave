@@ -1,0 +1,297 @@
+*** ============================================================================
+*** Concave Reactive Signals - Diamond Glitch Model Checking
+*** Matches client/concave-client/src/signals.js
+***
+*** Diamond graph:
+***   src -> left  = 2 * src
+***   src -> right = 3 * src
+***   {left, right} -> sum = left + right
+***   {left, right, sum} -> obs, which records (left, right, sum) and counts firings
+***
+*** Modules:
+***   1. SIGNALS-FIFO : Models the current flat-queue / re-entrant batch() in
+***      signals.js, lines 35-51 and 110-119. Reproduces both the diamond glitch
+***      where left / 2 =/= right / 3 and duplicate observer firing for one src change.
+***   2. SIGNALS-TOPO : Models topological depth-ordered dirty-checked flush
+***      with depths src=0, left=1, right=1, sum=2, obs=3. Proves ZERO glitch states
+***      and exact single-firing convergence for all nondeterministic tie-breaks.
+*** ============================================================================
+
+fmod SIGNALS-COMMON is
+  protecting NAT .
+  protecting BOOL .
+
+  sorts NodeId ObsRecord ObsLog .
+  subsort ObsRecord < ObsLog .
+
+  ops leftN rightN sumN obsN : -> NodeId [ctor] .
+
+  --- An observer firing captures the snapshot (left, right, sum) it observed.
+  op rec : Nat Nat Nat -> ObsRecord [ctor] .
+  op nilLog : -> ObsLog [ctor] .
+  op _;_ : ObsLog ObsLog -> ObsLog [ctor assoc id: nilLog] .
+
+  --- A record is a diamond glitch if left/2 =/= right/3 or sum =/= left + right.
+  op isGlitchRecord : ObsRecord -> Bool .
+  op hasGlitch : ObsLog -> Bool .
+
+  vars L R S : Nat .
+  var REC : ObsRecord .
+  var LOG : ObsLog .
+
+  eq isGlitchRecord(rec(L, R, S)) =
+    ((L rem 2) =/= 0) or ((R rem 3) =/= 0) or
+    ((L quo 2) =/= (R quo 3)) or (S =/= L + R) .
+
+  eq hasGlitch(nilLog) = false .
+  eq hasGlitch(REC ; LOG) = isGlitchRecord(REC) or hasGlitch(LOG) .
+endfm
+
+*** ----------------------------------------------------------------------------
+*** 1. SIGNALS-FIFO: Exact semantics of current signals.js
+***
+*** In signals.js:
+***   - signal.set(next) mutates value, enters batch() with batchDepth 0 -> 1,
+***     adds subscribers to pendingComputations, exits batch() with 1 -> 0,
+***     snapshots pendingComputations into a flat queue, clears pendingComputations,
+***     and iterates queue executing each computation with batchDepth == 0.
+***   - When a computed's effect executes and calls out.set(next), batchDepth is 0,
+***     so out.set() immediately flushes its own subscribers in a nested batch
+***     before the outer queue advances to the sibling branch.
+*** ----------------------------------------------------------------------------
+mod SIGNALS-FIFO is
+  protecting SIGNALS-COMMON .
+
+  sorts NodeList FrameStack FifoState .
+  subsort NodeId < NodeList .
+
+  op nilNL : -> NodeList [ctor] .
+  op _,_ : NodeList NodeList -> NodeList [ctor assoc id: nilNL] .
+
+  op emptyStack : -> FrameStack [ctor] .
+  op _|_ : NodeList FrameStack -> FrameStack [ctor] .
+
+  --- State: < src, left, right, sum | updated? | callStack | obsLog | fires >
+  op <_,_,_,_|_|_|_|_> :
+      Nat Nat Nat Nat Bool FrameStack ObsLog Nat -> FifoState [ctor] .
+
+  vars SRC L R S F : Nat .
+  var N : NodeId .
+  var NL : NodeList .
+  var STK : FrameStack .
+  var LOG : ObsLog .
+
+  --- Drop exhausted flush frames from the call stack.
+  eq nilNL | STK = STK .
+
+  --- Initial steady state with src = 1, left = 2, right = 3, sum = 5,
+  --- ready to apply a single src.set(2) mutation.
+  op initFifo : -> FifoState .
+  eq initFifo = < 1, 2, 3, 5 | false | emptyStack | nilLog | 0 > .
+
+  --- Single source mutation: src.set(2).
+  --- Both Set iteration orders of src's subscribers are explored nondeterministically.
+  rl [src-set-lr] :
+    < 1, L, R, S | false | emptyStack | LOG | F >
+    =>
+    < 2, L, R, S | true | (leftN , rightN) | emptyStack | LOG | F > .
+
+  rl [src-set-rl] :
+    < 1, L, R, S | false | emptyStack | LOG | F >
+    =>
+    < 2, L, R, S | true | (rightN , leftN) | emptyStack | LOG | F > .
+
+  --- Execute left = computed(() => 2 * src).
+  --- If value changed, left.set(2 * SRC) immediately flushes left's subscribers
+  --- sumN and obsN, in either Set order, before returning to the outer queue.
+  crl [exec-left-so] :
+    < SRC, L, R, S | true | (leftN , NL) | STK | LOG | F >
+    =>
+    < SRC, 2 * SRC, R, S | true | (sumN , obsN) | (NL | STK) | LOG | F >
+    if 2 * SRC =/= L .
+
+  crl [exec-left-os] :
+    < SRC, L, R, S | true | (leftN , NL) | STK | LOG | F >
+    =>
+    < SRC, 2 * SRC, R, S | true | (obsN , sumN) | (NL | STK) | LOG | F >
+    if 2 * SRC =/= L .
+
+  crl [exec-left-noop] :
+    < SRC, L, R, S | true | (leftN , NL) | STK | LOG | F >
+    =>
+    < SRC, L, R, S | true | NL | STK | LOG | F >
+    if 2 * SRC == L .
+
+  --- Execute right = computed(() => 3 * src).
+  crl [exec-right-so] :
+    < SRC, L, R, S | true | (rightN , NL) | STK | LOG | F >
+    =>
+    < SRC, L, 3 * SRC, S | true | (sumN , obsN) | (NL | STK) | LOG | F >
+    if 3 * SRC =/= R .
+
+  crl [exec-right-os] :
+    < SRC, L, R, S | true | (rightN , NL) | STK | LOG | F >
+    =>
+    < SRC, L, 3 * SRC, S | true | (obsN , sumN) | (NL | STK) | LOG | F >
+    if 3 * SRC =/= R .
+
+  crl [exec-right-noop] :
+    < SRC, L, R, S | true | (rightN , NL) | STK | LOG | F >
+    =>
+    < SRC, L, R, S | true | NL | STK | LOG | F >
+    if 3 * SRC == R .
+
+  --- Execute sum = computed(() => left + right).
+  crl [exec-sum-change] :
+    < SRC, L, R, S | true | (sumN , NL) | STK | LOG | F >
+    =>
+    < SRC, L, R, L + R | true | obsN | (NL | STK) | LOG | F >
+    if L + R =/= S .
+
+  crl [exec-sum-noop] :
+    < SRC, L, R, S | true | (sumN , NL) | STK | LOG | F >
+    =>
+    < SRC, L, R, S | true | NL | STK | LOG | F >
+    if L + R == S .
+
+  --- Execute observer: effect(() => record(left(), right(), sum())).
+  rl [exec-obs] :
+    < SRC, L, R, S | true | (obsN , NL) | STK | LOG | F >
+    =>
+    < SRC, L, R, S | true | NL | STK | LOG ; rec(L, R, S) | F + 1 > .
+endm
+
+*** ----------------------------------------------------------------------------
+*** 2. SIGNALS-TOPO: Topological depth-ordered, dirty-checked flush
+***
+*** Fix:
+***   - Assign each computation a topological depth max(dep depths) + 1:
+***       depth(leftN) = 1, depth(rightN) = 1, depth(sumN) = 2, depth(obsN) = 3.
+***   - Maintain a deduplicated dirty set during flush so flushing stays active
+***     until the dirty set is completely drained.
+***   - Always execute a dirty computation of minimal topological depth first
+***     with nondeterministic tie-breaking among equal-depth dirty nodes.
+***   - Only dirty downstream dependents when the recomputed value changes.
+*** ----------------------------------------------------------------------------
+mod SIGNALS-TOPO is
+  protecting SIGNALS-COMMON .
+
+  sorts NodeSet TopoState .
+  subsort NodeId < NodeSet .
+
+  op emptyNS : -> NodeSet [ctor] .
+  op _&_ : NodeSet NodeSet -> NodeSet [ctor assoc comm id: emptyNS] .
+
+  var N : NodeId .
+  var NS : NodeSet .
+  eq N & N = N .
+
+  --- Topological depth of each node in the diamond.
+  op depth : NodeId -> Nat .
+  eq depth(leftN)  = 1 .
+  eq depth(rightN) = 1 .
+  eq depth(sumN)   = 2 .
+  eq depth(obsN)   = 3 .
+
+  --- Minimum topological depth in a non-empty dirty set.
+  op minDepth : NodeSet -> Nat .
+  eq minDepth(N) = depth(N) .
+  ceq minDepth(N & NS) = min(depth(N), minDepth(NS)) if NS =/= emptyNS .
+
+  --- State: < src, left, right, sum | updated? | dirtySet | obsLog | fires >
+  op <_,_,_,_|_|_|_|_> :
+      Nat Nat Nat Nat Bool NodeSet ObsLog Nat -> TopoState [ctor] .
+
+  vars SRC L R S F : Nat .
+  var LOG : ObsLog .
+
+  op initTopo : -> TopoState .
+  eq initTopo = < 1, 2, 3, 5 | false | emptyNS | nilLog | 0 > .
+
+  --- Single source mutation: src.set(2) marks src's dependents dirty.
+  rl [src-set] :
+    < 1, L, R, S | false | emptyNS | LOG | F >
+    =>
+    < 2, L, R, S | true | leftN & rightN | LOG | F > .
+
+  --- Flush any dirty node at the current minimum topological depth.
+  --- Equal-depth nodes leftN and rightN at depth 1 can fire in either order.
+  crl [topo-left-change] :
+    < SRC, L, R, S | true | leftN & NS | LOG | F >
+    =>
+    < SRC, 2 * SRC, R, S | true | NS & sumN & obsN | LOG | F >
+    if depth(leftN) == minDepth(leftN & NS) /\ 2 * SRC =/= L .
+
+  crl [topo-left-noop] :
+    < SRC, L, R, S | true | leftN & NS | LOG | F >
+    =>
+    < SRC, L, R, S | true | NS | LOG | F >
+    if depth(leftN) == minDepth(leftN & NS) /\ 2 * SRC == L .
+
+  crl [topo-right-change] :
+    < SRC, L, R, S | true | rightN & NS | LOG | F >
+    =>
+    < SRC, L, 3 * SRC, S | true | NS & sumN & obsN | LOG | F >
+    if depth(rightN) == minDepth(rightN & NS) /\ 3 * SRC =/= R .
+
+  crl [topo-right-noop] :
+    < SRC, L, R, S | true | rightN & NS | LOG | F >
+    =>
+    < SRC, L, R, S | true | NS | LOG | F >
+    if depth(rightN) == minDepth(rightN & NS) /\ 3 * SRC == R .
+
+  crl [topo-sum-change] :
+    < SRC, L, R, S | true | sumN & NS | LOG | F >
+    =>
+    < SRC, L, R, L + R | true | NS & obsN | LOG | F >
+    if depth(sumN) == minDepth(sumN & NS) /\ L + R =/= S .
+
+  crl [topo-sum-noop] :
+    < SRC, L, R, S | true | sumN & NS | LOG | F >
+    =>
+    < SRC, L, R, S | true | NS | LOG | F >
+    if depth(sumN) == minDepth(sumN & NS) /\ L + R == S .
+
+  crl [topo-obs] :
+    < SRC, L, R, S | true | obsN & NS | LOG | F >
+    =>
+    < SRC, L, R, S | true | NS | LOG ; rec(L, R, S) | F + 1 >
+    if depth(obsN) == minDepth(obsN & NS) .
+endm
+
+*** ============================================================================
+*** MODEL CHECKING QUERIES
+*** ============================================================================
+
+--- [SIGNALS-FIFO 1] Reproduce diamond glitch: observer sees left/2 =/= right/3
+--- or sum =/= left + right during a single src.set(2) propagation.
+search [1] in SIGNALS-FIFO :
+  initFifo =>* < SRC:Nat, L:Nat, R:Nat, S:Nat | true | STK:FrameStack | LOG:ObsLog | F:Nat >
+  such that hasGlitch(LOG:ObsLog) == true .
+
+--- [SIGNALS-FIFO 2] Reproduce duplicate firing: observer fires >= 2 times
+--- for a single src.set(2) change.
+search [1] in SIGNALS-FIFO :
+  initFifo =>* < SRC:Nat, L:Nat, R:Nat, S:Nat | true | emptyStack | LOG:ObsLog | F:Nat >
+  such that F:Nat >= 2 .
+
+--- [SIGNALS-TOPO 1] Prove ZERO glitch states across ALL interleavings!
+--- Expected: No solution.
+search in SIGNALS-TOPO :
+  initTopo =>* < SRC:Nat, L:Nat, R:Nat, S:Nat | U:Bool | NS:NodeSet | LOG:ObsLog | F:Nat >
+  such that hasGlitch(LOG:ObsLog) == true .
+
+--- [SIGNALS-TOPO 2] Prove ZERO duplicate firings across ALL interleavings!
+--- Expected: No solution.
+search in SIGNALS-TOPO :
+  initTopo =>* < SRC:Nat, L:Nat, R:Nat, S:Nat | U:Bool | NS:NodeSet | LOG:ObsLog | F:Nat >
+  such that F:Nat > 1 .
+
+--- [SIGNALS-TOPO 3] Prove EXACT single-firing convergence in every terminal state!
+--- Expected: No solution.
+search in SIGNALS-TOPO :
+  initTopo =>! < SRC:Nat, L:Nat, R:Nat, S:Nat | U:Bool | NS:NodeSet | LOG:ObsLog | F:Nat >
+  such that (L:Nat =/= 4) or (R:Nat =/= 6) or (S:Nat =/= 10)
+         or (F:Nat =/= 1) or (LOG:ObsLog =/= rec(4, 6, 10)) .
+
+quit

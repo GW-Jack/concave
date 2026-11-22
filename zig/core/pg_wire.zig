@@ -77,8 +77,9 @@ pub const PgUrl = struct {
         var port: u16 = 5432;
         if (std.mem.lastIndexOfScalar(u8, host_port, ':')) |pi| {
             host_raw = host_port[0..pi];
-            port = std.fmt.parseInt(u16, host_port[pi + 1 ..], 10) catch 5432;
+            port = std.fmt.parseInt(u16, host_port[pi + 1 ..], 10) catch return error.InvalidDatabaseUrl;
         }
+        if (host_raw.len == 0) return error.InvalidDatabaseUrl;
 
         var use_tls = !std.mem.eql(u8, host_raw, "localhost") and !std.mem.eql(u8, host_raw, "127.0.0.1");
         var qit = std.mem.splitScalar(u8, query_part, '&');
@@ -128,10 +129,10 @@ fn percentDecode(allocator: Allocator, input: []const u8) ![]u8 {
     return try out.toOwnedSlice(allocator);
 }
 
-const PgRow = struct {
+pub const PgRow = struct {
     cols: [][]u8,
 
-    fn deinit(self: *const PgRow, allocator: Allocator) void {
+    pub fn deinit(self: *const PgRow, allocator: Allocator) void {
         for (self.cols) |c| allocator.free(c);
         allocator.free(self.cols);
     }
@@ -274,6 +275,7 @@ const PgConn = struct {
         defer if (scram_client_first_bare) |s| self.allocator.free(s);
         var scram_nonce: ?[]u8 = null;
         defer if (scram_nonce) |s| self.allocator.free(s);
+        var scram_expected_server_sig: ?[32]u8 = null;
 
         while (true) {
             const msg = try self.readMsg(self.allocator);
@@ -340,17 +342,22 @@ const PgConn = struct {
                         11 => {
                             // AuthenticationSASLContinue
                             const server_first = msg.payload[4..];
-                            const client_final = try buildScramClientFinal(
+                            const scram_res = try buildScramClientFinal(
                                 self.allocator,
                                 url.password,
                                 scram_client_first_bare orelse return error.PostgresAuthFailed,
                                 scram_nonce orelse return error.PostgresAuthFailed,
                                 server_first,
                             );
-                            defer self.allocator.free(client_final);
-                            try self.sendMsg('p', client_final);
+                            defer self.allocator.free(scram_res.client_final);
+                            scram_expected_server_sig = scram_res.expected_server_sig;
+                            try self.sendMsg('p', scram_res.client_final);
                         },
-                        12 => {}, // AuthenticationSASLFinal
+                        12 => {
+                            // AuthenticationSASLFinal — verify server signature in constant time (RFC 5802).
+                            const expected = scram_expected_server_sig orelse return error.PostgresAuthFailed;
+                            try verifyScramServerFinal(msg.payload[4..], expected);
+                        },
                         else => return error.UnsupportedPostgresAuth,
                     }
                 },
@@ -384,29 +391,8 @@ const PgConn = struct {
 
             switch (msg.tag) {
                 'D' => {
-                    // DataRow
-                    if (msg.payload.len < 2) continue;
-                    const col_count = std.mem.readInt(u16, msg.payload[0..2], .big);
-                    var cols = try allocator.alloc([]u8, col_count);
-                    var filled: usize = 0;
-                    errdefer {
-                        for (cols[0..filled]) |c| allocator.free(c);
-                        allocator.free(cols);
-                    }
-                    var pos: usize = 2;
-                    for (0..col_count) |ci| {
-                        const clen_i = std.mem.readInt(i32, msg.payload[pos..][0..4], .big);
-                        pos += 4;
-                        if (clen_i < 0) {
-                            cols[ci] = try allocator.dupe(u8, "");
-                        } else {
-                            const clen: usize = @intCast(clen_i);
-                            cols[ci] = try allocator.dupe(u8, msg.payload[pos .. pos + clen]);
-                            pos += clen;
-                        }
-                        filled += 1;
-                    }
-                    try rows.append(allocator, .{ .cols = cols });
+                    const row = parseDataRow(allocator, msg.payload) catch return storage_mod.StorageError.StorageFailure;
+                    try rows.append(allocator, row);
                 },
                 'E' => had_error = true,
                 'Z' => {
@@ -425,7 +411,41 @@ const PgConn = struct {
     }
 };
 
-fn pbkdf2HmacSha256(password: []const u8, salt: []const u8, iterations: u32) [32]u8 {
+pub fn parseDataRow(allocator: Allocator, payload: []const u8) !PgRow {
+    if (payload.len < 2) return error.MalformedDataRow;
+    const col_count = std.mem.readInt(u16, payload[0..2], .big);
+    // Each column requires at least a 4-byte length field; reject impossible column counts upfront.
+    if (@as(usize, col_count) * 4 > payload.len - 2) return error.MalformedDataRow;
+    var cols = try allocator.alloc([]u8, col_count);
+    var filled: usize = 0;
+    errdefer {
+        for (cols[0..filled]) |c| allocator.free(c);
+        allocator.free(cols);
+    }
+    var pos: usize = 2;
+    for (0..col_count) |ci| {
+        if (pos + 4 > payload.len) return error.MalformedDataRow;
+        const clen_i = std.mem.readInt(i32, payload[pos..][0..4], .big);
+        pos += 4;
+        if (clen_i < 0) {
+            cols[ci] = try allocator.dupe(u8, "");
+        } else {
+            const clen: usize = @intCast(clen_i);
+            if (clen > payload.len - pos) return error.MalformedDataRow;
+            cols[ci] = try allocator.dupe(u8, payload[pos .. pos + clen]);
+            pos += clen;
+        }
+        filled += 1;
+    }
+    return .{ .cols = cols };
+}
+
+pub const ScramClientFinal = struct {
+    client_final: []u8,
+    expected_server_sig: [32]u8,
+};
+
+pub fn pbkdf2HmacSha256(password: []const u8, salt: []const u8, iterations: u32) [32]u8 {
     var u_prev: [32]u8 = undefined;
     var hmac = HmacSha256.init(password);
     hmac.update(salt);
@@ -445,16 +465,16 @@ fn pbkdf2HmacSha256(password: []const u8, salt: []const u8, iterations: u32) [32
     return out;
 }
 
-fn buildScramClientFinal(
+pub fn buildScramClientFinal(
     allocator: Allocator,
     password: []const u8,
     client_first_bare: []const u8,
     client_nonce: []const u8,
     server_first: []const u8,
-) ![]u8 {
+) !ScramClientFinal {
     var full_nonce: ?[]const u8 = null;
     var salt_b64: ?[]const u8 = null;
-    var iterations: u32 = 4096;
+    var iterations: ?u32 = null;
 
     var it = std.mem.splitScalar(u8, server_first, ',');
     while (it.next()) |part| {
@@ -463,24 +483,33 @@ fn buildScramClientFinal(
         } else if (std.mem.startsWith(u8, part, "s=")) {
             salt_b64 = part[2..];
         } else if (std.mem.startsWith(u8, part, "i=")) {
-            iterations = std.fmt.parseInt(u32, part[2..], 10) catch 4096;
+            iterations = std.fmt.parseInt(u32, part[2..], 10) catch return error.PostgresAuthFailed;
         }
     }
     const r_val = full_nonce orelse return error.PostgresAuthFailed;
-    if (!std.mem.startsWith(u8, r_val, client_nonce)) return error.PostgresAuthFailed;
+    if (client_nonce.len == 0 or r_val.len <= client_nonce.len or !std.mem.startsWith(u8, r_val, client_nonce)) {
+        return error.PostgresAuthFailed;
+    }
     const s_b64 = salt_b64 orelse return error.PostgresAuthFailed;
+    const iter_count = iterations orelse return error.PostgresAuthFailed;
+    if (iter_count < 1 or iter_count > 1_000_000) return error.PostgresAuthFailed;
 
-    const salt_len = try std.base64.standard.Decoder.calcSizeForSlice(s_b64);
+    const salt_len = std.base64.standard.Decoder.calcSizeForSlice(s_b64) catch return error.PostgresAuthFailed;
     const salt = try allocator.alloc(u8, salt_len);
     defer allocator.free(salt);
-    try std.base64.standard.Decoder.decode(salt, s_b64);
+    std.base64.standard.Decoder.decode(salt, s_b64) catch return error.PostgresAuthFailed;
 
-    const salted = pbkdf2HmacSha256(password, salt, iterations);
+    const salted = pbkdf2HmacSha256(password, salt, iter_count);
 
     var client_key: [32]u8 = undefined;
     var ck_mac = HmacSha256.init(&salted);
     ck_mac.update("Client Key");
     ck_mac.final(&client_key);
+
+    var server_key: [32]u8 = undefined;
+    var sk_mac = HmacSha256.init(&salted);
+    sk_mac.update("Server Key");
+    sk_mac.final(&server_key);
 
     var stored_key: [32]u8 = undefined;
     Sha256.hash(&client_key, &stored_key, .{});
@@ -497,12 +526,45 @@ fn buildScramClientFinal(
     var client_sig: [32]u8 = undefined;
     sig_mac.final(&client_sig);
 
+    var srv_sig_mac = HmacSha256.init(&server_key);
+    srv_sig_mac.update(client_first_bare);
+    srv_sig_mac.update(",");
+    srv_sig_mac.update(server_first);
+    srv_sig_mac.update(",");
+    srv_sig_mac.update(client_final_without_proof);
+    var expected_server_sig: [32]u8 = undefined;
+    srv_sig_mac.final(&expected_server_sig);
+
     var proof: [32]u8 = undefined;
     for (0..32) |i| proof[i] = client_key[i] ^ client_sig[i];
 
     var proof_b64_buf: [44]u8 = undefined;
     const proof_b64 = std.base64.standard.Encoder.encode(&proof_b64_buf, &proof);
-    return try std.fmt.allocPrint(allocator, "{s},p={s}", .{ client_final_without_proof, proof_b64 });
+    const client_final = try std.fmt.allocPrint(allocator, "{s},p={s}", .{ client_final_without_proof, proof_b64 });
+    return .{
+        .client_final = client_final,
+        .expected_server_sig = expected_server_sig,
+    };
+}
+
+pub fn verifyScramServerFinal(server_final: []const u8, expected_server_sig: [32]u8) !void {
+    var v_b64: ?[]const u8 = null;
+    var it = std.mem.splitScalar(u8, server_final, ',');
+    while (it.next()) |part| {
+        if (std.mem.startsWith(u8, part, "v=")) {
+            v_b64 = part[2..];
+        } else if (std.mem.startsWith(u8, part, "e=")) {
+            return error.PostgresAuthFailed;
+        }
+    }
+    const sig_b64 = v_b64 orelse return error.PostgresAuthFailed;
+    const sig_len = std.base64.standard.Decoder.calcSizeForSlice(sig_b64) catch return error.PostgresAuthFailed;
+    if (sig_len != 32) return error.PostgresAuthFailed;
+    var got_sig: [32]u8 = undefined;
+    std.base64.standard.Decoder.decode(&got_sig, sig_b64) catch return error.PostgresAuthFailed;
+    if (!std.crypto.timing_safe.eql([32]u8, got_sig, expected_server_sig)) {
+        return error.PostgresAuthFailed;
+    }
 }
 
 /// Zero-dependency PostgreSQL `StorageBackend` implementation for Neon, PlanetScale PG, and Cloud SQL.
@@ -1154,7 +1216,7 @@ fn serializeWriteSetJson(allocator: Allocator, ws: *const readset_mod.WriteSet) 
     return try out.toOwnedSlice();
 }
 
-fn parseWriteSetJson(allocator: Allocator, raw: []const u8) !readset_mod.WriteSet {
+pub fn parseWriteSetJson(allocator: Allocator, raw: []const u8) !readset_mod.WriteSet {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1169,10 +1231,11 @@ fn parseWriteSetJson(allocator: Allocator, raw: []const u8) !readset_mod.WriteSe
         if (docs_v == .array) {
             for (docs_v.array.items) |dv| {
                 if (dv != .object) continue;
-                const ns = (dv.object.get("ns") orelse continue).string;
-                const t = (dv.object.get("t") orelse continue).string;
-                const id = (dv.object.get("id") orelse continue).string;
-                try ws.recordDoc(allocator, ns, t, id);
+                const ns_v = dv.object.get("ns") orelse continue;
+                const t_v = dv.object.get("t") orelse continue;
+                const id_v = dv.object.get("id") orelse continue;
+                if (ns_v != .string or t_v != .string or id_v != .string) continue;
+                try ws.recordDoc(allocator, ns_v.string, t_v.string, id_v.string);
             }
         }
     }
@@ -1180,15 +1243,16 @@ fn parseWriteSetJson(allocator: Allocator, raw: []const u8) !readset_mod.WriteSe
         if (keys_v == .array) {
             for (keys_v.array.items) |kv| {
                 if (kv != .object) continue;
-                const ns = (kv.object.get("ns") orelse continue).string;
-                const t = (kv.object.get("t") orelse continue).string;
-                const i_name = (kv.object.get("i") orelse continue).string;
-                const b64 = (kv.object.get("k") orelse continue).string;
-                const dec_len = std.base64.standard.Decoder.calcSizeForSlice(b64) catch continue;
+                const ns_v = kv.object.get("ns") orelse continue;
+                const t_v = kv.object.get("t") orelse continue;
+                const i_v = kv.object.get("i") orelse continue;
+                const k_v = kv.object.get("k") orelse continue;
+                if (ns_v != .string or t_v != .string or i_v != .string or k_v != .string) continue;
+                const dec_len = std.base64.standard.Decoder.calcSizeForSlice(k_v.string) catch continue;
                 const dec = try allocator.alloc(u8, dec_len);
                 defer allocator.free(dec);
-                std.base64.standard.Decoder.decode(dec, b64) catch continue;
-                try ws.recordIndexKey(allocator, ns, t, i_name, dec);
+                std.base64.standard.Decoder.decode(dec, k_v.string) catch continue;
+                try ws.recordIndexKey(allocator, ns_v.string, t_v.string, i_v.string, dec);
             }
         }
     }
