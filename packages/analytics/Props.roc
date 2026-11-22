@@ -69,15 +69,17 @@ Props := [Props].{
             NotFound => default_val
         }
 
-    ## Upsert a single key/value pair (replacing existing key if present).
+    ## Upsert a single key/value pair (replacing existing key and deduplicating any repeated keys).
     upsert : List(Prop), Str, Str -> List(Prop)
     upsert = |props, key, value| {
         var $out = []
         var $replaced = False
         for p in props {
             if p.key == key {
-                $out = List.append($out, { key, value })
-                $replaced = True
+                if !$replaced {
+                    $out = List.append($out, { key, value })
+                    $replaced = True
+                }
             } else {
                 $out = List.append($out, p)
             }
@@ -119,8 +121,12 @@ Props := [Props].{
     }
 
     ## Check whether `needle` appears in a comma-separated list of values (trimmed).
+    ## An empty/whitespace-only CSV never matches anything.
     in_csv : Str, Str -> Bool
     in_csv = |needle, csv| {
+        if Str.is_empty(Str.trim(csv)) {
+            return False
+        }
         parts = Str.split_on(csv, ",")
         var $matched = False
         for part in parts {
@@ -222,4 +228,13 @@ expect {
 expect {
     props = [Props.prop("plan", "free")]
     !Props.matches_all(props, [Props.eq("plan", "pro")])
+}
+
+expect {
+    # Upsert deduplicates repeated keys and empty CSV never matches empty values.
+    dups = [Props.prop("k", "1"), Props.prop("k", "2"), Props.prop("other", "x")]
+    deduped = Props.upsert(dups, "k", "3")
+    List.len(deduped) == 2
+    and Props.get_or(deduped, "k", "") == "3"
+    and !Props.matches_filter([Props.prop("empty", "")], Props.filter("empty", "in", ""))
 }

@@ -80,6 +80,31 @@ Insights := [Insights].{
         cohorts : List(RetentionCohort),
     }
 
+    max_i64 : I64
+    max_i64 = 9223372036854775807
+
+    ## Saturating signed addition for non-negative `delta >= 0` (never overflows `I64`).
+    safe_add_i64 : I64, I64 -> I64
+    safe_add_i64 = |a, b| {
+        if b > 0 and a > max_i64 - b {
+            max_i64
+        } else {
+            a + b
+        }
+    }
+
+    ## Saturating multiplication for non-negative `a >= 0, b >= 0` (never overflows `I64`).
+    safe_mul_nonneg_i64 : I64, I64 -> I64
+    safe_mul_nonneg_i64 = |a, b| {
+        if a <= 0 or b <= 0 {
+            0
+        } else if a > max_i64 // b {
+            max_i64
+        } else {
+            a * b
+        }
+    }
+
     ## Count list length as `I64`.
     list_len_i64 : List(a) -> I64
     list_len_i64 = |items| {
@@ -246,9 +271,11 @@ Insights := [Insights].{
     }
 
     ## Compute time-bucketed Trends + optional property breakdown for `event_name` over `[from_ms, to_ms]`.
+    ## Automatically widens `bucket_ms` when `span / bucket_ms >= 500` so `<= 500` buckets
+    ## ALWAYS partition the full `[from_ms, to_ms]` interval (`sum(buckets.count) == total_events`).
     compute_trends : Str, List(EventRecord), List(AliasEntry), I64, I64, I64, Str, List(Props.Filter) -> TrendResult
     compute_trends = |event_name, events, aliases, from_ms, to_ms, raw_bucket_ms, breakdown_property, filters| {
-        bucket_ms = if raw_bucket_ms <= 0 { 3600000 } else { raw_bucket_ms }
+        req_bucket_ms = if raw_bucket_ms <= 0 { 3600000 } else { raw_bucket_ms }
 
         # Filter matching events first.
         var $matched = []
@@ -269,17 +296,28 @@ Insights := [Insights].{
             }
         }
 
-        # Build contiguous time buckets from `from_ms` to `to_ms` (capped at 500 buckets).
+        # Build contiguous time buckets partitioning `[from_ms, to_ms]` in at most 500 buckets.
         var $buckets = []
         if to_ms >= from_ms {
+            span = to_ms - from_ms
+            min_step = (span // 500) + 1
+            bucket_ms = if req_bucket_ms < min_step { min_step } else { req_bucket_ms }
+
             var $cursor = from_ms
-            var $count_b = 0.I64
-            while $cursor <= to_ms and $count_b < 500 {
-                b_end = $cursor + bucket_ms
+            var $done = False
+            while !$done {
+                b_end = safe_add_i64($cursor, bucket_ms)
+                is_last = b_end > to_ms or b_end == $cursor
                 var $b_count = 0.I64
                 var $b_persons = []
                 for m in $matched {
-                    if m.timestamp_ms >= $cursor and m.timestamp_ms < b_end {
+                    in_bucket =
+                        if is_last {
+                            m.timestamp_ms >= $cursor and m.timestamp_ms <= to_ms
+                        } else {
+                            m.timestamp_ms >= $cursor and m.timestamp_ms < b_end
+                        }
+                    if in_bucket {
                         $b_count = $b_count + 1
                         $b_persons = add_unique_str($b_persons, m.canon)
                     }
@@ -289,8 +327,11 @@ Insights := [Insights].{
                     count: $b_count,
                     unique_persons: list_len_i64($b_persons),
                 })
-                $cursor = b_end
-                $count_b = $count_b + 1
+                if is_last {
+                    $done = True
+                } else {
+                    $cursor = b_end
+                }
             }
         }
 
@@ -373,7 +414,7 @@ Insights := [Insights].{
         }
 
         # Collect relevant events (up to `to_ms + window_ms` so late entrants can finish converting).
-        max_ts = to_ms + window_ms
+        max_ts = safe_add_i64(to_ms, window_ms)
         var $relevant = []
         var $entrants = []
         for ev in events {
@@ -415,7 +456,7 @@ Insights := [Insights].{
             var $start_idx = 0.I64
             for start_ev in ordered {
                 if start_ev.event == first_step and start_ev.timestamp_ms <= to_ms {
-                    deadline = start_ev.timestamp_ms + window_ms
+                    deadline = safe_add_i64(start_ev.timestamp_ms, window_ms)
                     var $reached = 0.I64
                     var $times = [start_ev.timestamp_ms]
                     var $last_ts = start_ev.timestamp_ms
@@ -545,7 +586,7 @@ Insights := [Insights].{
             } else {
                 raw_num_periods
             }
-        end_ms = from_ms + (num_periods * period_ms)
+        end_ms = safe_add_i64(from_ms, safe_mul_nonneg_i64(num_periods, period_ms))
 
         # Find each canonical person's earliest cohort_event timestamp within the retention window.
         var $cohort_members = []
@@ -593,7 +634,7 @@ Insights := [Insights].{
             }
 
             $cohorts = List.append($cohorts, {
-                cohort_start_ms: from_ms + ($c * period_ms),
+                cohort_start_ms: safe_add_i64(from_ms, safe_mul_nonneg_i64($c, period_ms)),
                 cohort_size,
                 retained_counts: $counts,
                 retained_rates: $rates,
@@ -698,4 +739,18 @@ expect {
         Err(_) => []
     }
     sizes == [2, 1] and day0_retained == [0, 1]
+}
+
+expect {
+    # Auto-widening guarantees bucket conservation even on a 24h range with 60s requested buckets!
+    events = [
+        { distinct_id: "alice", event: "msg", timestamp_ms: 86400000, session_id: "s1", properties: [] },
+        { distinct_id: "bob", event: "msg", timestamp_ms: 0, session_id: "s2", properties: [] },
+    ]
+    trend = Insights.compute_trends("msg", events, [], 0, 86400000, 60000, "", [])
+    var $sum = 0.I64
+    for b in trend.buckets {
+        $sum = $sum + b.count
+    }
+    trend.total_events == 2 and $sum == 2 and List.len(trend.buckets) <= 500
 }

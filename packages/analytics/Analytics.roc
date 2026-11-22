@@ -837,10 +837,11 @@ Analytics := [Analytics].{
 
     ## PostHog `identify`: link optional `anon_id` -> `distinct_id`, merge anonymous person profile,
     ## and apply `$set` (overwrite) and `$set_once` (initial-only) person properties.
+    ## Enforces forest acyclicity, root-only person rows, and event-count conservation.
     identify! : Ctx.MutationCtx, IdentifyArgs => Try(PersonProfile, Str)
     identify! = |ctx, args| {
-        canonical_id = Str.trim(args.distinct_id)
-        if Str.is_empty(canonical_id) {
+        raw_distinct_id = Str.trim(args.distinct_id)
+        if Str.is_empty(raw_distinct_id) {
             return Err("distinct_id cannot be empty")
         }
         anon_id = Str.trim(args.anon_id)
@@ -848,7 +849,11 @@ Analytics := [Analytics].{
         now_ms! = ctx.now_ms!
         now = now_ms!()
 
-        # Merge anonymous person profile & create alias if `anon_id` is supplied and distinct.
+        # Always resolve `distinct_id` to its canonical root so we never create non-root person rows.
+        canonical_id = resolve_distinct_id_db!(reader, raw_distinct_id)?
+
+        # Merge anonymous person profile & create alias ONLY when `anon_id` is an unaliased root
+        # distinct from `canonical_id` (prevents cycles and cross-person alias hijacking).
         var $anon_props = []
         var $anon_first = now
         var $anon_last = now
@@ -856,41 +861,28 @@ Analytics := [Analytics].{
         var $anon_events = 0.I64
 
         if !Str.is_empty(anon_id) and anon_id != canonical_id {
-            existing_alias =
-                Db.from_index(aliases_by_alias_id)
-                |> Db.eq([Key.str(anon_id)])
-                |> Db.first!(reader)?
+            anon_resolved = resolve_distinct_id_db!(reader, anon_id)?
+            if anon_resolved == anon_id {
+                _ = Db.insert!(ctx.db, aliases_table, {
+                    alias_id: anon_id,
+                    distinct_id: canonical_id,
+                })?
 
-            match existing_alias {
-                NotFound => {
-                    _ = Db.insert!(ctx.db, aliases_table, {
-                        alias_id: anon_id,
-                        distinct_id: canonical_id,
-                    })?
-                }
-                Found(a) => {
-                    if a.distinct_id != canonical_id {
-                        Db.patch!(ctx.db, aliases_table, a.id, {
-                            distinct_id: canonical_id,
-                        })?
+                anon_person =
+                    Db.from_index(persons_by_distinct_id)
+                    |> Db.eq([Key.str(anon_id)])
+                    |> Db.first!(reader)?
+
+                match anon_person {
+                    NotFound => {}
+                    Found(ap) => {
+                        $anon_props = ap.properties
+                        $anon_first = ap.first_seen_ms
+                        $anon_last = ap.last_seen_ms
+                        $anon_has_seen = True
+                        $anon_events = ap.event_count
+                        Db.delete!(ctx.db, persons_table, ap.id)?
                     }
-                }
-            }
-
-            anon_person =
-                Db.from_index(persons_by_distinct_id)
-                |> Db.eq([Key.str(anon_id)])
-                |> Db.first!(reader)?
-
-            match anon_person {
-                NotFound => {}
-                Found(ap) => {
-                    $anon_props = ap.properties
-                    $anon_first = ap.first_seen_ms
-                    $anon_last = ap.last_seen_ms
-                    $anon_has_seen = True
-                    $anon_events = ap.event_count
-                    Db.delete!(ctx.db, persons_table, ap.id)?
                 }
             }
         }
@@ -972,6 +964,8 @@ Analytics := [Analytics].{
     }
 
     ## Explicitly alias `alias_id` -> `distinct_id`.
+    ## Enforces strict forest acyclicity, rejects re-aliasing an already-bound ID to a different root,
+    ## and merges any existing `persons` row for `alias_id` into `canonical_target` to preserve event conservation.
     alias! : Ctx.MutationCtx, AliasArgs => Try(Bool, Str)
     alias! = |ctx, args| {
         alias_id = Str.trim(args.alias_id)
@@ -987,27 +981,59 @@ Analytics := [Analytics].{
         if canonical_target == alias_id {
             return Err("Cannot create cyclic alias")
         }
+        alias_resolved = resolve_distinct_id_db!(reader, alias_id)?
+        if alias_resolved == canonical_target {
+            return Ok(False)
+        }
+        if alias_resolved != alias_id {
+            return Err("alias_id is already linked to a different distinct_id")
+        }
 
-        existing =
-            Db.from_index(aliases_by_alias_id)
+        _ = Db.insert!(ctx.db, aliases_table, {
+            alias_id,
+            distinct_id: canonical_target,
+        })?
+
+        # Merge any existing `persons` row for `alias_id` into `canonical_target` so only roots hold person rows.
+        src_person =
+            Db.from_index(persons_by_distinct_id)
             |> Db.eq([Key.str(alias_id)])
             |> Db.first!(reader)?
 
-        match existing {
-            NotFound => {
-                _ = Db.insert!(ctx.db, aliases_table, {
-                    alias_id,
-                    distinct_id: canonical_target,
-                })?
-                Ok(True)
-            }
-            Found(doc) => {
-                Db.patch!(ctx.db, aliases_table, doc.id, {
-                    distinct_id: canonical_target,
-                })?
-                Ok(True)
+        match src_person {
+            NotFound => {}
+            Found(sp) => {
+                Db.delete!(ctx.db, persons_table, sp.id)?
+                dst_person =
+                    Db.from_index(persons_by_distinct_id)
+                    |> Db.eq([Key.str(canonical_target)])
+                    |> Db.first!(reader)?
+                match dst_person {
+                    NotFound => {
+                        _ = Db.insert!(ctx.db, persons_table, {
+                            distinct_id: canonical_target,
+                            properties: sp.properties,
+                            first_seen_ms: sp.first_seen_ms,
+                            last_seen_ms: sp.last_seen_ms,
+                            event_count: sp.event_count,
+                        })?
+                    }
+                    Found(dp) => {
+                        merged_props = Props.merge_set(sp.properties, dp.properties)
+                        first_ms = if sp.first_seen_ms < dp.first_seen_ms { sp.first_seen_ms } else { dp.first_seen_ms }
+                        last_ms = if sp.last_seen_ms > dp.last_seen_ms { sp.last_seen_ms } else { dp.last_seen_ms }
+                        Db.patch!(ctx.db, persons_table, dp.id, {
+                            properties: merged_props,
+                            first_seen_ms: first_ms,
+                            last_seen_ms: last_ms,
+                            event_count: dp.event_count + sp.event_count,
+                        })?
+                    }
+                }
             }
         }
+
+        Ok(True)
     }
 
     ## Create or update a Feature Flag / A/B Experiment definition.
@@ -1306,7 +1332,7 @@ Analytics := [Analytics].{
         from_ms = if is_live and args.from_ms <= 0 { to_ms - 86400000 } else { args.from_ms }
 
         docs =
-            if is_live {
+            if is_live or to_ms == Insights.max_i64 {
                 Db.from_index(events_by_timestamp)
                 |> Db.gte([Key.int(from_ms)])
                 |> Db.asc()
@@ -1339,7 +1365,7 @@ Analytics := [Analytics].{
         from_ms = if is_live and args.from_ms <= 0 { to_ms - 86400000 } else { args.from_ms }
 
         docs =
-            if is_live {
+            if is_live or to_ms == Insights.max_i64 {
                 Db.from_index(events_by_event_time)
                 |> Db.eq([Key.str(event_name)])
                 |> Db.gte([Key.str(event_name), Key.int(from_ms)])
@@ -1378,10 +1404,10 @@ Analytics := [Analytics].{
         to_ms = if is_live { now_ms!() } else { args.to_ms }
         from_ms = if is_live and args.from_ms <= 0 { to_ms - 86400000 } else { args.from_ms }
         window_ms = if args.conversion_window_ms <= 0 { 86400000 } else { args.conversion_window_ms }
-        scan_end = to_ms + window_ms
+        scan_end = Insights.safe_add_i64(to_ms, window_ms)
 
         docs =
-            if is_live {
+            if is_live or scan_end == Insights.max_i64 {
                 Db.from_index(events_by_timestamp)
                 |> Db.gte([Key.int(from_ms)])
                 |> Db.asc()
@@ -1421,11 +1447,12 @@ Analytics := [Analytics].{
 
         now_ms! = ctx.now_ms!
         is_live = args.from_ms < 0
-        from_ms = if is_live { now_ms!() - (num_periods * period_ms) } else { args.from_ms }
-        end_ms = from_ms + (num_periods * period_ms)
+        span_ms = Insights.safe_mul_nonneg_i64(num_periods, period_ms)
+        from_ms = if is_live { now_ms!() - span_ms } else { args.from_ms }
+        end_ms = Insights.safe_add_i64(from_ms, span_ms)
 
         docs =
-            if is_live {
+            if is_live or end_ms == Insights.max_i64 {
                 Db.from_index(events_by_timestamp)
                 |> Db.gte([Key.int(from_ms)])
                 |> Db.asc()

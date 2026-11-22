@@ -1,0 +1,254 @@
+*** ============================================================================
+*** Concave Analytics Identity Graph - Exhaustive Maude Model Checking
+*** Matches packages/analytics/Analytics.roc: capture!, identify!, alias!
+***
+*** Models 3 distinct IDs {0, 1, 2} with arbitrary interleavings of:
+***   - capture: inserts an event for resolved ID and increments person count
+***   - identify: links anonId -> distinct_id if eligible and merges person counts
+***   - alias: links aliasId -> distinct_id
+***
+*** Modules:
+***   1. ANALYTICS-BUGGY : Original identify!/alias! before formal audit.
+***      Reproduces alias 2-cycles, non-root orphaned persons rows, and
+***      event conservation violations.
+***   2. ANALYTICS-FIXED : Root-preserving identify!/alias! after audit.
+***      Exhaustively searches ALL reachable interleavings and proves ZERO
+***      cycles, ZERO orphan person rows, and EXACT event conservation.
+***
+*** Run with:
+***   maude -no-banner -batch specs/maude/analytics_identity.maude
+*** ============================================================================
+
+fmod ANALYTICS-ID-COMMON is
+  protecting NAT .
+  protecting BOOL .
+
+  --- Partial map of aliases for IDs {0, 1, 2}: value 9 means "unaliased (root)".
+  --- Represented as triple < a0, a1, a2 > for fast exact state-space exploration.
+  sorts AliasMap PersonCounts EventCounts .
+  op am : Nat Nat Nat -> AliasMap [ctor] .
+  op pc : Nat Nat Nat -> PersonCounts [ctor] .
+  op ec : Nat Nat Nat -> EventCounts [ctor] .
+
+  vars A0 A1 A2 P0 P1 P2 E0 E1 E2 I V H : Nat .
+
+  op getAlias : AliasMap Nat -> Nat .
+  eq getAlias(am(A0, A1, A2), 0) = A0 .
+  eq getAlias(am(A0, A1, A2), 1) = A1 .
+  eq getAlias(am(A0, A1, A2), 2) = A2 .
+  eq getAlias(am(A0, A1, A2), I) = 9 [owise] .
+
+  op setAlias : AliasMap Nat Nat -> AliasMap .
+  eq setAlias(am(A0, A1, A2), 0, V) = am(V, A1, A2) .
+  eq setAlias(am(A0, A1, A2), 1, V) = am(A0, V, A2) .
+  eq setAlias(am(A0, A1, A2), 2, V) = am(A0, A1, V) .
+  eq setAlias(am(A0, A1, A2), I, V) = am(A0, A1, A2) [owise] .
+
+  op getPC : PersonCounts Nat -> Nat .
+  eq getPC(pc(P0, P1, P2), 0) = P0 .
+  eq getPC(pc(P0, P1, P2), 1) = P1 .
+  eq getPC(pc(P0, P1, P2), 2) = P2 .
+  eq getPC(pc(P0, P1, P2), I) = 0 [owise] .
+
+  op setPC : PersonCounts Nat Nat -> PersonCounts .
+  eq setPC(pc(P0, P1, P2), 0, V) = pc(V, P1, P2) .
+  eq setPC(pc(P0, P1, P2), 1, V) = pc(P0, V, P2) .
+  eq setPC(pc(P0, P1, P2), 2, V) = pc(P0, P1, V) .
+  eq setPC(pc(P0, P1, P2), I, V) = pc(P0, P1, P2) [owise] .
+
+  op incPC : PersonCounts Nat -> PersonCounts .
+  eq incPC(pc(P0, P1, P2), 0) = pc(s(P0), P1, P2) .
+  eq incPC(pc(P0, P1, P2), 1) = pc(P0, s(P1), P2) .
+  eq incPC(pc(P0, P1, P2), 2) = pc(P0, P1, s(P2)) .
+  eq incPC(pc(P0, P1, P2), I) = pc(P0, P1, P2) [owise] .
+
+  op incEC : EventCounts Nat -> EventCounts .
+  eq incEC(ec(E0, E1, E2), 0) = ec(s(E0), E1, E2) .
+  eq incEC(ec(E0, E1, E2), 1) = ec(E0, s(E1), E2) .
+  eq incEC(ec(E0, E1, E2), 2) = ec(E0, E1, s(E2)) .
+  eq incEC(ec(E0, E1, E2), I) = ec(E0, E1, E2) [owise] .
+
+  --- Bounded 8-hop alias resolver matching `resolve_distinct_id_db!` in Analytics.roc
+  op resolve : AliasMap Nat -> Nat .
+  op resolveHops : AliasMap Nat Nat -> Nat .
+  eq resolve(AM:AliasMap, I) = resolveHops(AM:AliasMap, I, 8) .
+  eq resolveHops(AM:AliasMap, I, 0) = I .
+  eq resolveHops(AM:AliasMap, I, s(H)) =
+    if getAlias(AM:AliasMap, I) == 9 or getAlias(AM:AliasMap, I) == I
+    then I
+    else resolveHops(AM:AliasMap, getAlias(AM:AliasMap, I), H)
+    fi .
+
+  --- Safety Predicate 1: Alias map has a cycle (some ID does not resolve to a root!)
+  op isRoot : AliasMap Nat -> Bool .
+  eq isRoot(AM:AliasMap, I) = (getAlias(AM:AliasMap, I) == 9) .
+
+  op hasCycle : AliasMap -> Bool .
+  eq hasCycle(AM:AliasMap) =
+    (not isRoot(AM:AliasMap, resolve(AM:AliasMap, 0))) or
+    (not isRoot(AM:AliasMap, resolve(AM:AliasMap, 1))) or
+    (not isRoot(AM:AliasMap, resolve(AM:AliasMap, 2))) .
+
+  --- Safety Predicate 2: Non-root ID holds a non-zero `persons` row (orphan profile)
+  op hasOrphanPerson : AliasMap PersonCounts -> Bool .
+  eq hasOrphanPerson(AM:AliasMap, PC:PersonCounts) =
+    ((not isRoot(AM:AliasMap, 0)) and (getPC(PC:PersonCounts, 0) > 0)) or
+    ((not isRoot(AM:AliasMap, 1)) and (getPC(PC:PersonCounts, 1) > 0)) or
+    ((not isRoot(AM:AliasMap, 2)) and (getPC(PC:PersonCounts, 2) > 0)) .
+
+  --- Safety Predicate 3: Exact Event Conservation per canonical root
+  --- Sum of raw events whose resolved canonical ID == R must equal person[R].event_count!
+  op resolvedEventsFor : AliasMap EventCounts Nat -> Nat .
+  eq resolvedEventsFor(AM:AliasMap, ec(E0, E1, E2), R:Nat) =
+    (if resolve(AM:AliasMap, 0) == R:Nat then E0 else 0 fi) +
+    (if resolve(AM:AliasMap, 1) == R:Nat then E1 else 0 fi) +
+    (if resolve(AM:AliasMap, 2) == R:Nat then E2 else 0 fi) .
+
+  op eventCountMismatch : AliasMap PersonCounts EventCounts -> Bool .
+  eq eventCountMismatch(AM:AliasMap, PC:PersonCounts, EC:EventCounts) =
+    (isRoot(AM:AliasMap, 0) and (getPC(PC:PersonCounts, 0) =/= resolvedEventsFor(AM:AliasMap, EC:EventCounts, 0))) or
+    (isRoot(AM:AliasMap, 1) and (getPC(PC:PersonCounts, 1) =/= resolvedEventsFor(AM:AliasMap, EC:EventCounts, 1))) or
+    (isRoot(AM:AliasMap, 2) and (getPC(PC:PersonCounts, 2) =/= resolvedEventsFor(AM:AliasMap, EC:EventCounts, 2))) .
+
+  --- Safety Predicate 4: Resolution idempotency: resolve(resolve(x)) == resolve(x)
+  op nonIdempotent : AliasMap -> Bool .
+  eq nonIdempotent(AM:AliasMap) =
+    (resolve(AM:AliasMap, resolve(AM:AliasMap, 0)) =/= resolve(AM:AliasMap, 0)) or
+    (resolve(AM:AliasMap, resolve(AM:AliasMap, 1)) =/= resolve(AM:AliasMap, 1)) or
+    (resolve(AM:AliasMap, resolve(AM:AliasMap, 2)) =/= resolve(AM:AliasMap, 2)) .
+endfm
+
+*** ----------------------------------------------------------------------------
+*** 1. ANALYTICS-BUGGY: Original pre-audit semantics
+*** ----------------------------------------------------------------------------
+mod ANALYTICS-BUGGY is
+  protecting ANALYTICS-ID-COMMON .
+
+  sort State .
+  --- < aliases | person_counts | raw_event_counts | ops_remaining >
+  op <_|_|_|_> : AliasMap PersonCounts EventCounts Nat -> State [ctor] .
+
+  vars AM : AliasMap .
+  vars PC : PersonCounts .
+  vars EC : EventCounts .
+  vars K I J C : Nat .
+
+  --- Capture on ID 0, 1, or 2
+  rl [cap0] : < AM | PC | EC | s(K) > =>
+    < AM | incPC(PC, resolve(AM, 0)) | incEC(EC, resolve(AM, 0)) | K > .
+  rl [cap1] : < AM | PC | EC | s(K) > =>
+    < AM | incPC(PC, resolve(AM, 1)) | incEC(EC, resolve(AM, 1)) | K > .
+  rl [cap2] : < AM | PC | EC | s(K) > =>
+    < AM | incPC(PC, resolve(AM, 2)) | incEC(EC, resolve(AM, 2)) | K > .
+
+  --- Original buggy `alias(I -> J)`: checked `resolve(J) =/= I` but did NOT merge `PC[I]`
+  --- and allowed overwriting an already-aliased `I`!
+  crl [alias-0-1] : < AM | PC | EC | s(K) > =>
+    < setAlias(AM, 0, resolve(AM, 1)) | PC | EC | K >
+    if resolve(AM, 1) =/= 0 .
+  crl [alias-1-2] : < AM | PC | EC | s(K) > =>
+    < setAlias(AM, 1, resolve(AM, 2)) | PC | EC | K >
+    if resolve(AM, 2) =/= 1 .
+
+  --- Original buggy `identify(distinct_id = I, anon_id = J)`: did NOT resolve `I` and did NOT
+  --- check whether `I` already resolved to `J` -> creates 2-cycle `0 -> 1 -> 0`!
+  rl [ident-0-anon-1] : < AM | PC | EC | s(K) > =>
+    < setAlias(AM, 1, 0) | setPC(setPC(PC, 1, 0), 0, getPC(PC, 0) + getPC(PC, 1)) | EC | K > .
+endm
+
+*** ----------------------------------------------------------------------------
+*** 2. ANALYTICS-FIXED: Root-preserving post-audit semantics
+*** ----------------------------------------------------------------------------
+mod ANALYTICS-FIXED is
+  protecting ANALYTICS-ID-COMMON .
+
+  sort State .
+  op <_|_|_|_> : AliasMap PersonCounts EventCounts Nat -> State [ctor] .
+
+  op doCapture : AliasMap PersonCounts EventCounts Nat -> State .
+  op doIdentify : AliasMap PersonCounts EventCounts Nat Nat Nat -> State .
+  op doAlias : AliasMap PersonCounts EventCounts Nat Nat Nat -> State .
+
+  vars AM : AliasMap .
+  vars PC : PersonCounts .
+  vars EC : EventCounts .
+  vars K I J C R : Nat .
+
+  --- Exact helper for fixed `identify(distinct_id = I, anon_id = J)`:
+  --- 1. C = resolve(AM, I)
+  --- 2. Only link J -> C if J =/= C and resolve(AM, J) == J (unaliased root!)
+  --- 3. Merge PC[J] into PC[C] and zero PC[J].
+  eq doIdentify(AM, PC, EC, I, J, K) =
+    if (J =/= resolve(AM, I)) and (resolve(AM, J) == J)
+    then < setAlias(AM, J, resolve(AM, I))
+         | setPC(setPC(PC, J, 0), resolve(AM, I), getPC(PC, resolve(AM, I)) + getPC(PC, J))
+         | EC
+         | K >
+    else < AM | PC | EC | K >
+    fi .
+
+  --- Exact helper for fixed `alias(alias_id = I, distinct_id = J)`:
+  --- 1. C = resolve(AM, J)
+  --- 2. Only link I -> C if C =/= I and resolve(AM, I) == I (unaliased root!)
+  --- 3. Merge PC[I] into PC[C] and zero PC[I].
+  eq doAlias(AM, PC, EC, I, J, K) =
+    if (resolve(AM, J) =/= I) and (resolve(AM, I) == I)
+    then < setAlias(AM, I, resolve(AM, J))
+         | setPC(setPC(PC, I, 0), resolve(AM, J), getPC(PC, resolve(AM, J)) + getPC(PC, I))
+         | EC
+         | K >
+    else < AM | PC | EC | K >
+    fi .
+
+  --- All 3 captures
+  rl [cap0] : < AM | PC | EC | s(K) > =>
+    < AM | incPC(PC, resolve(AM, 0)) | incEC(EC, resolve(AM, 0)) | K > .
+  rl [cap1] : < AM | PC | EC | s(K) > =>
+    < AM | incPC(PC, resolve(AM, 1)) | incEC(EC, resolve(AM, 1)) | K > .
+  rl [cap2] : < AM | PC | EC | s(K) > =>
+    < AM | incPC(PC, resolve(AM, 2)) | incEC(EC, resolve(AM, 2)) | K > .
+
+  --- All 6 ordered `identify(I, anon_id = J)` transitions (I != J)
+  rl [id-0-1] : < AM | PC | EC | s(K) > => doIdentify(AM, PC, EC, 0, 1, K) .
+  rl [id-0-2] : < AM | PC | EC | s(K) > => doIdentify(AM, PC, EC, 0, 2, K) .
+  rl [id-1-0] : < AM | PC | EC | s(K) > => doIdentify(AM, PC, EC, 1, 0, K) .
+  rl [id-1-2] : < AM | PC | EC | s(K) > => doIdentify(AM, PC, EC, 1, 2, K) .
+  rl [id-2-0] : < AM | PC | EC | s(K) > => doIdentify(AM, PC, EC, 2, 0, K) .
+  rl [id-2-1] : < AM | PC | EC | s(K) > => doIdentify(AM, PC, EC, 2, 1, K) .
+
+  --- All 6 ordered `alias(I -> J)` transitions (I != J)
+  rl [al-0-1] : < AM | PC | EC | s(K) > => doAlias(AM, PC, EC, 0, 1, K) .
+  rl [al-0-2] : < AM | PC | EC | s(K) > => doAlias(AM, PC, EC, 0, 2, K) .
+  rl [al-1-0] : < AM | PC | EC | s(K) > => doAlias(AM, PC, EC, 1, 0, K) .
+  rl [al-1-2] : < AM | PC | EC | s(K) > => doAlias(AM, PC, EC, 1, 2, K) .
+  rl [al-2-0] : < AM | PC | EC | s(K) > => doAlias(AM, PC, EC, 2, 0, K) .
+  rl [al-2-1] : < AM | PC | EC | s(K) > => doAlias(AM, PC, EC, 2, 1, K) .
+endm
+
+*** ============================================================================
+*** Verification Queries
+*** ============================================================================
+
+*** 1. Confirm ANALYTICS-BUGGY reproduces cycle bug
+search [1] in ANALYTICS-BUGGY :
+  < am(9, 9, 9) | pc(0, 0, 0) | ec(0, 0, 0) | 3 >
+  =>* < AM:AliasMap | PC:PersonCounts | EC:EventCounts | K:Nat >
+  such that hasCycle(AM:AliasMap) .
+
+*** 2. Confirm ANALYTICS-BUGGY reproduces orphan person and conservation bug
+search [1] in ANALYTICS-BUGGY :
+  < am(9, 9, 9) | pc(0, 0, 0) | ec(0, 0, 0) | 3 >
+  =>* < AM:AliasMap | PC:PersonCounts | EC:EventCounts | K:Nat >
+  such that hasOrphanPerson(AM:AliasMap, PC:PersonCounts) .
+
+*** 3. Exhaustive proof on ANALYTICS-FIXED over all depth-4 interleavings:
+***    ZERO cycles, ZERO orphan persons, ZERO event-count mismatches, ZERO non-idempotent resolutions!
+search in ANALYTICS-FIXED :
+  < am(9, 9, 9) | pc(0, 0, 0) | ec(0, 0, 0) | 4 >
+  =>* < AM:AliasMap | PC:PersonCounts | EC:EventCounts | K:Nat >
+  such that hasCycle(AM:AliasMap)
+         or hasOrphanPerson(AM:AliasMap, PC:PersonCounts)
+         or eventCountMismatch(AM:AliasMap, PC:PersonCounts, EC:EventCounts)
+         or nonIdempotent(AM:AliasMap) .
+
+quit .

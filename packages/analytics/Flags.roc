@@ -27,6 +27,10 @@ Flags := [Flags].{
     variant : Str, I64 -> Variant
     variant = |key, weight| { key, weight }
 
+    ## Maximum allowed sum of variant weights (keeps hash modulo well within 31-bit modulus and overflow-free).
+    max_total_variant_weight : I64
+    max_total_variant_weight = 10000000
+
     ## Validate a flag definition before persisting.
     validate : FlagRule -> Try({}, Str)
     validate = |flag| {
@@ -44,6 +48,9 @@ Flags := [Flags].{
                 }
                 if v.weight <= 0 {
                     return Err("Variant weight must be positive")
+                }
+                if v.weight > max_total_variant_weight or ($total > max_total_variant_weight - v.weight) {
+                    return Err("Total variant weight exceeds maximum (${max_total_variant_weight.to_str()})")
                 }
                 $total = $total + v.weight
             }
@@ -122,8 +129,9 @@ Flags := [Flags].{
             }
         }
 
-        # Use an independent salt for variant selection so rollout % and variant split are orthogonal.
-        pick = Hash.bucket_bps("${flag.key}#variant", distinct_id) % $total_weight
+        # Use the full 31-bit hash space with an independent `#variant` salt so rollout % and
+        # variant split are orthogonal AND weights > 10,000 remain uniformly reachable.
+        pick = Hash.hash_str("${flag.key}#variant:${distinct_id}") % $total_weight
         var $cum = 0.I64
         for v in flag.variants {
             if v.weight > 0 {
@@ -187,4 +195,28 @@ expect {
     r1.enabled
     and r1.variant == r2.variant
     and (r1.variant == "control" or r1.variant == "treatment")
+}
+
+expect {
+    # Large weights (> 10,000) must still reach every variant uniformly.
+    rule = {
+        key: "large-weight-ab",
+        active: True,
+        rollout_pct: 100,
+        filters: [],
+        variants: [Flags.variant("a", 50000), Flags.variant("b", 50000)],
+    }
+    var $seen_a = 0.I64
+    var $seen_b = 0.I64
+    var $i = 0.I64
+    while $i < 40 {
+        r = Flags.evaluate(rule, "u-${$i.to_str()}", [])
+        if r.variant == "a" {
+            $seen_a = $seen_a + 1
+        } else if r.variant == "b" {
+            $seen_b = $seen_b + 1
+        }
+        $i = $i + 1
+    }
+    $seen_a > 5 and $seen_b > 5 and ($seen_a + $seen_b == 40)
 }
