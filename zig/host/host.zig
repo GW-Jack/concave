@@ -770,6 +770,22 @@ export fn main(argc: c_int, argv: [*]const [*:0]const u8, envp: [*:null]const ?[
     return 0;
 }
 
+var g_shutdown: std.atomic.Value(bool) = .init(false);
+
+fn handleShutdownSignal(_: std.posix.SIG) callconv(.c) void {
+    g_shutdown.store(true, .release);
+}
+
+fn installSignalHandlers() void {
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = &handleShutdownSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+}
+
 fn runServer(
     host: []const u8,
     port: u16,
@@ -779,6 +795,8 @@ fn runServer(
     static_dir: ?[]const u8,
     commit_poll_ms: u64,
 ) !void {
+    installSignalHandlers();
+
     const io = getIo();
     var exec = try RocAppExecutor.init();
     defer exec.deinit();
@@ -789,10 +807,17 @@ fn runServer(
     defer if (pg_store) |p| p.deinit();
 
     const storage: storage_mod.Storage = if (database_url) |url| blk: {
-        pg_store = try PgStore.connect(g_alloc, io, url, deployment_id);
+        const max_conns: usize = if (getEnvSlice("CONCAVE_PG_MAX_CONNECTIONS")) |s|
+            std.fmt.parseInt(usize, s, 10) catch 8
+        else
+            8;
+        pg_store = try PgStore.connectWithPoolSize(g_alloc, io, url, deployment_id, max_conns);
         break :blk .{ .pg = pg_store.? };
     } else blk: {
         wal_store = try WalStore.openFile(g_alloc, io, db_path);
+        if (getEnvSlice("CONCAVE_WAL_COMPACT_THRESHOLD")) |s| {
+            wal_store.?.compact_threshold = std.fmt.parseInt(usize, s, 10) catch 1000;
+        }
         break :blk .{ .wal = wal_store.? };
     };
 
@@ -801,8 +826,19 @@ fn runServer(
     else
         true;
 
+    const jwks_url = getEnvSlice("CONCAVE_JWKS_URL");
+    const jwks_json = getEnvSlice("CONCAVE_JWKS_JSON");
+    var jwks_cache: ?*auth_mod.JwksCache = null;
+    if (jwks_url != null or jwks_json != null) {
+        jwks_cache = try auth_mod.JwksCache.init(g_alloc, jwks_url, jwks_json);
+    }
+    defer if (jwks_cache) |jc| jc.deinit();
+
     var engine = try engine_mod.ConcaveEngine.init(g_alloc, io, storage, exec.asExecutor(), .{
         .jwt_secret = getEnvSlice("CONCAVE_JWT_SECRET"),
+        .jwks_cache = jwks_cache,
+        .expected_issuer = getEnvSlice("CONCAVE_JWT_ISSUER"),
+        .expected_audience = getEnvSlice("CONCAVE_JWT_AUDIENCE"),
         .allow_dev_tokens = allow_dev,
     });
     defer engine.deinit();
@@ -833,23 +869,58 @@ fn runServer(
     defer blob_store.deinit();
     engine.blob_store = blob_store;
 
+    var tailer_thread: ?std.Thread = null;
     if (commit_poll_ms > 0) {
-        const tailer = try engine.spawnCommitTailer(commit_poll_ms);
-        tailer.detach();
+        tailer_thread = try engine.spawnCommitTailer(commit_poll_ms);
     }
 
     const sched_poll_ms: u64 = if (getEnvSlice("CONCAVE_SCHEDULER_POLL_MS")) |s|
         std.fmt.parseInt(u64, s, 10) catch 200
     else
         200;
+    var sched_thread: ?std.Thread = null;
     if (sched_poll_ms > 0) {
-        const sched_worker = try engine.spawnSchedulerWorker(sched_poll_ms);
-        sched_worker.detach();
+        sched_thread = try engine.spawnSchedulerWorker(sched_poll_ms);
     }
+
+    // Spawn a lightweight graceful-shutdown coordinator that drains WS clients and unblocks accept().
+    const ShutdownWatcher = struct {
+        io: std.Io,
+        engine: *engine_mod.ConcaveEngine,
+        connect_host: []const u8,
+        port: u16,
+        fn run(ctx: @This()) void {
+            while (!g_shutdown.load(.acquire)) {
+                ctx.io.sleep(.fromMilliseconds(40), .awake) catch break;
+            }
+            ctx.engine.stop_tailer.store(true, .release);
+            ctx.engine.closeAllClients();
+            // Wake the blocking accept() call via a loopback poke.
+            if (std.Io.net.IpAddress.parse(ctx.connect_host, ctx.port)) |addr| {
+                if (addr.connect(ctx.io, .{ .mode = .stream })) |s| {
+                    s.close(ctx.io);
+                } else |_| {}
+            } else |_| {}
+        }
+    };
+    const watcher = try std.Thread.spawn(.{}, ShutdownWatcher.run, .{ShutdownWatcher{
+        .io = io,
+        .engine = engine,
+        .connect_host = default_host,
+        .port = port,
+    }});
+    watcher.detach();
 
     try server_mod.serve(g_alloc, io, engine, .{
         .host = host,
         .port = port,
         .static_dir = static_dir,
+        .admin_key = getEnvSlice("CONCAVE_ADMIN_KEY"),
+        .shutdown_flag = &g_shutdown,
     });
+
+    // Cleanly stop & join background workers before tearing down storage/engine.
+    engine.stop_tailer.store(true, .release);
+    if (tailer_thread) |t| t.join();
+    if (sched_thread) |t| t.join();
 }

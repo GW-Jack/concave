@@ -44,6 +44,10 @@ pub const WalStore = struct {
     indexes: std.ArrayList(IndexRow) = .empty,
     /// Monotonic commit log for OCC conflict checks and cross-instance tailing.
     commit_log: std.ArrayList(CommitEntry) = .empty,
+    /// Number of WAL records appended since the last atomic compaction.
+    wal_records_since_compact: usize = 0,
+    /// Automatically compact the WAL after this many commits (0 disables auto-compaction).
+    compact_threshold: usize = 1000,
 
     pub fn openInMemory(allocator: Allocator, io: std.Io) !*WalStore {
         const self = try allocator.create(WalStore);
@@ -287,10 +291,84 @@ pub const WalStore = struct {
             .write_set = write_set,
         });
 
+        // Bound in-memory commit_log size while keeping a generous sliding window for OCC/tailers.
+        if (self.commit_log.items.len > 4096) {
+            const drop = self.commit_log.items.len - 2048;
+            for (self.commit_log.items[0..drop]) |*old| old.deinit(self.allocator);
+            std.mem.copyForwards(CommitEntry, self.commit_log.items[0..2048], self.commit_log.items[drop..]);
+            self.commit_log.shrinkRetainingCapacity(2048);
+        }
+
+        // Trigger atomic WAL compaction when threshold is reached.
+        if (self.wal_path) |path| {
+            self.wal_records_since_compact += 1;
+            if (self.compact_threshold > 0 and self.wal_records_since_compact >= self.compact_threshold) {
+                self.compactLocked(path) catch {};
+            }
+        }
+
         return .{
             .commit_ts = next_ts,
             .write_set = caller_ws,
         };
+    }
+
+    /// Atomically compact the on-disk WAL into a minimal CRC32-protected snapshot of live documents.
+    pub fn compact(self: *WalStore) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const path = self.wal_path orelse return;
+        try self.compactLocked(path);
+    }
+
+    fn compactLocked(self: *WalStore, path: []const u8) !void {
+        var payload: std.Io.Writer.Allocating = .init(self.allocator);
+        defer payload.deinit();
+        const w = &payload.writer;
+
+        try w.print("{{\"ts\":{d},\"ops\":[", .{self.latest_ts});
+        var first = true;
+        var dit = self.docs.iterator();
+        while (dit.next()) |entry| {
+            var parts = std.mem.splitScalar(u8, entry.key_ptr.*, 0x1F);
+            const ns = parts.next() orelse continue;
+            const tbl = parts.next() orelse continue;
+            const doc = entry.value_ptr;
+
+            if (!first) try w.writeByte(',');
+            first = false;
+            try w.writeAll("{\"op\":\"insert\",\"ns\":");
+            try storage_mod.writeJsonString(w, ns);
+            try w.writeAll(",\"table\":");
+            try storage_mod.writeJsonString(w, tbl);
+            try w.writeAll(",\"id\":");
+            try storage_mod.writeJsonString(w, doc.id);
+            try w.print(",\"ct\":{d},\"body\":", .{doc.creation_time_ms});
+            try storage_mod.writeJsonString(w, doc.body_json);
+            try w.writeByte('}');
+        }
+        try w.writeAll("]}");
+
+        const crc = std.hash.Crc32.hash(payload.written());
+        var line: std.Io.Writer.Allocating = .init(self.allocator);
+        defer line.deinit();
+        try line.writer.print("{x:0>8}|{s}\n", .{ crc, payload.written() });
+
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.compact.tmp", .{path});
+        defer self.allocator.free(tmp_path);
+
+        {
+            const file = std.Io.Dir.cwd().createFile(self.io, tmp_path, .{ .truncate = true }) catch
+                return storage_mod.StorageError.StorageFailure;
+            defer file.close(self.io);
+            file.writePositionalAll(self.io, line.written(), 0) catch
+                return storage_mod.StorageError.StorageFailure;
+            file.sync(self.io) catch {};
+        }
+
+        std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, self.io) catch
+            return storage_mod.StorageError.StorageFailure;
+        self.wal_records_since_compact = 0;
     }
 
     pub fn commitsSince(self: *WalStore, allocator: Allocator, since_ts: i64) ![]CommitEntry {
@@ -858,4 +936,71 @@ test "wal store insert, index scan, patch moving out of index range, delete, and
     defer gen_watcher.deinit(allocator);
     try gen_watcher.recordIndexRange(allocator, "", "messages", "by_room", .{ .included = start_gen }, .{ .excluded = end_gen });
     try std.testing.expect(gen_watcher.intersects(&c2.write_set));
+}
+
+test "wal store atomic compaction shrinks log and recovers exact live state + commit_ts" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const wal_path = ".zig-cache/test-compact.wal";
+    std.Io.Dir.cwd().deleteFile(io, wal_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, wal_path) catch {};
+
+    const manifest_json =
+        \\{"app_name":"compact","tables":[{"name":"items","document_schema":{"kind":"any"},"indexes":[{"name":"by_val","fields":["val"]}]}],"components":[],"functions":[]}
+    ;
+    var manifest = try manifest_mod.AppManifest.parseJson(allocator, manifest_json);
+    defer manifest.deinit();
+
+    var store = try WalStore.openFile(allocator, io, wal_path);
+    store.compact_threshold = 0; // test manual compaction + size drop
+    try store.initSchema(&manifest);
+
+    var empty_rs: readset_mod.ReadSet = .{};
+    defer empty_rs.deinit(allocator);
+
+    // Insert 2 docs, patch doc1 60 times, delete doc2.
+    {
+        const w_ins = [_]WriteOp{
+            .{ .insert = .{ .namespace = @constCast(""), .table = @constCast("items"), .doc_id = @constCast("d1"), .creation_time_ms = 100, .body_json = @constCast("{\"val\":0}") } },
+            .{ .insert = .{ .namespace = @constCast(""), .table = @constCast("items"), .doc_id = @constCast("d2"), .creation_time_ms = 101, .body_json = @constCast("{\"val\":999}") } },
+        };
+        var c = try store.commitTx(allocator, &manifest, 0, &empty_rs, &w_ins);
+        c.deinit(allocator);
+    }
+    for (1..61) |i| {
+        const patch_json = try std.fmt.allocPrint(allocator, "{{\"val\":{d}}}", .{i});
+        defer allocator.free(patch_json);
+        const w_pat = [_]WriteOp{.{ .patch = .{ .namespace = @constCast(""), .table = @constCast("items"), .doc_id = @constCast("d1"), .patch_json = patch_json } }};
+        var c = try store.commitTx(allocator, &manifest, try store.latestCommitTs(), &empty_rs, &w_pat);
+        c.deinit(allocator);
+    }
+    {
+        const w_del = [_]WriteOp{.{ .delete = .{ .namespace = @constCast(""), .table = @constCast("items"), .doc_id = @constCast("d2") } }};
+        var c = try store.commitTx(allocator, &manifest, try store.latestCommitTs(), &empty_rs, &w_del);
+        c.deinit(allocator);
+    }
+
+    const before_bytes = try std.Io.Dir.cwd().readFileAlloc(io, wal_path, allocator, .limited(10 * 1024 * 1024));
+    const before_len = before_bytes.len;
+    allocator.free(before_bytes);
+
+    try store.compact();
+    const expected_ts = try store.latestCommitTs();
+    store.deinit();
+
+    const after_bytes = try std.Io.Dir.cwd().readFileAlloc(io, wal_path, allocator, .limited(10 * 1024 * 1024));
+    const after_len = after_bytes.len;
+    allocator.free(after_bytes);
+    try std.testing.expect(after_len * 5 < before_len);
+
+    // Reopen from compacted WAL and verify exact state + monotonic commit_ts + index integrity!
+    var reopened = try WalStore.openFile(allocator, io, wal_path);
+    defer reopened.deinit();
+    try reopened.initSchema(&manifest);
+    try std.testing.expectEqual(expected_ts, try reopened.latestCommitTs());
+    const d1 = (try reopened.getDoc(allocator, "", "items", "d1")).?;
+    defer d1.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, d1.body_json, "60") != null);
+    try std.testing.expect((try reopened.getDoc(allocator, "", "items", "d2")) == null);
+    try reopened.verifyIndexIntegrity(allocator, &manifest);
 }

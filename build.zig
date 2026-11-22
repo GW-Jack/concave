@@ -27,6 +27,15 @@ pub fn build(b: *std.Build) void {
     host_mod.addAnonymousImport("concave_analytics_client_js", .{
         .root_source_file = b.path("packages/analytics/client.js"),
     });
+    host_mod.addAnonymousImport("concave_dashboard_index_html", .{
+        .root_source_file = b.path("client/concave-dashboard/index.html"),
+    });
+    host_mod.addAnonymousImport("concave_dashboard_styles_css", .{
+        .root_source_file = b.path("client/concave-dashboard/styles.css"),
+    });
+    host_mod.addAnonymousImport("concave_dashboard_app_js", .{
+        .root_source_file = b.path("client/concave-dashboard/app.js"),
+    });
 
     const host_lib = b.addLibrary(.{
         .name = "host",
@@ -82,6 +91,15 @@ pub fn build(b: *std.Build) void {
     });
     test_mod.addAnonymousImport("concave_analytics_client_js", .{
         .root_source_file = b.path("packages/analytics/client.js"),
+    });
+    test_mod.addAnonymousImport("concave_dashboard_index_html", .{
+        .root_source_file = b.path("client/concave-dashboard/index.html"),
+    });
+    test_mod.addAnonymousImport("concave_dashboard_styles_css", .{
+        .root_source_file = b.path("client/concave-dashboard/styles.css"),
+    });
+    test_mod.addAnonymousImport("concave_dashboard_app_js", .{
+        .root_source_file = b.path("client/concave-dashboard/app.js"),
     });
     const unit_tests = b.addTest(.{
         .root_module = test_mod,

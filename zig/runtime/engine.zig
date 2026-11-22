@@ -231,9 +231,14 @@ pub const AppExecutor = struct {
 pub const ClientSink = struct {
     ptr: *anyopaque,
     sendFn: *const fn (ptr: *anyopaque, payload: []const u8) void,
+    closeFn: ?*const fn (ptr: *anyopaque) void = null,
 
     pub fn send(self: ClientSink, payload: []const u8) void {
         self.sendFn(self.ptr, payload);
+    }
+
+    pub fn close(self: ClientSink) void {
+        if (self.closeFn) |f| f(self.ptr);
     }
 
     pub fn fromWsSender(sender: *ws_mod.WsSender) ClientSink {
@@ -242,9 +247,19 @@ pub const ClientSink = struct {
                 const ws: *ws_mod.WsSender = @ptrCast(@alignCast(ptr));
                 ws.sendText(payload) catch {};
             }
+            fn closeWs(ptr: *anyopaque) void {
+                const ws: *ws_mod.WsSender = @ptrCast(@alignCast(ptr));
+                ws.sendClose();
+            }
         };
-        return .{ .ptr = @ptrCast(sender), .sendFn = &Wrapper.sendText };
+        return .{ .ptr = @ptrCast(sender), .sendFn = &Wrapper.sendText, .closeFn = &Wrapper.closeWs };
     }
+};
+
+pub const EngineStats = struct {
+    commit_ts: i64,
+    active_clients: usize,
+    active_subscriptions: usize,
 };
 
 const ActiveSubscription = struct {
@@ -337,6 +352,51 @@ pub const ConcaveEngine = struct {
 
     pub fn readyCheck(self: *ConcaveEngine) !i64 {
         return try self.storage.latestCommitTs();
+    }
+
+    pub fn getStats(self: *ConcaveEngine) EngineStats {
+        const ts = self.storage.latestCommitTs() catch self.last_broadcast_ts.load(.acquire);
+        self.clients_mutex.lockUncancelable(self.io);
+        defer self.clients_mutex.unlock(self.io);
+        const client_count = self.clients.count();
+        var sub_count: usize = 0;
+        var it = self.clients.valueIterator();
+        while (it.next()) |sess| {
+            sub_count += sess.*.subscriptions.count();
+        }
+        return .{
+            .commit_ts = ts,
+            .active_clients = client_count,
+            .active_subscriptions = sub_count,
+        };
+    }
+
+    pub fn adminScanTable(
+        self: *ConcaveEngine,
+        allocator: Allocator,
+        ns: []const u8,
+        table: []const u8,
+        limit: usize,
+    ) ![]storage_mod.Document {
+        return try self.storage.scanIndex(allocator, &.{
+            .namespace = ns,
+            .table = table,
+            .index_name = "by_creation_time",
+            .start = .unbounded,
+            .end = .unbounded,
+            .order = .desc,
+            .limit = if (limit == 0) 100 else @min(limit, 500),
+        });
+    }
+
+    /// Gracefully send WebSocket Close frames to every connected client during shutdown drain.
+    pub fn closeAllClients(self: *ConcaveEngine) void {
+        self.clients_mutex.lockUncancelable(self.io);
+        defer self.clients_mutex.unlock(self.io);
+        var it = self.clients.valueIterator();
+        while (it.next()) |sess| {
+            sess.*.sink.close();
+        }
     }
 
     pub fn verifyAuthToken(self: *ConcaveEngine, allocator: Allocator, token: []const u8) !auth_mod.AuthIdentity {

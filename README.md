@@ -8,15 +8,16 @@
 
 - **Native Roc Platform (`libhost.a` in Zig stdlib)**: `roc build` compiles your Roc backend and Concave's zero-dependency Zig runtime into a **~1.9 MB** standalone native server executable (`--serve`, `--introspect`).
 - **Static Effect Isolation**:
-  - **Queries** receive read-only `Ctx.QueryCtx` (deterministic, cacheable, reactive).
-  - **Mutations** receive transactional `Ctx.MutationCtx` (ACID read/write + OCC conflict detection + read-your-own-writes).
-  - **Actions** receive `Ctx.ActionCtx` (external HTTP/HTTPS I/O + re-entrant `run_query!` / `run_mutation!`).
-  - **Auth** (`ctx.auth!`) exposes pluggable HS256 JWT or lightweight dev-mode caller identity across all three.
+  - **Queries** receive read-only `Ctx.QueryCtx` (`db` with `get!`, `collect!`, `paginate!`, `search!`, plus read-only `storage.get_url!`).
+  - **Mutations** receive transactional `Ctx.MutationCtx` (ACID read/write + OCC conflict detection + read-your-own-writes + transactional `scheduler.run_after!`/`run_at!`/`cancel!` + `storage`).
+  - **Actions & Custom HTTP Routes** receive `Ctx.ActionCtx` (external HTTP/HTTPS I/O + re-entrant `run_query!` / `run_mutation!` + `storage`), plus declarative `App.http_route` webhooks and `App.cron` recurring jobs.
+  - **Production Auth** (`ctx.auth!`): zero-dep **HS256**, **RS256**, **EdDSA (Ed25519)**, and **ES256 (P-256)** JWT verification with live **JWKS (`CONCAVE_JWKS_URL`)** caching & automatic `kid` key rotation, plus `iss`/`aud` validation and optional dev tokens.
+- **Built-in Blob Storage & Live Dev Dashboard**: Local disk blob storage with HMAC-signed upload tokens (`/_storage/...`) and zero-dep **AWS SigV4** presigned URLs for S3/R2/GCS, plus an embedded zero-dep reactive Dev Dashboard at **`/_dashboard`** (protected by `CONCAVE_ADMIN_KEY`).
 - **Capability-Injected Components**: Reusable pure-Roc packages depending only on `concave-sdk`, mounted with explicit namespaces and enforced by the host with strict per-component table isolation inside the same ACID transaction.
 - **Idiomatic Roc `0.1.0_RC1` API**: Typed `Table(doc)` and `Table.Index(doc)` handles, flat pipe registration, built-in `Json` serialization (`Json.parse` / `Json.to_str_try`), and runtime `--introspect` -> typed ESM + `.d.ts` codegen (`api.js`, `api.d.ts`, `dataModel.d.ts`) with zero Roc source parsing.
 - **Zero-Dependency Dual Persistence**: Unified `Storage` engine (`documents`, `index_entries`, `commit_log` with `deployment_id` shard key) supporting:
-  - **Embedded ACID WAL (`WalStore`)**: zero-config local dev (`concave dev`) and offline tests — pure Zig stdlib, no SQLite/C deps.
-  - **Native PostgreSQL (`PgStore`)**: production & horizontal autoscaling (PlanetScale Postgres, Neon, Cloud SQL via `DATABASE_URL`) speaking **PostgreSQL Wire Protocol v3** + **TLS 1.3** (`std.crypto.tls.Client`) + **SCRAM-SHA-256** directly in Zig stdlib.
+  - **Embedded ACID WAL (`WalStore`)**: zero-config local dev (`concave dev`) and offline tests — CRC32-framed append-only WAL with atomic snapshot compaction, pure Zig stdlib, no SQLite/C deps.
+  - **Native PostgreSQL (`PgStore`)**: production & horizontal autoscaling (PlanetScale Postgres, Neon, Cloud SQL via `DATABASE_URL`) with a bounded connection pool speaking **PostgreSQL Wire Protocol v3** + **TLS 1.3** (`std.crypto.tls.Client`) + **SCRAM-SHA-256** directly in Zig stdlib, plus graceful `SIGTERM` drain.
 - **Surgical Reactivity & Native Browser ESM**: Exact Document-ID + Index-Range read-set tracking over lexicographically encoded index keys, delivering consistent `commit_ts` RFC 6455 WebSocket transitions to a bespoke zero-dependency reactive signal & surgical DOM runtime (`/_concave/index.js`). Served straight to the browser with companion `.d.ts` declarations — **zero `npm`, zero `node_modules`, zero transpiler, zero bundler**.
 
 ## Repository Layout

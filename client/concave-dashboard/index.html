@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Concave Dashboard</title>
+  <link rel="stylesheet" href="/_dashboard/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot" id="live-dot"></span>
+      <strong>CONCAVE</strong>
+      <span class="pill" id="app-name">loading…</span>
+    </div>
+    <div class="metrics">
+      <div class="metric"><span>commit_ts</span><strong id="m-ts">—</strong></div>
+      <div class="metric"><span>clients</span><strong id="m-clients">—</strong></div>
+      <div class="metric"><span>subs</span><strong id="m-subs">—</strong></div>
+      <input id="admin-key" type="password" placeholder="Admin key (if set)" autocomplete="off" />
+      <button id="refresh-btn" class="btn">Refresh</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <nav class="tabs">
+        <button class="tab active" data-tab="data">Data Browser</button>
+        <button class="tab" data-tab="functions">Functions</button>
+        <button class="tab" data-tab="jobs">Scheduler &amp; Crons</button>
+        <button class="tab" data-tab="routes">HTTP Routes</button>
+      </nav>
+      <div class="sidebar-list" id="sidebar-list"></div>
+    </aside>
+
+    <main class="main" id="main-view">
+      <div class="empty">Connecting to Concave…</div>
+    </main>
+  </div>
+
+  <script type="module" src="/_dashboard/app.js"></script>
+</body>
+</html>

@@ -597,10 +597,22 @@ pub const PgStore = struct {
     io: std.Io,
     url: PgUrl,
     deployment_id: []u8,
-    mutex: std.Io.Mutex = .init,
-    conn: ?*PgConn = null,
+    pool_mutex: std.Io.Mutex = .init,
+    idle: std.ArrayList(*PgConn) = .empty,
+    total_conns: usize = 0,
+    max_connections: usize = 8,
 
     pub fn connect(allocator: Allocator, io: std.Io, database_url: []const u8, deployment_id: []const u8) !*PgStore {
+        return connectWithPoolSize(allocator, io, database_url, deployment_id, 8);
+    }
+
+    pub fn connectWithPoolSize(
+        allocator: Allocator,
+        io: std.Io,
+        database_url: []const u8,
+        deployment_id: []const u8,
+        max_connections: usize,
+    ) !*PgStore {
         const self = try allocator.create(PgStore);
         errdefer allocator.destroy(self);
         const parsed = try PgUrl.parse(allocator, database_url);
@@ -613,31 +625,70 @@ pub const PgStore = struct {
             .io = io,
             .url = parsed,
             .deployment_id = dep,
-            .conn = null,
+            .max_connections = @max(@as(usize, 1), max_connections),
         };
-        // Eagerly establish initial connection to validate credentials.
-        self.conn = try PgConn.connect(allocator, io, &self.url);
+        // Eagerly establish initial connection to validate credentials & warm the pool.
+        const first = try PgConn.connect(allocator, io, &self.url);
+        errdefer first.deinit();
+        try self.idle.append(allocator, first);
+        self.total_conns = 1;
         return self;
     }
 
     pub fn deinit(self: *PgStore) void {
-        if (self.conn) |c| c.deinit();
+        for (self.idle.items) |c| c.deinit();
+        self.idle.deinit(self.allocator);
         self.url.deinit(self.allocator);
         self.allocator.free(self.deployment_id);
         self.allocator.destroy(self);
     }
 
-    fn ensureConnLocked(self: *PgStore) !*PgConn {
-        if (self.conn) |c| return c;
-        const c = try PgConn.connect(self.allocator, self.io, &self.url);
-        self.conn = c;
-        return c;
+    fn acquireConn(self: *PgStore) !*PgConn {
+        while (true) {
+            var should_dial = false;
+            {
+                self.pool_mutex.lockUncancelable(self.io);
+                defer self.pool_mutex.unlock(self.io);
+                if (self.idle.items.len > 0) {
+                    return self.idle.pop().?;
+                }
+                if (self.total_conns < self.max_connections) {
+                    self.total_conns += 1;
+                    should_dial = true;
+                }
+            }
+            if (should_dial) {
+                return PgConn.connect(self.allocator, self.io, &self.url) catch |err| {
+                    self.pool_mutex.lockUncancelable(self.io);
+                    self.total_conns -= 1;
+                    self.pool_mutex.unlock(self.io);
+                    return err;
+                };
+            }
+            self.io.sleep(.fromMilliseconds(2), .awake) catch {};
+        }
+    }
+
+    fn releaseConn(self: *PgStore, conn: *PgConn, healthy: bool) void {
+        if (healthy) {
+            self.pool_mutex.lockUncancelable(self.io);
+            defer self.pool_mutex.unlock(self.io);
+            self.idle.append(self.allocator, conn) catch {
+                conn.deinit();
+                self.total_conns -= 1;
+            };
+        } else {
+            conn.deinit();
+            self.pool_mutex.lockUncancelable(self.io);
+            defer self.pool_mutex.unlock(self.io);
+            if (self.total_conns > 0) self.total_conns -= 1;
+        }
     }
 
     pub fn initSchema(self: *PgStore, manifest: *const manifest_mod.AppManifest) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const conn = try self.ensureConnLocked();
+        const conn = try self.acquireConn();
+        var healthy = false;
+        defer self.releaseConn(conn, healthy);
 
         try conn.exec(
             \\CREATE TABLE IF NOT EXISTS documents (
@@ -664,6 +715,7 @@ pub const PgStore = struct {
         try conn.exec(
             \\CREATE INDEX IF NOT EXISTS idx_index_entries_doc
             \\  ON index_entries (deployment_id, namespace, table_name, doc_id)
+            \\
         );
         try conn.exec(
             \\CREATE TABLE IF NOT EXISTS commit_log (
@@ -673,31 +725,35 @@ pub const PgStore = struct {
             \\  PRIMARY KEY (deployment_id, commit_ts)
             \\)
         );
+        healthy = true;
         _ = manifest;
     }
 
     pub fn latestCommitTs(self: *PgStore) !i64 {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const conn = try self.ensureConnLocked();
-
         const sql = try allocSqlFormat(self.allocator, "SELECT COALESCE(MAX(commit_ts), 0) FROM commit_log WHERE deployment_id = {s}", .{try quoteSql(self.allocator, self.deployment_id)});
         defer self.allocator.free(sql);
 
-        const rows = try conn.queryRows(self.allocator, sql);
-        defer {
-            for (rows) |*r| r.deinit(self.allocator);
-            self.allocator.free(rows);
+        for (0..2) |attempt| {
+            const conn = try self.acquireConn();
+            var healthy = false;
+            defer self.releaseConn(conn, healthy);
+
+            const rows = conn.queryRows(self.allocator, sql) catch |err| {
+                if (attempt == 0) continue;
+                return err;
+            };
+            healthy = true;
+            defer {
+                for (rows) |*r| r.deinit(self.allocator);
+                self.allocator.free(rows);
+            }
+            if (rows.len == 0 or rows[0].cols.len == 0) return 0;
+            return std.fmt.parseInt(i64, rows[0].cols[0], 10) catch 0;
         }
-        if (rows.len == 0 or rows[0].cols.len == 0) return 0;
-        return std.fmt.parseInt(i64, rows[0].cols[0], 10) catch 0;
+        return 0;
     }
 
     pub fn getDoc(self: *PgStore, allocator: Allocator, ns: []const u8, table: []const u8, doc_id: []const u8) !?Document {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const conn = try self.ensureConnLocked();
-
         const q_dep = try quoteSql(self.allocator, self.deployment_id);
         defer self.allocator.free(q_dep);
         const q_ns = try quoteSql(self.allocator, ns);
@@ -714,24 +770,31 @@ pub const PgStore = struct {
         );
         defer self.allocator.free(sql);
 
-        const rows = try conn.queryRows(self.allocator, sql);
-        defer {
-            for (rows) |*r| r.deinit(self.allocator);
-            self.allocator.free(rows);
+        for (0..2) |attempt| {
+            const conn = try self.acquireConn();
+            var healthy = false;
+            defer self.releaseConn(conn, healthy);
+
+            const rows = conn.queryRows(self.allocator, sql) catch |err| {
+                if (attempt == 0) continue;
+                return err;
+            };
+            healthy = true;
+            defer {
+                for (rows) |*r| r.deinit(self.allocator);
+                self.allocator.free(rows);
+            }
+            if (rows.len == 0 or rows[0].cols.len < 2) return null;
+            return .{
+                .id = try allocator.dupe(u8, doc_id),
+                .creation_time_ms = std.fmt.parseInt(i64, rows[0].cols[0], 10) catch 0,
+                .body_json = try allocator.dupe(u8, rows[0].cols[1]),
+            };
         }
-        if (rows.len == 0 or rows[0].cols.len < 2) return null;
-        return .{
-            .id = try allocator.dupe(u8, doc_id),
-            .creation_time_ms = std.fmt.parseInt(i64, rows[0].cols[0], 10) catch 0,
-            .body_json = try allocator.dupe(u8, rows[0].cols[1]),
-        };
+        return null;
     }
 
     pub fn scanIndex(self: *PgStore, allocator: Allocator, query: *const IndexQuery) ![]Document {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const conn = try self.ensureConnLocked();
-
         var sql: std.Io.Writer.Allocating = .init(self.allocator);
         defer sql.deinit();
         const w = &sql.writer;
@@ -790,27 +853,38 @@ pub const PgStore = struct {
             try w.print(" LIMIT {d}", .{lim});
         }
 
-        const rows = try conn.queryRows(self.allocator, sql.written());
-        defer {
-            for (rows) |*r| r.deinit(self.allocator);
-            self.allocator.free(rows);
-        }
+        for (0..2) |attempt| {
+            const conn = try self.acquireConn();
+            var healthy = false;
+            defer self.releaseConn(conn, healthy);
 
-        var out = try allocator.alloc(Document, rows.len);
-        var built: usize = 0;
-        errdefer {
-            for (out[0..built]) |*d| d.deinit(allocator);
-            allocator.free(out);
-        }
-        for (rows, 0..) |row, i| {
-            out[i] = .{
-                .id = try allocator.dupe(u8, row.cols[0]),
-                .creation_time_ms = std.fmt.parseInt(i64, row.cols[1], 10) catch 0,
-                .body_json = try allocator.dupe(u8, row.cols[2]),
+            const rows = conn.queryRows(self.allocator, sql.written()) catch |err| {
+                if (attempt == 0) continue;
+                return err;
             };
-            built += 1;
+            healthy = true;
+            defer {
+                for (rows) |*r| r.deinit(self.allocator);
+                self.allocator.free(rows);
+            }
+
+            var out = try allocator.alloc(Document, rows.len);
+            var built: usize = 0;
+            errdefer {
+                for (out[0..built]) |*d| d.deinit(allocator);
+                allocator.free(out);
+            }
+            for (rows, 0..) |row, i| {
+                out[i] = .{
+                    .id = try allocator.dupe(u8, row.cols[0]),
+                    .creation_time_ms = std.fmt.parseInt(i64, row.cols[1], 10) catch 0,
+                    .body_json = try allocator.dupe(u8, row.cols[2]),
+                };
+                built += 1;
+            }
+            return out;
         }
-        return out;
+        unreachable;
     }
 
     pub fn commitTx(
@@ -821,9 +895,9 @@ pub const PgStore = struct {
         read_set: *const readset_mod.ReadSet,
         writes: []const WriteOp,
     ) !CommitResult {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const conn = try self.ensureConnLocked();
+        const conn = try self.acquireConn();
+        var healthy = false;
+        defer self.releaseConn(conn, healthy);
 
         const q_dep = try quoteSql(self.allocator, self.deployment_id);
         defer self.allocator.free(q_dep);
@@ -866,6 +940,7 @@ pub const PgStore = struct {
                 defer ws.deinit(self.allocator);
                 if (read_set.intersects(&ws)) {
                     conn.exec("ROLLBACK") catch {};
+                    healthy = true;
                     return storage_mod.StorageError.Conflict;
                 }
             }
@@ -873,6 +948,7 @@ pub const PgStore = struct {
 
         if (writes.len == 0) {
             try conn.exec("COMMIT");
+            healthy = true;
             return .{ .commit_ts = latest_ts, .write_set = .{} };
         }
 
@@ -880,7 +956,13 @@ pub const PgStore = struct {
         errdefer write_set.deinit(allocator);
 
         for (writes) |op| {
-            try self.applyPgOp(conn, manifest, q_dep, op, allocator, &write_set);
+            self.applyPgOp(conn, manifest, q_dep, op, allocator, &write_set) catch |err| {
+                if (err == storage_mod.StorageError.NotFound) {
+                    conn.exec("ROLLBACK") catch {};
+                    healthy = true;
+                }
+                return err;
+            };
         }
 
         const next_ts = latest_ts + 1;
@@ -897,6 +979,7 @@ pub const PgStore = struct {
         defer self.allocator.free(ins_log);
         try conn.exec(ins_log);
         try conn.exec("COMMIT");
+        healthy = true;
 
         return .{ .commit_ts = next_ts, .write_set = write_set };
     }
@@ -1132,10 +1215,6 @@ pub const PgStore = struct {
     }
 
     pub fn commitsSince(self: *PgStore, allocator: Allocator, since_ts: i64) ![]CommitEntry {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const conn = try self.ensureConnLocked();
-
         const q_dep = try quoteSql(self.allocator, self.deployment_id);
         defer self.allocator.free(q_dep);
 
@@ -1146,26 +1225,37 @@ pub const PgStore = struct {
         );
         defer self.allocator.free(sql);
 
-        const rows = try conn.queryRows(self.allocator, sql);
-        defer {
-            for (rows) |*r| r.deinit(self.allocator);
-            self.allocator.free(rows);
-        }
+        for (0..2) |attempt| {
+            const conn = try self.acquireConn();
+            var healthy = false;
+            defer self.releaseConn(conn, healthy);
 
-        var out = try allocator.alloc(CommitEntry, rows.len);
-        var built: usize = 0;
-        errdefer {
-            for (out[0..built]) |*c| c.deinit(allocator);
-            allocator.free(out);
-        }
-        for (rows, 0..) |row, i| {
-            out[i] = .{
-                .commit_ts = std.fmt.parseInt(i64, row.cols[0], 10) catch 0,
-                .write_set = try parseWriteSetJson(allocator, row.cols[1]),
+            const rows = conn.queryRows(self.allocator, sql) catch |err| {
+                if (attempt == 0) continue;
+                return err;
             };
-            built += 1;
+            healthy = true;
+            defer {
+                for (rows) |*r| r.deinit(self.allocator);
+                self.allocator.free(rows);
+            }
+
+            var out = try allocator.alloc(CommitEntry, rows.len);
+            var built: usize = 0;
+            errdefer {
+                for (out[0..built]) |*c| c.deinit(allocator);
+                allocator.free(out);
+            }
+            for (rows, 0..) |row, i| {
+                out[i] = .{
+                    .commit_ts = std.fmt.parseInt(i64, row.cols[0], 10) catch 0,
+                    .write_set = try parseWriteSetJson(allocator, row.cols[1]),
+                };
+                built += 1;
+            }
+            return out;
         }
-        return out;
+        unreachable;
     }
 };
 

@@ -10,11 +10,16 @@ const CLIENT_SIGNALS_JS = @embedFile("concave_client_signals_js");
 const CLIENT_CLIENT_JS = @embedFile("concave_client_client_js");
 const CLIENT_DOM_JS = @embedFile("concave_client_dom_js");
 const ANALYTICS_CLIENT_JS = @embedFile("concave_analytics_client_js");
+const DASHBOARD_INDEX_HTML = @embedFile("concave_dashboard_index_html");
+const DASHBOARD_STYLES_CSS = @embedFile("concave_dashboard_styles_css");
+const DASHBOARD_APP_JS = @embedFile("concave_dashboard_app_js");
 
 pub const ServerConfig = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 3210,
     static_dir: ?[]const u8 = null,
+    admin_key: ?[]const u8 = null,
+    shutdown_flag: ?*std.atomic.Value(bool) = null,
 };
 
 pub fn serve(
@@ -30,20 +35,33 @@ pub fn serve(
     std.debug.print("Concave server listening on http://{s}:{d}\n", .{ config.host, config.port });
 
     while (true) {
+        if (config.shutdown_flag) |sf| {
+            if (sf.load(.acquire)) break;
+        }
         const stream = listener.accept(io) catch |err| {
+            if (config.shutdown_flag) |sf| {
+                if (sf.load(.acquire)) break;
+            }
             std.debug.print("accept error: {s}\n", .{@errorName(err)});
             continue;
         };
+        if (config.shutdown_flag) |sf| {
+            if (sf.load(.acquire)) {
+                stream.close(io);
+                break;
+            }
+        }
 
         const ConnCtx = struct {
             allocator: Allocator,
             io: std.Io,
             engine: *engine_mod.ConcaveEngine,
             static_dir: ?[]const u8,
+            admin_key: ?[]const u8,
             stream: std.Io.net.Stream,
 
             fn run(ctx: @This()) void {
-                handleConnection(ctx.allocator, ctx.io, ctx.engine, ctx.static_dir, ctx.stream);
+                handleConnection(ctx.allocator, ctx.io, ctx.engine, ctx.static_dir, ctx.admin_key, ctx.stream);
             }
         };
 
@@ -52,6 +70,7 @@ pub fn serve(
             .io = io,
             .engine = engine,
             .static_dir = config.static_dir,
+            .admin_key = config.admin_key,
             .stream = stream,
         }}) catch {
             stream.close(io);
@@ -159,6 +178,7 @@ fn handleConnection(
     io: std.Io,
     engine: *engine_mod.ConcaveEngine,
     static_dir: ?[]const u8,
+    admin_key: ?[]const u8,
     stream: std.Io.net.Stream,
 ) void {
     defer stream.close(io);
@@ -218,6 +238,84 @@ fn handleConnection(
 
     if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/api/manifest")) {
         writeHttpResponse(io, stream, 200, "OK", "application/json", engine.manifest.raw_json);
+        return;
+    }
+
+    // Embedded Live Dev Dashboard (`/_dashboard`)
+    if (std.mem.eql(u8, req.method, "GET") and
+        (std.mem.eql(u8, req.path, "/_dashboard") or std.mem.eql(u8, req.path, "/_dashboard/")))
+    {
+        writeHttpResponse(io, stream, 200, "OK", "text/html; charset=utf-8", DASHBOARD_INDEX_HTML);
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/_dashboard/styles.css")) {
+        writeHttpResponse(io, stream, 200, "OK", "text/css; charset=utf-8", DASHBOARD_STYLES_CSS);
+        return;
+    }
+    if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/_dashboard/app.js")) {
+        writeHttpResponse(io, stream, 200, "OK", "text/javascript; charset=utf-8", DASHBOARD_APP_JS);
+        return;
+    }
+
+    // Admin inspection endpoints (`/_admin/stats`, `/_admin/table`, `/_admin/jobs`)
+    if (std.mem.eql(u8, req.method, "GET") and std.mem.startsWith(u8, req.path, "/_admin/")) {
+        if (!isAdminAuthorized(engine, admin_key, req.authorization, req.query)) {
+            const status: u16 = if (admin_key != null) 401 else 403;
+            const reason = if (admin_key != null) "Unauthorized" else "Forbidden";
+            writeHttpResponse(io, stream, status, reason, "application/json", "{\"error\":\"admin access denied\"}");
+            return;
+        }
+        if (std.mem.eql(u8, req.path, "/_admin/stats")) {
+            const stats = engine.getStats();
+            const raw = engine.manifest.raw_json;
+            // Splice live runtime metrics into the manifest JSON object.
+            const inner = if (raw.len >= 2 and raw[0] == '{' and raw[raw.len - 1] == '}') raw[1 .. raw.len - 1] else "";
+            const body = std.fmt.allocPrint(
+                allocator,
+                "{{\"commit_ts\":{d},\"active_clients\":{d},\"active_subscriptions\":{d},{s}}}",
+                .{ stats.commit_ts, stats.active_clients, stats.active_subscriptions, inner },
+            ) catch return;
+            defer allocator.free(body);
+            writeHttpResponse(io, stream, 200, "OK", "application/json", body);
+            return;
+        }
+        if (std.mem.eql(u8, req.path, "/_admin/jobs")) {
+            const docs = engine.adminScanTable(allocator, "_system", "_scheduled_jobs", 100) catch {
+                writeHttpResponse(io, stream, 500, "Internal Server Error", "application/json", "{\"error\":\"failed to list jobs\"}");
+                return;
+            };
+            defer {
+                for (docs) |*d| d.deinit(allocator);
+                allocator.free(docs);
+            }
+            sendDocsJsonArray(allocator, io, stream, docs);
+            return;
+        }
+        if (std.mem.eql(u8, req.path, "/_admin/table")) {
+            const ns = getQueryParamDecoded(allocator, req.query, "ns") catch null;
+            defer if (ns) |v| allocator.free(v);
+            const tbl = getQueryParamDecoded(allocator, req.query, "table") catch null;
+            defer if (tbl) |v| allocator.free(v);
+            if (tbl == null or tbl.?.len == 0) {
+                writeHttpResponse(io, stream, 400, "Bad Request", "application/json", "{\"error\":\"missing table parameter\"}");
+                return;
+            }
+            const lim_str = getQueryParamDecoded(allocator, req.query, "limit") catch null;
+            defer if (lim_str) |v| allocator.free(v);
+            const limit: usize = if (lim_str) |ls| std.fmt.parseInt(usize, ls, 10) catch 100 else 100;
+
+            const docs = engine.adminScanTable(allocator, ns orelse "", tbl.?, limit) catch {
+                writeHttpResponse(io, stream, 500, "Internal Server Error", "application/json", "{\"error\":\"failed to scan table\"}");
+                return;
+            };
+            defer {
+                for (docs) |*d| d.deinit(allocator);
+                allocator.free(docs);
+            }
+            sendDocsJsonArray(allocator, io, stream, docs);
+            return;
+        }
+        writeHttpResponse(io, stream, 404, "Not Found", "application/json", "{\"error\":\"unknown admin endpoint\"}");
         return;
     }
 
@@ -671,6 +769,83 @@ fn handleWsText(
         defer allocator.free(pong);
         sender.sendText(pong) catch {};
     }
+}
+
+fn isAdminAuthorized(
+    engine: *const engine_mod.ConcaveEngine,
+    admin_key: ?[]const u8,
+    auth_header: ?[]const u8,
+    query: []const u8,
+) bool {
+    if (admin_key) |expected| {
+        if (auth_header) |ah| {
+            var tok = std.mem.trim(u8, ah, " \t");
+            if (std.mem.startsWith(u8, tok, "Bearer ")) {
+                tok = std.mem.trim(u8, tok["Bearer ".len..], " \t");
+            }
+            if (timingSafeStrEql(tok, expected)) return true;
+        }
+        var pairs = std.mem.splitScalar(u8, query, '&');
+        while (pairs.next()) |pair| {
+            if (std.mem.startsWith(u8, pair, "key=")) {
+                if (timingSafeStrEql(pair["key=".len..], expected)) return true;
+            }
+        }
+        return false;
+    }
+    return engine.auth_config.allow_dev_tokens;
+}
+
+fn timingSafeStrEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, b) |x, y| diff |= x ^ y;
+    return diff == 0;
+}
+
+fn getQueryParamDecoded(allocator: Allocator, query: []const u8, key: []const u8) !?[]u8 {
+    var pairs = std.mem.splitScalar(u8, query, '&');
+    while (pairs.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (!std.mem.eql(u8, pair[0..eq], key)) continue;
+        const raw = pair[eq + 1 ..];
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        var i: usize = 0;
+        while (i < raw.len) {
+            if (raw[i] == '+') {
+                try out.append(allocator, ' ');
+                i += 1;
+            } else if (raw[i] == '%' and i + 2 < raw.len) {
+                const byte = std.fmt.parseInt(u8, raw[i + 1 .. i + 3], 16) catch {
+                    try out.append(allocator, raw[i]);
+                    i += 1;
+                    continue;
+                };
+                try out.append(allocator, byte);
+                i += 3;
+            } else {
+                try out.append(allocator, raw[i]);
+                i += 1;
+            }
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+    return null;
+}
+
+fn sendDocsJsonArray(allocator: Allocator, io: std.Io, stream: std.Io.net.Stream, docs: []const storage_mod.Document) void {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    out.writer.writeByte('[') catch return;
+    for (docs, 0..) |*d, i| {
+        if (i > 0) out.writer.writeByte(',') catch return;
+        const wj = d.toWireJson(allocator) catch return;
+        defer allocator.free(wj);
+        out.writer.writeAll(wj) catch return;
+    }
+    out.writer.writeByte(']') catch return;
+    writeHttpResponse(io, stream, 200, "OK", "application/json", out.written());
 }
 
 fn httpStatusReason(status: u16) []const u8 {
