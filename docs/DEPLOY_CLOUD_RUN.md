@@ -1,17 +1,16 @@
 # Deploying Concave to Google Cloud Run + Serverless PostgreSQL
 
-Concave compiles your Roc application and Rust runtime into a single Linux binary that scales horizontally (`0 -> N` instances) on **Google Cloud Run** backed by serverless PostgreSQL (**PlanetScale for Postgres** or **Neon**).
+Concave compiles your Roc application and zero-dependency Zig runtime into a **single ~1.9 MB Linux binary** that scales horizontally (`0 -> N` instances) on **Google Cloud Run** backed by serverless PostgreSQL (**PlanetScale for Postgres** or **Neon**).
 
 ## How Horizontal Autoscaling Works
 
-1. **Shared ACID Storage**: All Cloud Run instances connect to the same PostgreSQL database (`DATABASE_URL`) using our 3-table schema (`documents`, `index_entries`, `commit_log`), led by `deployment_id` for clean tenant-level sharding.
-2. **Serverless Pooler Safe**: `PostgresStorage` sets `statement_cache_capacity(0)` and `min_connections(0)` so it works cleanly behind transaction-mode poolers (PlanetScale PgBouncer, Neon `-pooler`) and lets idle compute scale to zero.
-3. **Cross-Instance Reactivity**: Each instance runs a lightweight background `commit_log` tailer (`CONCAVE_COMMIT_POLL_MS`, default `100ms`) that polls `commits_since(last_seen_ts)` **only while clients are connected** — pushing live `Transition` frames to local WebSocket subscribers when another Cloud Run replica commits a mutation, while emitting zero DB traffic when idle.
-4. **Zero-`npm` Frontend Serving**: The container serves your static TypeScript frontend (`CONCAVE_STATIC_DIR=/app/frontend`) and `/_concave/*.ts` directly, stripping TS on the fly in Rust via `oxc`.
-5. **Graceful Drain & Health Probes**:
+1. **Shared ACID Storage (Pure Zig PG Wire v3)**: All Cloud Run instances connect directly to PostgreSQL (`DATABASE_URL`) using Concave's zero-dependency `PgStore` (`zig/core/pg_wire.zig`) — speaking PostgreSQL Wire Protocol v3 over native Zig TLS 1.3 (`std.crypto.tls.Client`) with SCRAM-SHA-256 authentication, over our 3-table schema (`documents`, `index_entries`, `commit_log`) led by `deployment_id`.
+2. **Serverless Pooler Safe**: `PgStore` uses simple/stateless queries with zero server-side prepared statements and connects on demand, so it works cleanly behind transaction-mode poolers (PlanetScale PgBouncer, Neon `-pooler`) and lets idle compute scale to zero.
+3. **Cross-Instance Reactivity**: Each instance runs a lightweight background `commit_log` tailer (`CONCAVE_COMMIT_POLL_MS`, default `100ms`) that polls `commitsSince(last_seen_ts)` **only while WebSocket clients are connected** — pushing live `transition` frames to local WebSocket subscribers when another Cloud Run replica commits a mutation, while emitting zero DB traffic when idle.
+4. **Zero-`npm` Frontend Serving**: The container serves your native browser ESM frontend (`CONCAVE_STATIC_DIR=/app/frontend`) and embedded `/_concave/*.js` directly with zero build step.
+5. **Health & Readiness Probes**:
    - Liveness: `GET /health`
-   - Readiness (verifies DB connectivity): `GET /ready`
-   - Graceful `SIGTERM` shutdown drains active connections cleanly on scale-down.
+   - Readiness (verifies DB connectivity & reports `commit_ts`): `GET /ready`
 
 ---
 
@@ -34,7 +33,7 @@ gcloud run deploy concave-chat \
   --concurrency 250 \
   --timeout 3600 \
   --session-affinity \
-  --set-env-vars "CONCAVE_DEPLOYMENT_ID=prod,CONCAVE_COMMIT_POLL_MS=100,CONCAVE_PG_MAX_CONNECTIONS=10,CONCAVE_ALLOW_DEV_TOKENS=true" \
+  --set-env-vars "CONCAVE_DEPLOYMENT_ID=prod,CONCAVE_COMMIT_POLL_MS=100,CONCAVE_ALLOW_DEV_TOKENS=true" \
   --set-secrets "DATABASE_URL=concave-database-url:latest"
 ```
 
@@ -46,11 +45,10 @@ gcloud run deploy concave-chat \
 | --- | --- | --- |
 | `PORT` | `3210` (or Cloud Run `8080`) | HTTP/WebSocket bind port |
 | `CONCAVE_HOST` | `0.0.0.0` (when `PORT` set) | Bind IP address |
-| `DATABASE_URL` | *(unset -> SQLite)* | PostgreSQL connection URL (Neon / PlanetScale PG / Cloud SQL) |
+| `DATABASE_URL` | *(unset -> embedded `WalStore`)* | PostgreSQL connection URL (Neon / PlanetScale PG / Cloud SQL) |
 | `CONCAVE_DEPLOYMENT_ID` | `default` | Leading shard/tenant key for all tables |
-| `CONCAVE_PG_MAX_CONNECTIONS` | `10` | Per-instance Postgres pool size |
 | `CONCAVE_COMMIT_POLL_MS` | `100` | Cross-instance `commit_log` tail interval in ms (`0` to disable) |
-| `CONCAVE_STATIC_DIR` | *(unset)* | Static frontend directory served with on-the-fly Rust `oxc` TS stripping |
+| `CONCAVE_STATIC_DIR` | *(unset)* | Static frontend directory served as native browser ESM |
 | `CONCAVE_JWT_SECRET` | *(unset)* | HS256 secret for verifying production JWTs |
 | `CONCAVE_ALLOW_DEV_TOKENS` | `true` | Set to `false` in production to reject `dev:*` tokens |
 

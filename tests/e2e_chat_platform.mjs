@@ -6,8 +6,8 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { ConcaveClient } from "../client/concave-client/src/index.ts";
-import { api } from "../examples/chat-app/frontend/src/_generated/api.ts";
+import { ConcaveClient } from "../client/concave-client/src/index.js";
+import { api } from "../examples/chat-app/frontend/src/_generated/api.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
@@ -38,13 +38,13 @@ async function waitForCondition(fn, timeoutMs = 5000, label = "condition") {
 
 test("end-to-end native Roc platform: WS reactivity, index-range isolation, components, OCC, and HTTP Action", async (t) => {
   const binPath = path.join(ROOT, "examples/chat-app/.concave/e2e-server");
-  const dbPath = path.join(ROOT, "examples/chat-app/.concave/e2e.db");
+  const dbPath = path.join(ROOT, "examples/chat-app/.concave/e2e.wal");
   fs.mkdirSync(path.dirname(binPath), { recursive: true });
-  for (const suffix of ["", "-wal", "-shm"]) {
+  for (const suffix of ["", "-wal", "-shm", ".tmp"]) {
     fs.rmSync(`${dbPath}${suffix}`, { force: true });
   }
 
-  // 1. Build standalone native Roc+Rust server binary.
+  // 1. Build standalone native Roc+Zig zero-dependency server binary.
   const build = spawnSync(
     "roc",
     [
@@ -97,7 +97,7 @@ test("end-to-end native Roc platform: WS reactivity, index-range isolation, comp
   });
   t.after(() => {
     serverProc.kill("SIGTERM");
-    for (const suffix of ["", "-wal", "-shm"]) {
+    for (const suffix of ["", "-wal", "-shm", ".tmp"]) {
       fs.rmSync(`${dbPath}${suffix}`, { force: true });
     }
   });
@@ -111,30 +111,27 @@ test("end-to-end native Roc platform: WS reactivity, index-range isolation, comp
   assert.equal(readyBody.status, "ready");
   assert.equal(typeof readyBody.commit_ts, "number");
 
-  // Verify zero-npm TypeScript serving via Concave's built-in Rust `oxc` transpiler!
+  // Verify zero-npm native browser ESM serving from Concave's zero-dependency Zig host!
   const indexHtml = await fetch(`${serverUrl}/`);
   assert.equal(indexHtml.status, 200);
-  assert.ok((await indexHtml.text()).includes("/src/main.ts"));
+  assert.ok((await indexHtml.text()).includes("/src/main.js"));
 
-  const builtinClient = await fetch(`${serverUrl}/_concave/index.ts`);
+  const builtinClient = await fetch(`${serverUrl}/_concave/index.js`);
   assert.equal(builtinClient.status, 200);
   assert.match(builtinClient.headers.get("content-type") ?? "", /text\/javascript/);
   const builtinJs = await builtinClient.text();
   assert.ok(builtinJs.includes("ConcaveClient"));
-  assert.ok(!builtinJs.includes("type Accessor"), "oxc must strip TypeScript types");
 
-  const mainTsResp = await fetch(`${serverUrl}/src/main.ts`);
-  assert.equal(mainTsResp.status, 200);
-  assert.match(mainTsResp.headers.get("content-type") ?? "", /text\/javascript/);
-  const mainJs = await mainTsResp.text();
+  const mainJsResp = await fetch(`${serverUrl}/src/main.js`);
+  assert.equal(mainJsResp.status, 200);
+  assert.match(mainJsResp.headers.get("content-type") ?? "", /text\/javascript/);
+  const mainJs = await mainJsResp.text();
   assert.ok(mainJs.includes("mount("));
-  assert.ok(!mainJs.includes("Promise<void>"), "oxc must strip TypeScript return types");
 
-  const apiTsResp = await fetch(`${serverUrl}/src/_generated/api.ts`);
-  assert.equal(apiTsResp.status, 200);
-  const apiJs = await apiTsResp.text();
+  const apiJsResp = await fetch(`${serverUrl}/src/_generated/api.js`);
+  assert.equal(apiJsResp.status, 200);
+  const apiJs = await apiJsResp.text();
   assert.ok(apiJs.includes("export const api ="));
-  assert.ok(!apiJs.includes("export interface FunctionReference"));
 
   // 4. Connect two real ConcaveClient WebSocket sessions (Alice in #general, Bob in #roc-lang).
   const alice = new ConcaveClient(serverUrl, { authToken: "dev:alice:Alice" });

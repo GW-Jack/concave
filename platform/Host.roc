@@ -1,4 +1,4 @@
-## Low-level hosted C-ABI functions implemented by Concave's Rust host (`crates/concave-host`).
+## Low-level hosted C-ABI functions implemented by Concave's zero-dependency Zig host (`zig/host/host.zig`).
 ## Application code should use `concave-sdk` (`Ctx`, `Db`, `App`) instead of calling `Host` directly.
 
 Host := [Host].{

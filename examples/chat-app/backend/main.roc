@@ -47,7 +47,7 @@ ensure_defaults! = |ctx, _| {
     if List.is_empty(existing) {
         general_id = Db.insert!(ctx.db, Room.table, {
             name: "general",
-            topic: "Welcome to Concave — real-time reactive chat powered by Roc + Rust",
+            topic: "Welcome to Concave — real-time reactive chat powered by zero-dep Roc + Zig",
             created_by: "system",
         })?
         _ = Db.insert!(ctx.db, Message.table, {

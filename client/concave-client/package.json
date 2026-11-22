@@ -2,11 +2,21 @@
   "name": "@concave/client",
   "version": "0.1.0",
   "type": "module",
-  "description": "Zero-dependency TypeScript WebSocket sync engine and fine-grained reactive signal/DOM runtime for Concave (transpiled on the fly by Concave's Rust oxc server)",
-  "main": "./src/index.ts",
+  "description": "Zero-dependency native ESM WebSocket sync engine and fine-grained reactive signal/DOM runtime for Concave (with .d.ts declarations)",
+  "main": "./src/index.js",
+  "types": "./src/index.d.ts",
   "exports": {
-    ".": "./src/index.ts",
-    "./signals": "./src/signals.ts",
-    "./dom": "./src/dom.ts"
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./signals": {
+      "types": "./src/signals.d.ts",
+      "default": "./src/signals.js"
+    },
+    "./dom": {
+      "types": "./src/dom.d.ts",
+      "default": "./src/dom.js"
+    }
   }
 }

@@ -1,4 +1,4 @@
-.PHONY: host host-release test test-rust test-roc test-client test-e2e codegen-chat dev-chat
+.PHONY: host host-release test test-zig test-roc test-client test-e2e codegen-chat dev-chat
 
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
@@ -17,20 +17,20 @@ else
   endif
 endif
 
-## Build Rust `libhost.a` and install into `platform/targets/$(ROC_TARGET)/`
+## Build zero-dependency Zig `libhost.a` and `concave` CLI
 host:
-	cargo build -p concave-host
+	zig build
 	mkdir -p platform/targets/$(ROC_TARGET)
-	cp target/debug/libconcave_host.a platform/targets/$(ROC_TARGET)/libhost.a
+	cp zig-out/lib/libhost.a platform/targets/$(ROC_TARGET)/libhost.a
 
-## Build release `libhost.a` for production binaries
+## Build ReleaseSafe `libhost.a` and `concave` CLI for production binaries
 host-release:
-	cargo build --release -p concave-host
+	zig build -Doptimize=ReleaseSafe
 	mkdir -p platform/targets/$(ROC_TARGET)
-	cp target/release/libconcave_host.a platform/targets/$(ROC_TARGET)/libhost.a
+	cp zig-out/lib/libhost.a platform/targets/$(ROC_TARGET)/libhost.a
 
-test-rust:
-	cargo test --workspace
+test-zig:
+	zig build test
 
 test-roc:
 	roc check packages/concave-sdk/main.roc
@@ -45,23 +45,23 @@ test-roc:
 	roc check examples/chat-app/backend/main.roc
 
 test-client:
-	node --experimental-strip-types --test client/concave-client/test/signals.test.ts
+	node --test client/concave-client/test/signals.test.mjs
 
 test-e2e: host codegen-chat
-	node --experimental-strip-types --test --test-timeout=15000 tests/e2e_chat_platform.mjs
+	node --test --test-timeout=15000 tests/e2e_chat_platform.mjs
 
-test: test-rust test-roc test-client test-e2e
+test: test-zig test-roc test-client test-e2e
 
 codegen-chat: host
-	cargo run -p concave-cli -- codegen \
+	./zig-out/bin/concave codegen \
 		--entry examples/chat-app/backend/main.roc \
 		--out examples/chat-app/frontend/src/_generated
 
 ## Single-command live dev server: serves WebSockets, HTTP API, embedded `/_concave/*.js`, and the chat UI on :3210
 dev-chat: host
-	cargo run -p concave-cli -- dev \
+	./zig-out/bin/concave dev \
 		--entry examples/chat-app/backend/main.roc \
 		--out examples/chat-app/frontend/src/_generated \
 		--port 3210 \
-		--db examples/chat-app/.concave/dev.db \
+		--db examples/chat-app/.concave/dev.wal \
 		--static-dir examples/chat-app/frontend

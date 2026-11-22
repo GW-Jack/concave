@@ -1,0 +1,58 @@
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    // 1. Native Roc 0.1.0_RC1 static library host (`libhost.a`) — ZERO third-party dependencies!
+    const host_mod = b.createModule(.{
+        .root_source_file = b.path("zig/host_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    host_mod.addAnonymousImport("concave_client_index_js", .{
+        .root_source_file = b.path("client/concave-client/src/index.js"),
+    });
+    host_mod.addAnonymousImport("concave_client_signals_js", .{
+        .root_source_file = b.path("client/concave-client/src/signals.js"),
+    });
+    host_mod.addAnonymousImport("concave_client_client_js", .{
+        .root_source_file = b.path("client/concave-client/src/client.js"),
+    });
+    host_mod.addAnonymousImport("concave_client_dom_js", .{
+        .root_source_file = b.path("client/concave-client/src/dom.js"),
+    });
+
+    const host_lib = b.addLibrary(.{
+        .name = "host",
+        .linkage = .static,
+        .root_module = host_mod,
+    });
+    b.installArtifact(host_lib);
+
+    // 2. Zero-dependency `concave` CLI (`init`, `dev`, `codegen`, `build`)
+    const cli_mod = b.createModule(.{
+        .root_source_file = b.path("zig/cli_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const cli_exe = b.addExecutable(.{
+        .name = "concave",
+        .root_module = cli_mod,
+    });
+    b.installArtifact(cli_exe);
+
+    // 3. All Zig unit tests (`zig build test`)
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("zig/tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const unit_tests = b.addTest(.{
+        .root_module = test_mod,
+    });
+    const run_tests = b.addRunArtifact(unit_tests);
+    const test_step = b.step("test", "Run all Concave Zig unit tests");
+    test_step.dependOn(&run_tests.step);
+}

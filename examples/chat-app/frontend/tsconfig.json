@@ -3,7 +3,8 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "allowImportingTsExtensions": true,
+    "allowJs": true,
+    "checkJs": true,
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
@@ -12,5 +13,9 @@
       "/_concave/*": ["../../../client/concave-client/src/*"]
     }
   },
-  "include": ["src/**/*.ts", "../../../client/concave-client/src/**/*.ts"]
+  "include": [
+    "src/**/*.js",
+    "src/**/*.d.ts",
+    "../../../client/concave-client/src/**/*.d.ts"
+  ]
 }

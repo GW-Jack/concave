@@ -1,9 +1,12 @@
-target/
+.zig-cache/
+zig-out/
 .git/
 .concave/
 platform/targets/
 examples/*/.concave/
 examples/*/frontend/src/_generated/
+*.wal
+*.wal.tmp
 *.db
 *.db-wal
 *.db-shm

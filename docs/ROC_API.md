@@ -3,7 +3,7 @@
 Concave splits cleanly into two Roc layers:
 
 1. **`packages/concave-sdk`** — Pure Roc package defining `Schema`, `Key`, `Table`, `Ctx`, `Db`, `Component`, and `App`. Reusable Components depend *only* on `concave-sdk` so they remain pure and unit-testable with `roc test`.
-2. **`platform/main.roc`** — Native Roc platform linking `libhost.a` (Rust runtime) and providing `--serve` and `--introspect` entrypoints.
+2. **`platform/main.roc`** — Native Roc platform linking `libhost.a` (zero-dependency Zig runtime) and providing `--serve` and `--introspect` entrypoints.
 
 ## Defining Tables & Typed Indexes
 

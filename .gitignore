@@ -1,6 +1,6 @@
-# Rust
-/target
-Cargo.lock
+# Zig
+.zig-cache/
+zig-out/
 
 # Roc
 *.roc.o
@@ -8,14 +8,10 @@ platform/targets/*/libhost.a
 platform/targets/*/host.lib
 .roc_cache/
 
-# Node / TypeScript
-node_modules/
-dist/
-.vite/
-*.tsbuildinfo
-
 # Concave local state & generated artifacts
 .concave/
+*.wal
+*.wal.tmp
 *.db
 *.db-wal
 *.db-shm
