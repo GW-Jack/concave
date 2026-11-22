@@ -1,0 +1,17 @@
+[package]
+name = "concave-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "concave"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+concave-codegen = { path = "../concave-codegen" }
+concave-core = { path = "../concave-core" }
+notify.workspace = true
+serde_json.workspace = true
