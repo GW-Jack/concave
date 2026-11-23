@@ -51,13 +51,17 @@ pub const H2Response = struct {
     status: u16,
     content_type: []const u8,
     body: []u8,
+    body_owned: bool = true,
     content_encoding: ?[]const u8 = null,
     etag: ?[]u8 = null,
+    etag_owned: bool = true,
     cache_control: ?[]const u8 = null,
 
     pub fn deinit(self: *const H2Response, allocator: Allocator) void {
-        allocator.free(self.body);
-        if (self.etag) |e| allocator.free(e);
+        if (self.body_owned and self.body.len > 0) allocator.free(self.body);
+        if (self.etag_owned) {
+            if (self.etag) |e| allocator.free(e);
+        }
     }
 };
 
@@ -125,8 +129,14 @@ pub fn serveConnection(
 
     var peer_max_frame: usize = MAX_FRAME_SIZE;
     var last_stream_id: u32 = 0;
+    var stack_payload: [4096]u8 = undefined;
+    var req_arena = std.heap.ArenaAllocator.init(allocator);
+    defer req_arena.deinit();
 
     while (true) {
+        if (reader.bufferedLen() == 0) {
+            writer.flush() catch break;
+        }
         var fhdr: [9]u8 = undefined;
         reader.readSliceAll(&fhdr) catch break;
 
@@ -139,8 +149,15 @@ pub fn serveConnection(
             sendGoAway(writer, last_stream_id, 6); // FRAME_SIZE_ERROR
             break;
         }
-        const payload = allocator.alloc(u8, length) catch break;
-        defer allocator.free(payload);
+        var heap_payload: ?[]u8 = null;
+        defer if (heap_payload) |hp| allocator.free(hp);
+        const payload: []u8 = if (length <= stack_payload.len)
+            stack_payload[0..length]
+        else blk: {
+            const hp = allocator.alloc(u8, length) catch break;
+            heap_payload = hp;
+            break :blk hp;
+        };
         if (length > 0) {
             reader.readSliceAll(payload) catch break;
         }
@@ -207,7 +224,8 @@ pub fn serveConnection(
                     };
                     gop.value_ptr.header_block.clearRetainingCapacity();
                     if (gop.value_ptr.end_stream) {
-                        completeStream(allocator, writer, sid, gop.value_ptr, peer_max_frame, dispatch_ctx, dispatch_fn) catch break;
+                        defer _ = req_arena.reset(.retain_capacity);
+                        completeStream(req_arena.allocator(), writer, reader, sid, gop.value_ptr, peer_max_frame, dispatch_ctx, dispatch_fn) catch break;
                         if (streams.fetchRemove(sid)) |kv| {
                             var sb = kv.value;
                             sb.deinit(allocator);
@@ -249,7 +267,8 @@ pub fn serveConnection(
                 }
                 if ((flags & FLAG_END_STREAM) != 0) {
                     sb.end_stream = true;
-                    completeStream(allocator, writer, sid, sb, peer_max_frame, dispatch_ctx, dispatch_fn) catch break;
+                    defer _ = req_arena.reset(.retain_capacity);
+                    completeStream(req_arena.allocator(), writer, reader, sid, sb, peer_max_frame, dispatch_ctx, dispatch_fn) catch break;
                     if (streams.fetchRemove(sid)) |kv| {
                         var rem = kv.value;
                         rem.deinit(allocator);
@@ -264,6 +283,7 @@ pub fn serveConnection(
 fn completeStream(
     allocator: Allocator,
     writer: *std.Io.Writer,
+    reader: *std.Io.Reader,
     stream_id: u32,
     sb: *StreamBuf,
     max_frame: usize,
@@ -275,22 +295,22 @@ fn completeStream(
     const path_slice = if (q_idx) |qi| raw_target[0..qi] else raw_target;
     const query_slice = if (q_idx) |qi| raw_target[qi + 1 ..] else "";
 
+    // Zero-copy view directly over `sb` (valid for the entire duration of `dispatch_fn`).
     const req = H2Request{
-        .method = try allocator.dupe(u8, sb.method orelse "GET"),
-        .path = try allocator.dupe(u8, path_slice),
-        .query = try allocator.dupe(u8, query_slice),
-        .content_type = if (sb.content_type) |v| try allocator.dupe(u8, v) else null,
-        .authorization = if (sb.authorization) |v| try allocator.dupe(u8, v) else null,
-        .accept_encoding = if (sb.accept_encoding) |v| try allocator.dupe(u8, v) else null,
-        .if_none_match = if (sb.if_none_match) |v| try allocator.dupe(u8, v) else null,
-        .body = try allocator.dupe(u8, sb.body.items),
+        .method = @constCast(sb.method orelse "GET"),
+        .path = @constCast(path_slice),
+        .query = @constCast(query_slice),
+        .content_type = sb.content_type,
+        .authorization = sb.authorization,
+        .accept_encoding = sb.accept_encoding,
+        .if_none_match = sb.if_none_match,
+        .body = sb.body.items,
     };
-    defer req.deinit(allocator);
 
     const resp = dispatch_fn(dispatch_ctx, allocator, &req);
     defer resp.deinit(allocator);
 
-    var hdr_block: std.ArrayList(u8) = .empty;
+    var hdr_block = try std.ArrayList(u8).initCapacity(allocator, 256);
     defer hdr_block.deinit(allocator);
 
     // Encode `:status`
@@ -339,7 +359,10 @@ fn completeStream(
         try writeFrame(writer, .data, if (is_last) FLAG_END_STREAM else 0, stream_id, resp.body[off .. off + chunk_len]);
         off += chunk_len;
     }
-    try writer.flush();
+    // Coalesce flushes when more HTTP/2 frames are already buffered on the socket!
+    if (reader.bufferedLen() == 0) {
+        try writer.flush();
+    }
 }
 
 fn writeFrame(writer: *std.Io.Writer, ftype: FrameType, flags: u8, stream_id: u32, payload: []const u8) !void {
@@ -679,44 +702,59 @@ const HUFFMAN_TABLE = [256]HuffCode{
     .{ .code = 0x7ffffee, .len = 27 }, .{ .code = 0x7ffffef, .len = 27 }, .{ .code = 0x7fffff0, .len = 27 }, .{ .code = 0x3ffffee, .len = 26 },
 };
 
+const TrieNode = struct {
+    children: [2]u16 = .{ 0, 0 },
+    sym: i16 = -1,
+};
+
+const HUFFMAN_TRIE = blk: {
+    @setEvalBranchQuota(50000);
+    var nodes: [600]TrieNode = @splat(TrieNode{});
+    var count: u16 = 1;
+    for (HUFFMAN_TABLE, 0..) |hc, sym| {
+        var cur: u16 = 0;
+        var b: i32 = @as(i32, hc.len) - 1;
+        while (b >= 0) : (b -= 1) {
+            const bit: u1 = @intCast((hc.code >> @intCast(b)) & 1);
+            if (nodes[cur].children[bit] == 0) {
+                nodes[cur].children[bit] = count;
+                count += 1;
+            }
+            cur = nodes[cur].children[bit];
+        }
+        nodes[cur].sym = @intCast(sym);
+    }
+    break :blk nodes;
+};
+
 pub fn decodeHuffman(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
+    var out = try std.ArrayList(u8).initCapacity(allocator, input.len + input.len / 2);
     errdefer out.deinit(allocator);
 
-    var acc: u64 = 0;
-    var bits: u6 = 0;
+    var cur: u16 = 0;
+    var rem_bits: u8 = 0;
+    var all_ones = true;
 
     for (input) |byte| {
-        acc = (acc << 8) | byte;
-        bits += 8;
-
-        while (bits >= 5) {
-            var matched = false;
-            // Search matching canonical code among current top `bits`.
-            for (HUFFMAN_TABLE, 0..) |hc, sym| {
-                if (hc.len <= bits) {
-                    const shift: u6 = bits - @as(u6, hc.len);
-                    const top: u32 = @intCast((acc >> shift) & ((@as(u64, 1) << @as(u6, hc.len)) - 1));
-                    if (top == hc.code) {
-                        try out.append(allocator, @intCast(sym));
-                        bits -= @as(u6, hc.len);
-                        acc &= if (bits == 0) 0 else (@as(u64, 1) << bits) - 1;
-                        matched = true;
-                        break;
-                    }
-                }
+        var shift: i32 = 7;
+        while (shift >= 0) : (shift -= 1) {
+            const bit: u1 = @intCast((byte >> @intCast(shift)) & 1);
+            if (bit == 0) all_ones = false;
+            rem_bits += 1;
+            const next = HUFFMAN_TRIE[cur].children[bit];
+            if (next == 0) return error.InvalidHuffman;
+            cur = next;
+            const sym = HUFFMAN_TRIE[cur].sym;
+            if (sym >= 0) {
+                try out.append(allocator, @intCast(sym));
+                cur = 0;
+                rem_bits = 0;
+                all_ones = true;
             }
-            if (!matched) break;
         }
     }
 
-    // Remaining padding bits must be < 8 and all 1s (prefix of EOS).
-    if (bits >= 8) return error.InvalidHuffman;
-    if (bits > 0) {
-        const expected_pad = (@as(u64, 1) << bits) - 1;
-        if (acc != expected_pad) return error.InvalidHuffman;
-    }
-
+    if (rem_bits >= 8 or (rem_bits > 0 and !all_ones)) return error.InvalidHuffman;
     return try out.toOwnedSlice(allocator);
 }
 

@@ -160,8 +160,17 @@ pub fn readFrame(allocator: Allocator, reader: *std.Io.Reader) WsReadError!Frame
         if (len_usize > 0) {
             reader.readSliceAll(chunk) catch return .close;
             if (masked) {
-                for (chunk, 0..) |*byte, i| {
-                    byte.* ^= mask_key[i & 3];
+                var idx: usize = 0;
+                if (chunk.len >= 8) {
+                    const m32 = std.mem.readInt(u32, &mask_key, .little);
+                    const m64: u64 = (@as(u64, m32) << 32) | @as(u64, m32);
+                    while (idx + 8 <= chunk.len) : (idx += 8) {
+                        const v = std.mem.readInt(u64, chunk[idx..][0..8], .little);
+                        std.mem.writeInt(u64, chunk[idx..][0..8], v ^ m64, .little);
+                    }
+                }
+                while (idx < chunk.len) : (idx += 1) {
+                    chunk[idx] ^= mask_key[idx & 3];
                 }
             }
         }

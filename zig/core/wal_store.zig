@@ -10,26 +10,71 @@ const WriteOp = storage_mod.WriteOp;
 const CommitEntry = storage_mod.CommitEntry;
 const CommitResult = storage_mod.CommitResult;
 
-const IndexRow = struct {
-    namespace: []u8,
-    table: []u8,
-    index_name: []u8,
+const SortedIndexRow = struct {
     encoded_key: []u8,
     doc_id: []u8,
 
-    fn deinit(self: *const IndexRow, allocator: Allocator) void {
-        allocator.free(self.namespace);
-        allocator.free(self.table);
-        allocator.free(self.index_name);
+    fn deinit(self: *const SortedIndexRow, allocator: Allocator) void {
         allocator.free(self.encoded_key);
         allocator.free(self.doc_id);
     }
 };
 
-/// Zero-dependency embedded ACID WAL + ordered index store (replaces SQLite for local dev & tests).
+fn cmpRow(a_key: []const u8, a_id: []const u8, b_key: []const u8, b_id: []const u8) std.math.Order {
+    const c = std.mem.order(u8, a_key, b_key);
+    return if (c != .eq) c else std.mem.order(u8, a_id, b_id);
+}
+
+fn lowerBoundKeyDoc(items: []const SortedIndexRow, key: []const u8, doc_id: []const u8) usize {
+    var lo: usize = 0;
+    var hi: usize = items.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (cmpRow(items[mid].encoded_key, items[mid].doc_id, key, doc_id) == .lt) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+fn lowerBoundKeyOnly(items: []const SortedIndexRow, key: []const u8, inclusive: bool) usize {
+    var lo: usize = 0;
+    var hi: usize = items.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const ord = std.mem.order(u8, items[mid].encoded_key, key);
+        const go_right = if (inclusive) ord == .lt else (ord == .lt or ord == .eq);
+        if (go_right) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+fn upperBoundKeyOnly(items: []const SortedIndexRow, key: []const u8, inclusive: bool) usize {
+    var lo: usize = 0;
+    var hi: usize = items.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const ord = std.mem.order(u8, items[mid].encoded_key, key);
+        const go_right = if (inclusive) (ord == .lt or ord == .eq) else ord == .lt;
+        if (go_right) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+/// Zero-dependency embedded ACID WAL + partitioned $O(\log N)$ ordered index store.
 ///
-/// - Persists every committed mutation as an append-only newline-delimited JSON record in `wal_path`
-///   and replays it cleanly on startup.
+/// - Persists every committed mutation as an append-only CRC32-framed JSON record in `wal_path`
+///   using a persistent open file handle, with atomic snapshot compaction.
 /// - Enforces serializable OCC conflict checks against `commit_log` and maintains both pre-image
 ///   and post-image index keys in every `WriteSet`.
 pub const WalStore = struct {
@@ -37,11 +82,13 @@ pub const WalStore = struct {
     io: std.Io,
     mutex: std.Io.Mutex = .init,
     wal_path: ?[]u8,
+    wal_file: ?std.Io.File = null,
+    wal_file_size: u64 = 0,
     latest_ts: i64 = 0,
     /// Keyed by `"<namespace>\x1f<table>\x1f<doc_id>"` -> owned Document.
     docs: std.StringHashMapUnmanaged(Document) = .empty,
-    /// Secondary index entries (kept sorted by encoded_key + doc_id on scan).
-    indexes: std.ArrayList(IndexRow) = .empty,
+    /// Partitioned secondary indexes keyed by `"<ns>\x1f<table>\x1f<index_name>"` -> sorted rows.
+    index_buckets: std.StringHashMapUnmanaged(std.ArrayList(SortedIndexRow)) = .empty,
     /// Monotonic commit log for OCC conflict checks and cross-instance tailing.
     commit_log: std.ArrayList(CommitEntry) = .empty,
     /// Number of WAL records appended since the last atomic compaction.
@@ -81,6 +128,7 @@ pub const WalStore = struct {
     }
 
     pub fn deinit(self: *WalStore) void {
+        if (self.wal_file) |f| f.close(self.io);
         if (self.wal_path) |p| self.allocator.free(p);
         var it = self.docs.iterator();
         while (it.next()) |entry| {
@@ -88,8 +136,13 @@ pub const WalStore = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.docs.deinit(self.allocator);
-        for (self.indexes.items) |*row| row.deinit(self.allocator);
-        self.indexes.deinit(self.allocator);
+        var bit = self.index_buckets.iterator();
+        while (bit.next()) |b| {
+            self.allocator.free(b.key_ptr.*);
+            for (b.value_ptr.items) |*row| row.deinit(self.allocator);
+            b.value_ptr.deinit(self.allocator);
+        }
+        self.index_buckets.deinit(self.allocator);
         for (self.commit_log.items) |*ce| ce.deinit(self.allocator);
         self.commit_log.deinit(self.allocator);
         self.allocator.destroy(self);
@@ -120,9 +173,10 @@ pub const WalStore = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        const k = try makeDocKey(self.allocator, ns, table, doc_id);
-        defer self.allocator.free(k);
-        if (self.docs.get(k)) |doc| {
+        var stack_buf: [256]u8 = undefined;
+        const k = try formatKey3Buf(&stack_buf, self.allocator, ns, table, doc_id);
+        defer if (k.owned) self.allocator.free(k.slice);
+        if (self.docs.get(k.slice)) |doc| {
             return try doc.clone(allocator);
         }
         return null;
@@ -132,63 +186,50 @@ pub const WalStore = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        const range = readset_mod.IndexRangeRead{
-            .namespace = @constCast(query.namespace),
-            .table = @constCast(query.table),
-            .index_name = @constCast(query.index_name),
-            .start = query.start,
-            .end = query.end,
+        var bucket_buf: [256]u8 = undefined;
+        const bk = try formatKey3Buf(&bucket_buf, self.allocator, query.namespace, query.table, query.index_name);
+        defer if (bk.owned) self.allocator.free(bk.slice);
+
+        const bucket = self.index_buckets.getPtr(bk.slice) orelse return try allocator.alloc(Document, 0);
+        const rows = bucket.items;
+        if (rows.len == 0) return try allocator.alloc(Document, 0);
+
+        const lo: usize = switch (query.start) {
+            .unbounded => 0,
+            .included => |k| lowerBoundKeyOnly(rows, k, true),
+            .excluded => |k| lowerBoundKeyOnly(rows, k, false),
         };
-
-        const Match = struct {
-            encoded_key: []const u8,
-            doc_id: []const u8,
-            doc: *const Document,
+        const hi: usize = switch (query.end) {
+            .unbounded => rows.len,
+            .included => |k| upperBoundKeyOnly(rows, k, true),
+            .excluded => |k| upperBoundKeyOnly(rows, k, false),
         };
+        if (lo >= hi) return try allocator.alloc(Document, 0);
 
-        var matches: std.ArrayList(Match) = .empty;
-        defer matches.deinit(self.allocator);
-
-        for (self.indexes.items) |*row| {
-            if (!std.mem.eql(u8, row.namespace, query.namespace)) continue;
-            if (!std.mem.eql(u8, row.table, query.table)) continue;
-            if (!std.mem.eql(u8, row.index_name, query.index_name)) continue;
-            if (!range.containsKey(row.encoded_key)) continue;
-
-            const dk = try makeDocKey(self.allocator, row.namespace, row.table, row.doc_id);
-            defer self.allocator.free(dk);
-            if (self.docs.getPtr(dk)) |doc_ptr| {
-                try matches.append(self.allocator, .{
-                    .encoded_key = row.encoded_key,
-                    .doc_id = row.doc_id,
-                    .doc = doc_ptr,
-                });
-            }
-        }
-
-        const SortCtx = struct {
-            order: storage_mod.QueryOrder,
-            fn lessThan(ctx: @This(), a: Match, b: Match) bool {
-                const cmp = std.mem.order(u8, a.encoded_key, b.encoded_key);
-                const ord = if (cmp != .eq) cmp else std.mem.order(u8, a.doc_id, b.doc_id);
-                return switch (ctx.order) {
-                    .asc => ord == .lt,
-                    .desc => ord == .gt,
-                };
-            }
-        };
-        std.mem.sort(Match, matches.items, SortCtx{ .order = query.order }, SortCtx.lessThan);
-
-        const count = if (query.limit) |lim| @min(lim, matches.items.len) else matches.items.len;
+        const span = rows[lo..hi];
+        const count = if (query.limit) |lim| @min(lim, span.len) else span.len;
         var out = try allocator.alloc(Document, count);
         var built: usize = 0;
         errdefer {
             for (out[0..built]) |*d| d.deinit(allocator);
             allocator.free(out);
         }
-        for (matches.items[0..count], 0..) |m, i| {
-            out[i] = try m.doc.clone(allocator);
-            built += 1;
+
+        var doc_buf: [256]u8 = undefined;
+        for (0..count) |i| {
+            const row = switch (query.order) {
+                .asc => &span[i],
+                .desc => &span[span.len - 1 - i],
+            };
+            const dk = try formatKey3Buf(&doc_buf, self.allocator, query.namespace, query.table, row.doc_id);
+            defer if (dk.owned) self.allocator.free(dk.slice);
+            if (self.docs.getPtr(dk.slice)) |doc_ptr| {
+                out[built] = try doc_ptr.clone(allocator);
+                built += 1;
+            }
+        }
+        if (built < count) {
+            return try allocator.realloc(out, built);
         }
         return out;
     }
@@ -366,6 +407,11 @@ pub const WalStore = struct {
             file.sync(self.io) catch {};
         }
 
+        if (self.wal_file) |f| {
+            f.close(self.io);
+            self.wal_file = null;
+            self.wal_file_size = 0;
+        }
         std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, self.io) catch
             return storage_mod.StorageError.StorageFailure;
         self.wal_records_since_compact = 0;
@@ -468,13 +514,24 @@ pub const WalStore = struct {
             self.allocator.free(entries);
         }
         for (entries) |e| {
-            try self.indexes.append(self.allocator, .{
-                .namespace = try self.allocator.dupe(u8, ns),
-                .table = try self.allocator.dupe(u8, table),
-                .index_name = try self.allocator.dupe(u8, e.index_name),
+            var kbuf: [256]u8 = undefined;
+            const bk = try formatKey3Buf(&kbuf, self.allocator, ns, table, e.index_name);
+            defer if (bk.owned) self.allocator.free(bk.slice);
+
+            const bucket = blk: {
+                if (self.index_buckets.getPtr(bk.slice)) |ptr| break :blk ptr;
+                const owned_bk = try self.allocator.dupe(u8, bk.slice);
+                errdefer self.allocator.free(owned_bk);
+                try self.index_buckets.put(self.allocator, owned_bk, .empty);
+                break :blk self.index_buckets.getPtr(owned_bk).?;
+            };
+
+            const pos = lowerBoundKeyDoc(bucket.items, e.encoded_key, doc.id);
+            const row = SortedIndexRow{
                 .encoded_key = try self.allocator.dupe(u8, e.encoded_key),
                 .doc_id = try self.allocator.dupe(u8, doc.id),
-            });
+            };
+            try bucket.insert(self.allocator, pos, row);
             if (write_set) |ws| {
                 try ws.recordIndexKey(self.allocator, ns, table, e.index_name, e.encoded_key);
             }
@@ -494,28 +551,32 @@ pub const WalStore = struct {
             for (old_entries) |*e| e.deinit(self.allocator);
             self.allocator.free(old_entries);
         }
+        var kbuf: [256]u8 = undefined;
         for (old_entries) |e| {
             try write_set.recordIndexKey(self.allocator, ns, table, e.index_name, e.encoded_key);
-        }
-
-        var i: usize = 0;
-        while (i < self.indexes.items.len) {
-            const row = &self.indexes.items[i];
-            if (std.mem.eql(u8, row.namespace, ns) and
-                std.mem.eql(u8, row.table, table) and
-                std.mem.eql(u8, row.doc_id, doc.id))
-            {
-                row.deinit(self.allocator);
-                _ = self.indexes.swapRemove(i);
-            } else {
-                i += 1;
+            const bk = try formatKey3Buf(&kbuf, self.allocator, ns, table, e.index_name);
+            defer if (bk.owned) self.allocator.free(bk.slice);
+            if (self.index_buckets.getPtr(bk.slice)) |bucket| {
+                const pos = lowerBoundKeyDoc(bucket.items, e.encoded_key, doc.id);
+                if (pos < bucket.items.len and
+                    std.mem.eql(u8, bucket.items[pos].encoded_key, e.encoded_key) and
+                    std.mem.eql(u8, bucket.items[pos].doc_id, doc.id))
+                {
+                    bucket.items[pos].deinit(self.allocator);
+                    _ = bucket.orderedRemove(pos);
+                }
             }
         }
     }
 
     fn rebuildIndexesLocked(self: *WalStore, manifest: *const manifest_mod.AppManifest) !void {
-        for (self.indexes.items) |*row| row.deinit(self.allocator);
-        self.indexes.clearRetainingCapacity();
+        var bit = self.index_buckets.iterator();
+        while (bit.next()) |b| {
+            self.allocator.free(b.key_ptr.*);
+            for (b.value_ptr.items) |*row| row.deinit(self.allocator);
+            b.value_ptr.deinit(self.allocator);
+        }
+        self.index_buckets.clearRetainingCapacity();
 
         var it = self.docs.iterator();
         while (it.next()) |entry| {
@@ -586,15 +647,22 @@ pub const WalStore = struct {
         defer line.deinit();
         try line.writer.print("{x:0>8}|{s}\n", .{ crc, payload.written() });
 
-        const file = std.Io.Dir.cwd().createFile(self.io, path, .{
-            .truncate = false,
-            .read = true,
-        }) catch return storage_mod.StorageError.StorageFailure;
-        defer file.close(self.io);
-
-        const stat = file.stat(self.io) catch return storage_mod.StorageError.StorageFailure;
-        file.writePositionalAll(self.io, line.written(), stat.size) catch
+        if (self.wal_file == null) {
+            const f = std.Io.Dir.cwd().createFile(self.io, path, .{
+                .truncate = false,
+                .read = true,
+            }) catch return storage_mod.StorageError.StorageFailure;
+            const st = f.stat(self.io) catch {
+                f.close(self.io);
+                return storage_mod.StorageError.StorageFailure;
+            };
+            self.wal_file = f;
+            self.wal_file_size = st.size;
+        }
+        const file = self.wal_file.?;
+        file.writePositionalAll(self.io, line.written(), self.wal_file_size) catch
             return storage_mod.StorageError.StorageFailure;
+        self.wal_file_size += line.written().len;
         file.sync(self.io) catch {};
     }
 
@@ -806,14 +874,21 @@ pub const WalStore = struct {
             }
         }
 
-        for (self.indexes.items) |row| {
-            const sig = try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{x}", .{
-                row.namespace, row.table, row.index_name, row.doc_id, row.encoded_key,
-            });
-            defer allocator.free(sig);
-            const cnt = expected.getPtr(sig) orelse return error.IndexIntegrityViolation;
-            if (cnt.* == 0) return error.IndexIntegrityViolation;
-            cnt.* -= 1;
+        var bit = self.index_buckets.iterator();
+        while (bit.next()) |b| {
+            var bparts = std.mem.splitScalar(u8, b.key_ptr.*, 0x1F);
+            const b_ns = bparts.next() orelse continue;
+            const b_tbl = bparts.next() orelse continue;
+            const b_idx = bparts.next() orelse continue;
+            for (b.value_ptr.items) |row| {
+                const sig = try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{x}", .{
+                    b_ns, b_tbl, b_idx, row.doc_id, row.encoded_key,
+                });
+                defer allocator.free(sig);
+                const cnt = expected.getPtr(sig) orelse return error.IndexIntegrityViolation;
+                if (cnt.* == 0) return error.IndexIntegrityViolation;
+                cnt.* -= 1;
+            }
         }
 
         var eit = expected.valueIterator();
@@ -831,6 +906,24 @@ fn jsonStrField(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
 fn jsonIntField(obj: std.json.ObjectMap, name: []const u8) ?i64 {
     const v = obj.get(name) orelse return null;
     return if (v == .integer) v.integer else null;
+}
+
+const KeySlice = struct {
+    slice: []const u8,
+    owned: bool,
+};
+
+fn formatKey3Buf(buf: []u8, allocator: Allocator, a: []const u8, b: []const u8, c: []const u8) !KeySlice {
+    const needed = a.len + 1 + b.len + 1 + c.len;
+    if (needed <= buf.len) {
+        @memcpy(buf[0..a.len], a);
+        buf[a.len] = 0x1F;
+        @memcpy(buf[a.len + 1 .. a.len + 1 + b.len], b);
+        buf[a.len + 1 + b.len] = 0x1F;
+        @memcpy(buf[a.len + 2 + b.len .. needed], c);
+        return .{ .slice = buf[0..needed], .owned = false };
+    }
+    return .{ .slice = try makeDocKey(allocator, a, b, c), .owned = true };
 }
 
 fn makeDocKey(allocator: Allocator, ns: []const u8, table: []const u8, doc_id: []const u8) ![]u8 {

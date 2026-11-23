@@ -143,21 +143,40 @@ pub const HttpRequest = struct {
 };
 
 pub fn readHttpRequest(allocator: Allocator, reader: *std.Io.Reader) !?HttpRequest {
-    var head: std.ArrayList(u8) = .empty;
-    defer head.deinit(allocator);
+    var stack_head: [8192]u8 = undefined;
+    var stack_len: usize = 0;
+    var heap_head: std.ArrayList(u8) = .empty;
+    defer heap_head.deinit(allocator);
+    var use_heap = false;
 
     var found_end = false;
-    while (head.items.len < 64 * 1024) {
+    while (true) {
+        const cur_len = if (use_heap) heap_head.items.len else stack_len;
+        if (cur_len >= 64 * 1024) break;
         const b = reader.takeByte() catch return null;
-        try head.append(allocator, b);
-        if (head.items.len >= 4 and std.mem.eql(u8, head.items[head.items.len - 4 ..], "\r\n\r\n")) {
+        if (!use_heap) {
+            if (stack_len < stack_head.len) {
+                stack_head[stack_len] = b;
+                stack_len += 1;
+                if (stack_len >= 4 and std.mem.eql(u8, stack_head[stack_len - 4 .. stack_len], "\r\n\r\n")) {
+                    found_end = true;
+                    break;
+                }
+                continue;
+            }
+            use_heap = true;
+            try heap_head.appendSlice(allocator, stack_head[0..stack_len]);
+        }
+        try heap_head.append(allocator, b);
+        if (heap_head.items.len >= 4 and std.mem.eql(u8, heap_head.items[heap_head.items.len - 4 ..], "\r\n\r\n")) {
             found_end = true;
             break;
         }
     }
     if (!found_end) return error.HeadersTooLarge;
 
-    var lines = std.mem.splitSequence(u8, head.items[0 .. head.items.len - 4], "\r\n");
+    const head_bytes = if (use_heap) heap_head.items[0 .. heap_head.items.len - 4] else stack_head[0 .. stack_len - 4];
+    var lines = std.mem.splitSequence(u8, head_bytes, "\r\n");
     const req_line = lines.next() orelse return null;
     var req_parts = std.mem.splitScalar(u8, req_line, ' ');
     const method_raw = req_parts.next() orelse return null;
@@ -283,14 +302,19 @@ fn handleConnection(
         .operator_token = operator_token,
     };
 
+    var req_arena = std.heap.ArenaAllocator.init(allocator);
+    defer req_arena.deinit();
+
     var first_req = true;
     while (true) {
         if (shutdown_flag) |sf| {
             if (sf.load(.acquire)) break;
         }
-        const maybe_req = readHttpRequest(allocator, &sr.interface) catch return;
+        defer _ = req_arena.reset(.retain_capacity);
+        const ra = req_arena.allocator();
+
+        const maybe_req = readHttpRequest(ra, &sr.interface) catch return;
         const req = maybe_req orelse return;
-        defer req.deinit(allocator);
 
         // Seamless HTTP/2 (`h2c` prior knowledge) upgrade on first request preface
         if (first_req and req.is_h2_preface) {
@@ -305,8 +329,7 @@ fn handleConnection(
         // WebSocket upgrade on `/ws`
         if (req.upgrade_ws and std.mem.eql(u8, req.path, "/ws")) {
             const key = req.ws_key orelse {
-                const err_resp = makePlainResponse(allocator, 400, "text/plain", "missing Sec-WebSocket-Key") catch return;
-                defer err_resp.deinit(allocator);
+                const err_resp = makePlainResponse(ra, 400, "text/plain", "missing Sec-WebSocket-Key") catch return;
                 engine.metrics.recordHttpStatus(400);
                 writeHttp1Response(io, stream, &err_resp, false);
                 return;
@@ -330,8 +353,7 @@ fn handleConnection(
         }
 
         const h2_view = req.asH2View();
-        const resp = dispatchHttpRequest(allocator, io, engine, static_dir, admin_key, operator_token, &h2_view);
-        defer resp.deinit(allocator);
+        const resp = dispatchHttpRequest(ra, io, engine, static_dir, admin_key, operator_token, &h2_view);
 
         const shutting_down = if (shutdown_flag) |sf| sf.load(.acquire) else false;
         const keep_conn = req.keep_alive and !shutting_down and resp.status < 400;
@@ -646,33 +668,32 @@ fn dispatchHttpRequestInner(
 }
 
 fn serveEmbeddedAsset(
-    allocator: Allocator,
+    _: Allocator,
     asset: *const assets.Asset,
     want_gzip: bool,
     if_none_match: ?[]const u8,
 ) http2.H2Response {
-    const etag_copy = allocator.dupe(u8, asset.etag) catch null;
     if (compress.etagMatches(if_none_match, asset.etag)) {
         return .{
             .status = 304,
             .content_type = asset.content_type,
-            .body = allocator.alloc(u8, 0) catch &.{},
-            .etag = etag_copy,
+            .body = &.{},
+            .body_owned = false,
+            .etag = @constCast(asset.etag),
+            .etag_owned = false,
             .cache_control = "public, max-age=3600",
         };
     }
     const use_gz = want_gzip and asset.gzip.len < asset.raw.len;
     const payload = if (use_gz) asset.gzip else asset.raw;
-    const body = allocator.dupe(u8, payload) catch {
-        if (etag_copy) |e| allocator.free(e);
-        return makeEmptyResponse(500, "text/plain");
-    };
     return .{
         .status = 200,
         .content_type = asset.content_type,
-        .body = body,
+        .body = @constCast(payload),
+        .body_owned = false,
         .content_encoding = if (use_gz) "gzip" else null,
-        .etag = etag_copy,
+        .etag = @constCast(asset.etag),
+        .etag_owned = false,
         .cache_control = "public, max-age=3600",
     };
 }
@@ -682,6 +703,7 @@ fn makeEmptyResponse(status: u16, content_type: []const u8) http2.H2Response {
         .status = status,
         .content_type = content_type,
         .body = &.{},
+        .body_owned = false,
     };
 }
 
@@ -749,9 +771,7 @@ fn buildDocsJsonResponse(allocator: Allocator, docs: []const storage_mod.Documen
     out.writer.writeByte('[') catch return makeEmptyResponse(500, "application/json");
     for (docs, 0..) |*d, i| {
         if (i > 0) out.writer.writeByte(',') catch return makeEmptyResponse(500, "application/json");
-        const wj = d.toWireJson(allocator) catch return makeEmptyResponse(500, "application/json");
-        defer allocator.free(wj);
-        out.writer.writeAll(wj) catch return makeEmptyResponse(500, "application/json");
+        d.writeWireJson(&out.writer) catch return makeEmptyResponse(500, "application/json");
     }
     out.writer.writeByte(']') catch return makeEmptyResponse(500, "application/json");
     return makeResponse(allocator, 200, "application/json", out.written(), want_gzip);
@@ -869,7 +889,7 @@ fn writeHttp1Response(
     resp: *const http2.H2Response,
     keep_alive: bool,
 ) void {
-    var wbuf: [4096]u8 = undefined;
+    var wbuf: [16384]u8 = undefined;
     var sw = stream.writer(io, &wbuf);
     const w = &sw.interface;
     w.print(
@@ -919,9 +939,13 @@ fn handleWebSocket(
         engine.unregisterClient(client_id);
     }
 
+    var ws_arena = std.heap.ArenaAllocator.init(allocator);
+    defer ws_arena.deinit();
+
     while (true) {
-        const frame = ws_mod.readFrame(allocator, reader) catch break;
-        defer frame.deinit(allocator);
+        defer _ = ws_arena.reset(.retain_capacity);
+        const wa = ws_arena.allocator();
+        const frame = ws_mod.readFrame(wa, reader) catch break;
 
         switch (frame) {
             .close => break,
@@ -930,23 +954,19 @@ fn handleWebSocket(
             },
             .pong => {},
             .text => |text| {
-                handleWsText(allocator, engine, client_id, &sender, text);
+                handleWsText(wa, engine, client_id, &sender, text);
             },
         }
     }
 }
 
 fn handleWsText(
-    allocator: Allocator,
+    a: Allocator,
     engine: *engine_mod.ConcaveEngine,
     client_id: u64,
     sender: *ws_mod.WsSender,
     text: []const u8,
 ) void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch {
         sender.sendText("{\"type\":\"error\",\"message\":\"invalid JSON frame\"}") catch {};
         return;
@@ -959,7 +979,7 @@ fn handleWsText(
     if (std.mem.eql(u8, msg_type, "authenticate")) {
         const tok: ?[]const u8 = if (parsed.object.get("token")) |tv| (if (tv == .string) tv.string else null) else null;
         const resp = engine.authenticateClient(client_id, tok) catch return;
-        defer allocator.free(resp);
+        defer engine.allocator.free(resp);
         sender.sendText(resp) catch {};
     } else if (std.mem.eql(u8, msg_type, "subscribe")) {
         const sub_id = jsonStringField(parsed.object, "sub_id") orelse return;
@@ -980,14 +1000,10 @@ fn handleWsText(
         else
             "{}";
 
-        var auth_copy = engine.cloneClientAuth(allocator, client_id);
-        defer if (auth_copy) |*ac| ac.deinit(allocator);
+        var auth_copy = engine.cloneClientAuth(a, client_id);
+        const mres = engine.executeMutation(a, name, args_json, if (auth_copy) |*ac| ac else null) catch return;
 
-        const mres = engine.executeMutation(allocator, name, args_json, if (auth_copy) |*ac| ac else null) catch return;
-        defer mres.deinit(allocator);
-
-        var out: std.Io.Writer.Allocating = .init(allocator);
-        defer out.deinit();
+        var out: std.Io.Writer.Allocating = .init(a);
         const w = &out.writer;
         w.writeAll("{\"type\":\"mutation_result\",\"req_id\":") catch return;
         storage_mod.writeJsonString(w, req_id) catch return;
@@ -1012,14 +1028,10 @@ fn handleWsText(
         else
             "{}";
 
-        var auth_copy = engine.cloneClientAuth(allocator, client_id);
-        defer if (auth_copy) |*ac| ac.deinit(allocator);
+        var auth_copy = engine.cloneClientAuth(a, client_id);
+        const res = engine.executeAction(a, name, args_json, if (auth_copy) |*ac| ac else null) catch return;
 
-        const res = engine.executeAction(allocator, name, args_json, if (auth_copy) |*ac| ac else null) catch return;
-        defer res.deinit(allocator);
-
-        var out: std.Io.Writer.Allocating = .init(allocator);
-        defer out.deinit();
+        var out: std.Io.Writer.Allocating = .init(a);
         const w = &out.writer;
         w.writeAll("{\"type\":\"action_result\",\"req_id\":") catch return;
         storage_mod.writeJsonString(w, req_id) catch return;
@@ -1038,8 +1050,7 @@ fn handleWsText(
         sender.sendText(out.written()) catch {};
     } else if (std.mem.eql(u8, msg_type, "ping")) {
         const ts: i64 = if (parsed.object.get("ts")) |tv| (if (tv == .integer) tv.integer else 0) else 0;
-        const pong = std.fmt.allocPrint(allocator, "{{\"type\":\"pong\",\"ts\":{d}}}", .{ts}) catch return;
-        defer allocator.free(pong);
+        const pong = std.fmt.allocPrint(a, "{{\"type\":\"pong\",\"ts\":{d}}}", .{ts}) catch return;
         sender.sendText(pong) catch {};
     }
 }

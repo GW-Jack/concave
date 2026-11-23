@@ -40,12 +40,8 @@ pub const Document = struct {
         allocator.free(self.body_json);
     }
 
-    /// Merge system fields (`id`, `created_at`) into the document's JSON object representation.
-    pub fn toWireJson(self: *const Document, allocator: Allocator) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(allocator);
-        errdefer out.deinit();
-        const w = &out.writer;
-
+    /// Stream the merged wire JSON (`id`, `created_at`, plus body fields) directly into `w` with zero temp allocations.
+    pub fn writeWireJson(self: *const Document, w: *std.Io.Writer) !void {
         const trimmed = std.mem.trim(u8, self.body_json, " \t\r\n");
         try w.writeAll("{\"id\":");
         try writeJsonString(w, self.id);
@@ -61,6 +57,13 @@ pub const Document = struct {
             try w.writeAll(trimmed);
         }
         try w.writeByte('}');
+    }
+
+    /// Merge system fields (`id`, `created_at`) into the document's JSON object representation.
+    pub fn toWireJson(self: *const Document, allocator: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        try self.writeWireJson(&out.writer);
         return try out.toOwnedSlice();
     }
 };

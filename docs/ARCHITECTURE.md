@@ -58,7 +58,7 @@ This document captures the technical architecture of **Concave**, a **zero-depen
 
 Storage is abstracted behind a unified `Storage` union (`zig/core/storage.zig`) with two zero-dependency implementations:
 
-- **`WalStore` (`zig/core/wal_store.zig`)**: Embedded crash-safe append-only write-ahead log + ordered in-memory document & index store for zero-config local dev (`concave dev`) and single-node deployments. Every WAL frame is `<8-hex-crc32>|<json>\n` with torn-write truncation safety, atomic snapshot compaction (`<path>.compact.tmp` -> `fsync` -> `rename`), and a bounded sliding-window `commit_log`.
+- **`WalStore` (`zig/core/wal_store.zig`)**: Embedded crash-safe append-only write-ahead log + partitioned $O(\log N)$ binary-searched ordered indexes for zero-config local dev (`concave dev`) and single-node deployments. Uses a persistent open WAL file handle with `<8-hex-crc32>|<json>\n` framing, torn-write truncation safety, atomic snapshot compaction (`<path>.compact.tmp` -> `fsync` -> `rename`), and a bounded sliding-window `commit_log`.
 - **`PgStore` (`zig/core/pg_wire.zig`)**: Production and horizontal cloud deployments speaking **PostgreSQL Wire Protocol v3** directly over TCP or **TLS 1.3** (`std.crypto.tls.Client`, `sslmode=disable|require|verify-ca|verify-full`), with **SCRAM-SHA-256** (including mutual server signature verification), MD5, and Cleartext auth. Uses a thread-safe **bounded connection pool** (`CONCAVE_PG_MAX_CONNECTIONS`, default `8`) with automatic unhealthy-connection eviction and retry, compatible with standard Postgres, Neon, and PgBouncer transaction-mode poolers.
 
 ### Core 3-Table Schema
@@ -98,6 +98,7 @@ Every table includes `deployment_id` as the leading key so multi-tenant deployme
 
 ## 5. Client Runtime, Dashboard & CLI
 
-- **Bespoke Client Runtime (`client/concave-client`)**: Embedded at `/_concave/{index,signals,client,dom}.js` — glitch-free push-pull signals, automatic resubscription, optimistic update reconciliation, and surgical DOM helpers (`el`, `each`, `show`, `mount`).
+- **Bespoke Client Runtime (`client/concave-client`)**: Bundled, minified, and pre-gzipped at build time (`zig/tools/minify_assets.zig`) into a single **4.6 KB gzipped** zero-waterfall ESM file at `/_concave/index.js` with strong SHA-256 `ETag`/`304` caching — glitch-free push-pull signals, automatic resubscription, optimistic update reconciliation, and surgical DOM helpers (`el`, `each`, `show`, `mount`).
+- **Unified Multi-Protocol Transport (`server.zig`, `http2.zig`, `compress.zig`)**: Serves HTTP/1.1 Keep-Alive, HTTP/2 (`h2c` prior knowledge with RFC 7541 HPACK + comptime Huffman trie), and RFC 6455 WebSockets (`/ws`) on the same port with `TCP_NODELAY`, zero-copy pre-gzipped assets, and dynamic gzip compression.
 - **Embedded Live Dev Dashboard (`client/concave-dashboard`)**: Embedded at `/_dashboard` — real-time stats, Data Browser, Function Runner + live WS subscriptions, Scheduler/Crons monitor, and HTTP Route tester.
 - **Zero-Dep CLI (`zig/cli/main.zig`)**: `concave init`, `concave dev` (hot-reload + codegen + serve), `concave codegen`, and `concave build`.

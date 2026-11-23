@@ -17,6 +17,7 @@ pub const TxContext = struct {
     manifest: *const manifest_mod.AppManifest,
     snapshot_ts: i64,
     read_only: bool,
+    track_reads: bool = true,
     read_set: readset_mod.ReadSet = .{},
     writes: std.ArrayList(WriteOp) = .empty,
     /// Overlay keyed by `"<ns>\x1f<table>\x1f<id>"` -> `?Document` (`null` means deleted in this tx).
@@ -53,25 +54,34 @@ pub const TxContext = struct {
     }
 
     pub fn get(self: *TxContext, allocator: Allocator, ns: []const u8, table: []const u8, doc_id: []const u8) !?Document {
-        try self.read_set.recordDocRead(self.allocator, ns, table, doc_id);
-        const key = try makeKey(self.allocator, ns, table, doc_id);
-        defer self.allocator.free(key);
-
-        if (self.pending_docs.get(key)) |maybe_doc| {
-            return if (maybe_doc) |d| try d.clone(allocator) else null;
+        if (self.track_reads) {
+            try self.read_set.recordDocRead(self.allocator, ns, table, doc_id);
+        }
+        if (self.pending_docs.count() > 0) {
+            const key = try makeKey(self.allocator, ns, table, doc_id);
+            defer self.allocator.free(key);
+            if (self.pending_docs.get(key)) |maybe_doc| {
+                return if (maybe_doc) |d| try d.clone(allocator) else null;
+            }
         }
         return try self.storage.getDoc(allocator, ns, table, doc_id);
     }
 
     pub fn scanIndex(self: *TxContext, allocator: Allocator, query: *const IndexQuery) ![]Document {
-        try self.read_set.recordIndexRange(
-            self.allocator,
-            query.namespace,
-            query.table,
-            query.index_name,
-            query.start,
-            query.end,
-        );
+        if (self.track_reads) {
+            try self.read_set.recordIndexRange(
+                self.allocator,
+                query.namespace,
+                query.table,
+                query.index_name,
+                query.start,
+                query.end,
+            );
+        }
+
+        if (self.pending_docs.count() == 0) {
+            return try self.storage.scanIndex(allocator, query);
+        }
 
         const prefix = try std.fmt.allocPrint(self.allocator, "{s}\x1f{s}\x1f", .{ query.namespace, query.table });
         defer self.allocator.free(prefix);

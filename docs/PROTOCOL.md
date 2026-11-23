@@ -1,6 +1,6 @@
 # Concave Wire Protocol & HTTP Reference
 
-Concave exposes a unified HTTP/1.1 + RFC 6455 WebSocket server from every compiled native binary.
+Concave exposes a unified **HTTP/1.1 Keep-Alive + HTTP/2 (`h2c` prior knowledge) + RFC 6455 WebSocket** server on the same port from every compiled native binary, with automatic `Content-Encoding: gzip` and `ETag` / `304 Not Modified` caching.
 
 ---
 

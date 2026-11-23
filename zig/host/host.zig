@@ -75,6 +75,16 @@ var g_roc_mutex: std.Io.Mutex = .init;
 threadlocal var t_roc_lock_depth: usize = 0;
 threadlocal var t_env_stack: [16]*engine_mod.ExecutionEnv = undefined;
 threadlocal var t_env_depth: usize = 0;
+threadlocal var t_host_arena_inited: bool = false;
+threadlocal var t_host_arena: std.heap.ArenaAllocator = undefined;
+
+fn getThreadArena() *std.heap.ArenaAllocator {
+    if (!t_host_arena_inited) {
+        t_host_arena = std.heap.ArenaAllocator.init(g_alloc);
+        t_host_arena_inited = true;
+    }
+    return &t_host_arena;
+}
 
 fn currentEnv() ?*engine_mod.ExecutionEnv {
     if (t_env_depth == 0) return null;
@@ -88,12 +98,24 @@ fn takeRocStr(alloc: Allocator, s: RocStr) ![]u8 {
 }
 
 fn wireOk(payload: []const u8) RocStr {
+    var stack: [4096]u8 = undefined;
+    if (3 + payload.len <= stack.len) {
+        @memcpy(stack[0..3], "OK:");
+        @memcpy(stack[3 .. 3 + payload.len], payload);
+        return RocStr.fromSlice(stack[0 .. 3 + payload.len], &g_roc_host);
+    }
     const full = std.fmt.allocPrint(g_alloc, "OK:{s}", .{payload}) catch return RocStr.fromSlice("ERR:oom", &g_roc_host);
     defer g_alloc.free(full);
     return RocStr.fromSlice(full, &g_roc_host);
 }
 
 fn wireErr(msg: []const u8) RocStr {
+    var stack: [1024]u8 = undefined;
+    if (4 + msg.len <= stack.len) {
+        @memcpy(stack[0..4], "ERR:");
+        @memcpy(stack[4 .. 4 + msg.len], msg);
+        return RocStr.fromSlice(stack[0 .. 4 + msg.len], &g_roc_host);
+    }
     const full = std.fmt.allocPrint(g_alloc, "ERR:{s}", .{msg}) catch return RocStr.fromSlice("ERR:oom", &g_roc_host);
     defer g_alloc.free(full);
     return RocStr.fromSlice(full, &g_roc_host);
@@ -114,15 +136,12 @@ fn unwrapRocWire(allocator: Allocator, raw: []const u8) engine_mod.ExecResult {
 // =============================================================================
 
 export fn roc_host_db_get(ns_raw: RocStr, table_raw: RocStr, id_raw: RocStr) callconv(.c) RocStr {
-    const ns = takeRocStr(g_alloc, ns_raw) catch return wireErr("oom");
-    defer g_alloc.free(ns);
-    const table = takeRocStr(g_alloc, table_raw) catch return wireErr("oom");
-    defer g_alloc.free(table);
-    const doc_id = takeRocStr(g_alloc, id_raw) catch return wireErr("oom");
-    defer g_alloc.free(doc_id);
+    defer ns_raw.decref(&g_roc_host);
+    defer table_raw.decref(&g_roc_host);
+    defer id_raw.decref(&g_roc_host);
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
-    const maybe_doc = env.dbGet(g_alloc, ns, table, doc_id) catch |err| return wireErr(@errorName(err));
+    const maybe_doc = env.dbGet(g_alloc, ns_raw.asSlice(), table_raw.asSlice(), id_raw.asSlice()) catch |err| return wireErr(@errorName(err));
     if (maybe_doc) |doc| {
         defer doc.deinit(g_alloc);
         const wire = doc.toWireJson(g_alloc) catch return wireErr("serialization failed");
@@ -160,13 +179,13 @@ fn parseWireBound(alloc: Allocator, val: std.json.Value) !readset_mod.KeyBound {
 }
 
 export fn roc_host_db_query(req_raw: RocStr) callconv(.c) RocStr {
-    const req_json = takeRocStr(g_alloc, req_raw) catch return wireErr("oom");
-    defer g_alloc.free(req_json);
+    defer req_raw.decref(&g_roc_host);
+    const req_json = req_raw.asSlice();
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
 
-    var arena = std.heap.ArenaAllocator.init(g_alloc);
-    defer arena.deinit();
+    const arena = getThreadArena();
+    defer _ = arena.reset(.retain_capacity);
     const a = arena.allocator();
 
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, req_json, .{}) catch
@@ -195,7 +214,7 @@ export fn roc_host_db_query(req_raw: RocStr) callconv(.c) RocStr {
         if (lv == .integer and lv.integer >= 0) limit = @intCast(lv.integer);
     }
 
-    const docs = env.dbQuery(g_alloc, &.{
+    const docs = env.dbQuery(a, &.{
         .namespace = ns,
         .table = table,
         .index_name = index_name,
@@ -204,19 +223,12 @@ export fn roc_host_db_query(req_raw: RocStr) callconv(.c) RocStr {
         .order = order,
         .limit = limit,
     }) catch |err| return wireErr(@errorName(err));
-    defer {
-        for (docs) |*d| d.deinit(g_alloc);
-        g_alloc.free(docs);
-    }
 
-    var out: std.Io.Writer.Allocating = .init(g_alloc);
-    defer out.deinit();
+    var out: std.Io.Writer.Allocating = .init(a);
     out.writer.writeByte('[') catch return wireErr("oom");
     for (docs, 0..) |*d, i| {
         if (i > 0) out.writer.writeByte(',') catch return wireErr("oom");
-        const wj = d.toWireJson(g_alloc) catch return wireErr("oom");
-        defer g_alloc.free(wj);
-        out.writer.writeAll(wj) catch return wireErr("oom");
+        d.writeWireJson(&out.writer) catch return wireErr("oom");
     }
     out.writer.writeByte(']') catch return wireErr("oom");
     return wireOk(out.written());
@@ -330,59 +342,45 @@ export fn roc_host_db_search(req_raw: RocStr) callconv(.c) RocStr {
 }
 
 export fn roc_host_db_insert(ns_raw: RocStr, table_raw: RocStr, body_raw: RocStr) callconv(.c) RocStr {
-    const ns = takeRocStr(g_alloc, ns_raw) catch return wireErr("oom");
-    defer g_alloc.free(ns);
-    const table = takeRocStr(g_alloc, table_raw) catch return wireErr("oom");
-    defer g_alloc.free(table);
-    const body = takeRocStr(g_alloc, body_raw) catch return wireErr("oom");
-    defer g_alloc.free(body);
+    defer ns_raw.decref(&g_roc_host);
+    defer table_raw.decref(&g_roc_host);
+    defer body_raw.decref(&g_roc_host);
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
-    const id = env.dbInsert(g_alloc, ns, table, body) catch |err| return wireErr(@errorName(err));
+    const id = env.dbInsert(g_alloc, ns_raw.asSlice(), table_raw.asSlice(), body_raw.asSlice()) catch |err| return wireErr(@errorName(err));
     defer g_alloc.free(id);
     return wireOk(id);
 }
 
 export fn roc_host_db_patch(ns_raw: RocStr, table_raw: RocStr, id_raw: RocStr, patch_raw: RocStr) callconv(.c) RocStr {
-    const ns = takeRocStr(g_alloc, ns_raw) catch return wireErr("oom");
-    defer g_alloc.free(ns);
-    const table = takeRocStr(g_alloc, table_raw) catch return wireErr("oom");
-    defer g_alloc.free(table);
-    const doc_id = takeRocStr(g_alloc, id_raw) catch return wireErr("oom");
-    defer g_alloc.free(doc_id);
-    const patch = takeRocStr(g_alloc, patch_raw) catch return wireErr("oom");
-    defer g_alloc.free(patch);
+    defer ns_raw.decref(&g_roc_host);
+    defer table_raw.decref(&g_roc_host);
+    defer id_raw.decref(&g_roc_host);
+    defer patch_raw.decref(&g_roc_host);
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
-    env.dbPatch(ns, table, doc_id, patch) catch |err| return wireErr(@errorName(err));
+    env.dbPatch(ns_raw.asSlice(), table_raw.asSlice(), id_raw.asSlice(), patch_raw.asSlice()) catch |err| return wireErr(@errorName(err));
     return wireOk("ok");
 }
 
 export fn roc_host_db_replace(ns_raw: RocStr, table_raw: RocStr, id_raw: RocStr, body_raw: RocStr) callconv(.c) RocStr {
-    const ns = takeRocStr(g_alloc, ns_raw) catch return wireErr("oom");
-    defer g_alloc.free(ns);
-    const table = takeRocStr(g_alloc, table_raw) catch return wireErr("oom");
-    defer g_alloc.free(table);
-    const doc_id = takeRocStr(g_alloc, id_raw) catch return wireErr("oom");
-    defer g_alloc.free(doc_id);
-    const body = takeRocStr(g_alloc, body_raw) catch return wireErr("oom");
-    defer g_alloc.free(body);
+    defer ns_raw.decref(&g_roc_host);
+    defer table_raw.decref(&g_roc_host);
+    defer id_raw.decref(&g_roc_host);
+    defer body_raw.decref(&g_roc_host);
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
-    env.dbReplace(ns, table, doc_id, body) catch |err| return wireErr(@errorName(err));
+    env.dbReplace(ns_raw.asSlice(), table_raw.asSlice(), id_raw.asSlice(), body_raw.asSlice()) catch |err| return wireErr(@errorName(err));
     return wireOk("ok");
 }
 
 export fn roc_host_db_delete(ns_raw: RocStr, table_raw: RocStr, id_raw: RocStr) callconv(.c) RocStr {
-    const ns = takeRocStr(g_alloc, ns_raw) catch return wireErr("oom");
-    defer g_alloc.free(ns);
-    const table = takeRocStr(g_alloc, table_raw) catch return wireErr("oom");
-    defer g_alloc.free(table);
-    const doc_id = takeRocStr(g_alloc, id_raw) catch return wireErr("oom");
-    defer g_alloc.free(doc_id);
+    defer ns_raw.decref(&g_roc_host);
+    defer table_raw.decref(&g_roc_host);
+    defer id_raw.decref(&g_roc_host);
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
-    env.dbDelete(ns, table, doc_id) catch |err| return wireErr(@errorName(err));
+    env.dbDelete(ns_raw.asSlice(), table_raw.asSlice(), id_raw.asSlice()) catch |err| return wireErr(@errorName(err));
     return wireOk("ok");
 }
 

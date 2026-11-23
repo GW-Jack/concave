@@ -649,10 +649,8 @@ pub const ConcaveEngine = struct {
         args_json: []const u8,
         auth: ?*const auth_mod.AuthIdentity,
     ) !ExecResult {
-        var ran = self.runQueryInternal(name, args_json, auth);
-        defer ran.read_set.deinit(self.allocator);
-        defer ran.result.deinit(self.allocator);
-        return try ran.result.clone(allocator);
+        const ran = self.runQueryInternalWithOpts(allocator, name, args_json, auth, false);
+        return ran.result;
     }
 
     const InternalQueryRun = struct {
@@ -667,6 +665,17 @@ pub const ConcaveEngine = struct {
         args_json: []const u8,
         auth: ?*const auth_mod.AuthIdentity,
     ) InternalQueryRun {
+        return self.runQueryInternalWithOpts(self.allocator, name, args_json, auth, true);
+    }
+
+    fn runQueryInternalWithOpts(
+        self: *ConcaveEngine,
+        result_allocator: Allocator,
+        name: []const u8,
+        args_json: []const u8,
+        auth: ?*const auth_mod.AuthIdentity,
+        track_reads: bool,
+    ) InternalQueryRun {
         const start_us = metrics_mod.PlatformMetrics.nowMicros(self.io);
         _ = self.metrics.queries_total.fetchAdd(1, .monotonic);
 
@@ -677,31 +686,29 @@ pub const ConcaveEngine = struct {
             self.metrics.query_latency.observeUs(dur_us);
             self.metrics.logRpc(self.io, "query", name, dur_us, false, 0, @errorName(err));
             return .{
-                .result = .{ .err = std.fmt.allocPrint(self.allocator, "storage error: {s}", .{@errorName(err)}) catch &.{} },
+                .result = .{ .err = std.fmt.allocPrint(result_allocator, "storage error: {s}", .{@errorName(err)}) catch &.{} },
                 .read_set = .{},
                 .snapshot_ts = 0,
             };
         };
 
         var tx = tx_mod.TxContext.init(self.allocator, self.io, self.storage, self.manifest, snapshot_ts, true);
+        tx.track_reads = track_reads;
         defer {
             // Move read_set out before deiniting remaining tx fields.
             tx.read_set = .{};
             tx.deinit();
         }
 
-        const auth_clone = if (auth) |a| a.clone(self.allocator) catch null else null;
-        defer if (auth_clone) |*ac| ac.deinit(self.allocator);
-
         var env = ExecutionEnv{
             .allocator = self.allocator,
             .io = self.io,
-            .auth = auth_clone,
+            .auth = if (auth) |a| a.* else null,
             .blob_store = self.blob_store,
             .mode = .{ .tx = &tx },
         };
 
-        const res = self.executor.executeQuery(self.allocator, name, args_json, &env);
+        const res = self.executor.executeQuery(result_allocator, name, args_json, &env);
         const dur_us = metrics_mod.PlatformMetrics.elapsedUs(self.io, start_us);
         self.metrics.query_latency.observeUs(dur_us);
         switch (res) {

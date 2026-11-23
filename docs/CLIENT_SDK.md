@@ -1,6 +1,6 @@
 # Browser Client & Signals SDK (`/_concave/index.js`)
 
-Concave ships a bespoke, **zero-dependency** native browser ESM runtime embedded directly inside every compiled server binary at `/_concave/index.js` — no `npm`, no `node_modules`, no bundler, and no Virtual DOM.
+Concave ships a bespoke, **zero-dependency** native browser ESM runtime — bundled, minified, and pre-gzipped at build time into **1 single 4.6 KB gzipped request** at `/_concave/index.js` (with strong `ETag` / `304` caching) — no `npm`, no `node_modules`, no bundler, and no Virtual DOM.
 
 Companion `.d.ts` declarations (`client/concave-client/src/*.d.ts`) work alongside `--introspect` generated `_generated/{api.js,api.d.ts,dataModel.d.ts}` so editors (VS Code, `tsc --noEmit` with `checkJs: true`) give full end-to-end autocomplete and type checking on plain `.js` files.
 
