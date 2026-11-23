@@ -1,6 +1,7 @@
 comptime {
     _ = @import("core/key.zig");
     _ = @import("core/manifest.zig");
+    _ = @import("core/schema_validate.zig");
     _ = @import("core/readset.zig");
     _ = @import("core/storage.zig");
     _ = @import("core/wal_store.zig");

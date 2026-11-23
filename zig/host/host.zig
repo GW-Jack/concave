@@ -68,9 +68,15 @@ export fn roc_crashed(bytes: [*]const u8, len: usize) callconv(.c) void {
 }
 
 // =============================================================================
-// Thread-Safe + Re-Entrant Roc Execution Stack
+// Thread-Safe + Multi-Core Re-Entrant Roc Execution Stack
 // =============================================================================
+//
+// Roc 0.1.0_RC1 uses atomic refcounting (`@atomicRmw`) with `REFCOUNT_STATIC_DATA == 0`
+// for immortal constants, and `g_alloc` is `std.heap.smp_allocator`, so compiled Roc
+// entrypoints execute in parallel across all CPU cores with per-thread `t_env_stack`
+// and `t_host_arena`. Set `CONCAVE_SERIALIZE_ROC=1` to opt into serialized execution.
 
+var g_serialize_roc: bool = false;
 var g_roc_mutex: std.Io.Mutex = .init;
 threadlocal var t_roc_lock_depth: usize = 0;
 threadlocal var t_env_stack: [16]*engine_mod.ExecutionEnv = undefined;
@@ -680,16 +686,19 @@ const RocAppExecutor = struct {
         env: *engine_mod.ExecutionEnv,
     ) engine_mod.ExecResult {
         const io = getIo();
-        if (t_roc_lock_depth == 0) {
-            g_roc_mutex.lockUncancelable(io);
+        const lock_roc = g_serialize_roc;
+        if (lock_roc) {
+            if (t_roc_lock_depth == 0) {
+                g_roc_mutex.lockUncancelable(io);
+            }
+            t_roc_lock_depth += 1;
         }
-        t_roc_lock_depth += 1;
-        defer {
+        defer if (lock_roc) {
             t_roc_lock_depth -= 1;
             if (t_roc_lock_depth == 0) {
                 g_roc_mutex.unlock(io);
             }
-        }
+        };
 
         if (t_env_depth >= t_env_stack.len) {
             return .{ .err = allocator.dupe(u8, "max re-entrant Roc call depth exceeded") catch &.{} };
@@ -730,16 +739,19 @@ const RocAppExecutor = struct {
 
     fn runHttpRoute(_: *anyopaque, allocator: Allocator, method: []const u8, path: []const u8, req_json: []const u8, env: *engine_mod.ExecutionEnv) engine_mod.ExecResult {
         const io = getIo();
-        if (t_roc_lock_depth == 0) {
-            g_roc_mutex.lockUncancelable(io);
+        const lock_roc = g_serialize_roc;
+        if (lock_roc) {
+            if (t_roc_lock_depth == 0) {
+                g_roc_mutex.lockUncancelable(io);
+            }
+            t_roc_lock_depth += 1;
         }
-        t_roc_lock_depth += 1;
-        defer {
+        defer if (lock_roc) {
             t_roc_lock_depth -= 1;
             if (t_roc_lock_depth == 0) {
                 g_roc_mutex.unlock(io);
             }
-        }
+        };
 
         if (t_env_depth >= t_env_stack.len) {
             return .{ .err = allocator.dupe(u8, "max re-entrant Roc call depth exceeded") catch &.{} };
@@ -816,6 +828,9 @@ fn getEnvSlice(name: []const u8) ?[]const u8 {
 
 export fn main(argc: c_int, argv: [*]const [*:0]const u8, envp: [*:null]const ?[*:0]const u8) callconv(.c) c_int {
     g_envp = envp;
+    if (getEnvSlice("CONCAVE_SERIALIZE_ROC")) |sr| {
+        g_serialize_roc = std.mem.eql(u8, sr, "1") or std.ascii.eqlIgnoreCase(sr, "true");
+    }
     initRocRuntime();
 
     var introspect = false;
@@ -964,6 +979,12 @@ fn runServer(
             engine.metrics.log_json = true;
         }
     }
+
+    const strict_migrations = if (getEnvSlice("CONCAVE_STRICT_MIGRATIONS")) |v|
+        std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true")
+    else
+        false;
+    try engine.checkSchemaMigration(strict_migrations);
 
     // Configure built-in local / S3-SigV4 blob storage.
     const storage_dir = getEnvSlice("CONCAVE_STORAGE_DIR") orelse ".concave/storage";

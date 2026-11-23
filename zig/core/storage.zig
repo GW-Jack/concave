@@ -13,6 +13,7 @@ pub const StorageError = error{
     NotFound,
     ReadOnly,
     InvalidJson,
+    SchemaViolation,
     InvalidKey,
     StorageFailure,
     OutOfMemory,
@@ -198,22 +199,10 @@ pub const Storage = union(enum) {
         };
     }
 
-    pub fn scanIndexToWireJson(self: Storage, allocator: Allocator, query: *const IndexQuery, w: *std.Io.Writer) !void {
+    pub fn scanIndexToWireJson(self: Storage, _: Allocator, query: *const IndexQuery, w: *std.Io.Writer) !void {
         switch (self) {
             .wal => |wal| try wal.scanIndexToWireJson(query, w),
-            .pg => |pg| {
-                const docs = try pg.scanIndex(allocator, query);
-                defer {
-                    for (docs) |*d| d.deinit(allocator);
-                    allocator.free(docs);
-                }
-                try w.writeByte('[');
-                for (docs, 0..) |*d, i| {
-                    if (i > 0) try w.writeByte(',');
-                    try d.writeWireJson(w);
-                }
-                try w.writeByte(']');
-            },
+            .pg => |pg| try pg.scanIndexToWireJson(query, w),
         }
     }
 

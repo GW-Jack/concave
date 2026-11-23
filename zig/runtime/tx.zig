@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const manifest_mod = @import("../core/manifest.zig");
 const readset_mod = @import("../core/readset.zig");
+const schema_validate = @import("../core/schema_validate.zig");
 const storage_mod = @import("../core/storage.zig");
 
 const Document = storage_mod.Document;
@@ -262,6 +263,9 @@ pub const TxContext = struct {
         if (self.read_only) return storage_mod.StorageError.ReadOnly;
         const clean_body = try storage_mod.stripSystemFields(self.allocator, body_json);
         errdefer self.allocator.free(clean_body);
+        if (self.manifest.findTable(ns, table)) |tspec| {
+            try schema_validate.validateDocumentJson(self.allocator, tspec.document_schema, clean_body);
+        }
 
         const doc_id = try storage_mod.newDocId(self.allocator, self.io);
         errdefer self.allocator.free(doc_id);
@@ -290,6 +294,10 @@ pub const TxContext = struct {
         defer existing.deinit(self.allocator);
 
         const merged = try storage_mod.applyPatchJson(self.allocator, existing.body_json, patch_json);
+        errdefer self.allocator.free(merged);
+        if (self.manifest.findTable(ns, table)) |tspec| {
+            try schema_validate.validateDocumentJson(self.allocator, tspec.document_schema, merged);
+        }
         try self.putPending(ns, table, doc_id, .{
             .id = try self.allocator.dupe(u8, doc_id),
             .creation_time_ms = existing.creation_time_ms,
@@ -311,6 +319,9 @@ pub const TxContext = struct {
 
         const clean_body = try storage_mod.stripSystemFields(self.allocator, body_json);
         errdefer self.allocator.free(clean_body);
+        if (self.manifest.findTable(ns, table)) |tspec| {
+            try schema_validate.validateDocumentJson(self.allocator, tspec.document_schema, clean_body);
+        }
 
         try self.putPending(ns, table, doc_id, .{
             .id = try self.allocator.dupe(u8, doc_id),

@@ -4,6 +4,7 @@ const blob_store_mod = @import("../core/blob_store.zig");
 const key_mod = @import("../core/key.zig");
 const manifest_mod = @import("../core/manifest.zig");
 const readset_mod = @import("../core/readset.zig");
+const schema_validate = @import("../core/schema_validate.zig");
 const storage_mod = @import("../core/storage.zig");
 const auth_mod = @import("auth.zig");
 const http_client = @import("http_client.zig");
@@ -383,6 +384,63 @@ pub const ConcaveEngine = struct {
 
     pub fn readyCheck(self: *ConcaveEngine) !i64 {
         return try self.storage.latestCommitTs();
+    }
+
+    /// Compare the running manifest against the persisted `_system._schema_meta` snapshot,
+    /// log additive/breaking schema changes, enforce `strict` mode if enabled, and persist the
+    /// current snapshot when changed.
+    pub fn checkSchemaMigration(self: *ConcaveEngine, strict: bool) !void {
+        const curr_snap = try schema_validate.encodeSchemaSnapshot(self.allocator, self.manifest);
+        defer self.allocator.free(curr_snap);
+
+        const snap_ts = try self.storage.latestCommitTs();
+        const prev_doc = try self.storage.getDoc(self.allocator, "_system", "_schema_meta", "current");
+        defer if (prev_doc) |d| d.deinit(self.allocator);
+
+        if (prev_doc) |pd| {
+            if (std.mem.eql(u8, pd.body_json, curr_snap)) return;
+            const report = try schema_validate.diffSchemaSnapshots(self.allocator, pd.body_json, self.manifest);
+            defer report.deinit(self.allocator);
+
+            for (report.additive_changes) |ch| {
+                std.debug.print("[concave] schema migration (additive): {s}\n", .{ch});
+            }
+            for (report.breaking_changes) |ch| {
+                std.debug.print("[concave] WARNING breaking schema change: {s}\n", .{ch});
+            }
+            if (strict and report.isBreaking()) {
+                return error.BreakingSchemaMigration;
+            }
+        }
+
+        // Persist updated snapshot under `_system._schema_meta/current` with OCC ReadSet tracking
+        // so simultaneous multi-replica startups never collide on PK insert.
+        var rs: readset_mod.ReadSet = .{};
+        defer rs.deinit(self.allocator);
+        try rs.recordDocRead(self.allocator, "_system", "_schema_meta", "current");
+        const now = storage_mod.nowMillis(self.io);
+        const ops = [_]storage_mod.WriteOp{
+            if (prev_doc != null)
+                .{ .replace = .{
+                    .namespace = @constCast("_system"),
+                    .table = @constCast("_schema_meta"),
+                    .doc_id = @constCast("current"),
+                    .body_json = curr_snap,
+                } }
+            else
+                .{ .insert = .{
+                    .namespace = @constCast("_system"),
+                    .table = @constCast("_schema_meta"),
+                    .doc_id = @constCast("current"),
+                    .creation_time_ms = now,
+                    .body_json = curr_snap,
+                } },
+        };
+        var c = self.storage.commitTx(self.allocator, self.manifest, snap_ts, &rs, &ops) catch |err| {
+            if (err == storage_mod.StorageError.Conflict) return;
+            return err;
+        };
+        c.deinit(self.allocator);
     }
 
     pub fn getStats(self: *ConcaveEngine) EngineStats {

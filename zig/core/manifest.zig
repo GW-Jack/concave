@@ -103,6 +103,11 @@ const system_storage_table = TableSpec{
     .document_schema = .any_t,
     .indexes = &.{},
 };
+const system_schema_meta_table = TableSpec{
+    .name = "_schema_meta",
+    .document_schema = .any_t,
+    .indexes = &.{},
+};
 
 pub const AppManifest = struct {
     arena: std.heap.ArenaAllocator,
@@ -211,6 +216,7 @@ pub const AppManifest = struct {
         if (std.mem.eql(u8, namespace, "_system")) {
             if (std.mem.eql(u8, table_name, "_scheduled_jobs")) return &system_scheduled_jobs_table;
             if (std.mem.eql(u8, table_name, "_storage")) return &system_storage_table;
+            if (std.mem.eql(u8, table_name, "_schema_meta")) return &system_schema_meta_table;
             return null;
         }
         if (namespace.len == 0) {

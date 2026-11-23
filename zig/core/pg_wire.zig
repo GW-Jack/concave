@@ -174,6 +174,10 @@ const PgConn = struct {
         const stream = try host_name.connect(io, url.port, .{ .mode = .stream });
         errdefer stream.close(io);
 
+        // Disable Nagle's algorithm so back-to-back Postgres wire messages never stall on delayed ACKs.
+        const one: i32 = 1;
+        std.posix.setsockopt(stream.socket.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
+
         self.* = .{
             .allocator = allocator,
             .io = io,
@@ -597,7 +601,9 @@ pub const PgStore = struct {
     io: std.Io,
     url: PgUrl,
     deployment_id: []u8,
+    quoted_deployment_id: []u8,
     pool_mutex: std.Io.Mutex = .init,
+    pool_cond: std.Io.Condition = .init,
     idle: std.ArrayList(*PgConn) = .empty,
     total_conns: usize = 0,
     max_connections: usize = 8,
@@ -619,12 +625,15 @@ pub const PgStore = struct {
         errdefer parsed.deinit(allocator);
         const dep = try allocator.dupe(u8, deployment_id);
         errdefer allocator.free(dep);
+        const q_dep = try quoteSql(allocator, deployment_id);
+        errdefer allocator.free(q_dep);
 
         self.* = .{
             .allocator = allocator,
             .io = io,
             .url = parsed,
             .deployment_id = dep,
+            .quoted_deployment_id = q_dep,
             .max_connections = @max(@as(usize, 1), max_connections),
         };
         // Eagerly establish initial connection to validate credentials & warm the pool.
@@ -640,6 +649,7 @@ pub const PgStore = struct {
         self.idle.deinit(self.allocator);
         self.url.deinit(self.allocator);
         self.allocator.free(self.deployment_id);
+        self.allocator.free(self.quoted_deployment_id);
         self.allocator.destroy(self);
     }
 
@@ -648,24 +658,29 @@ pub const PgStore = struct {
             var should_dial = false;
             {
                 self.pool_mutex.lockUncancelable(self.io);
-                defer self.pool_mutex.unlock(self.io);
+                while (self.idle.items.len == 0 and self.total_conns >= self.max_connections) {
+                    self.pool_cond.waitUncancelable(self.io, &self.pool_mutex);
+                }
                 if (self.idle.items.len > 0) {
-                    return self.idle.pop().?;
+                    const c = self.idle.pop().?;
+                    self.pool_mutex.unlock(self.io);
+                    return c;
                 }
                 if (self.total_conns < self.max_connections) {
                     self.total_conns += 1;
                     should_dial = true;
                 }
+                self.pool_mutex.unlock(self.io);
             }
             if (should_dial) {
                 return PgConn.connect(self.allocator, self.io, &self.url) catch |err| {
                     self.pool_mutex.lockUncancelable(self.io);
                     self.total_conns -= 1;
+                    self.pool_cond.signal(self.io);
                     self.pool_mutex.unlock(self.io);
                     return err;
                 };
             }
-            self.io.sleep(.fromMilliseconds(2), .awake) catch {};
         }
     }
 
@@ -677,11 +692,13 @@ pub const PgStore = struct {
                 conn.deinit();
                 self.total_conns -= 1;
             };
+            self.pool_cond.signal(self.io);
         } else {
             conn.deinit();
             self.pool_mutex.lockUncancelable(self.io);
             defer self.pool_mutex.unlock(self.io);
             if (self.total_conns > 0) self.total_conns -= 1;
+            self.pool_cond.signal(self.io);
         }
     }
 
@@ -691,6 +708,8 @@ pub const PgStore = struct {
         defer self.releaseConn(conn, healthy);
 
         try conn.exec(
+            \\BEGIN;
+            \\SELECT pg_advisory_xact_lock(hashtext('concave_init_schema'));
             \\CREATE TABLE IF NOT EXISTS documents (
             \\  deployment_id TEXT NOT NULL,
             \\  namespace TEXT NOT NULL,
@@ -699,9 +718,7 @@ pub const PgStore = struct {
             \\  creation_time_ms BIGINT NOT NULL,
             \\  body_json JSONB NOT NULL,
             \\  PRIMARY KEY (deployment_id, namespace, table_name, doc_id)
-            \\)
-        );
-        try conn.exec(
+            \\);
             \\CREATE TABLE IF NOT EXISTS index_entries (
             \\  deployment_id TEXT NOT NULL,
             \\  namespace TEXT NOT NULL,
@@ -710,27 +727,23 @@ pub const PgStore = struct {
             \\  encoded_key BYTEA NOT NULL,
             \\  doc_id TEXT NOT NULL,
             \\  PRIMARY KEY (deployment_id, namespace, table_name, index_name, encoded_key, doc_id)
-            \\)
-        );
-        try conn.exec(
+            \\);
             \\CREATE INDEX IF NOT EXISTS idx_index_entries_doc
-            \\  ON index_entries (deployment_id, namespace, table_name, doc_id)
-            \\
-        );
-        try conn.exec(
+            \\  ON index_entries (deployment_id, namespace, table_name, doc_id);
             \\CREATE TABLE IF NOT EXISTS commit_log (
             \\  deployment_id TEXT NOT NULL,
             \\  commit_ts BIGINT NOT NULL,
             \\  writes_json JSONB NOT NULL,
             \\  PRIMARY KEY (deployment_id, commit_ts)
-            \\)
+            \\);
+            \\COMMIT;
         );
         healthy = true;
         _ = manifest;
     }
 
     pub fn latestCommitTs(self: *PgStore) !i64 {
-        const sql = try allocSqlFormat(self.allocator, "SELECT COALESCE(MAX(commit_ts), 0) FROM commit_log WHERE deployment_id = {s}", .{try quoteSql(self.allocator, self.deployment_id)});
+        const sql = try std.fmt.allocPrint(self.allocator, "SELECT COALESCE(MAX(commit_ts), 0) FROM commit_log WHERE deployment_id = {s}", .{self.quoted_deployment_id});
         defer self.allocator.free(sql);
 
         for (0..2) |attempt| {
@@ -887,6 +900,93 @@ pub const PgStore = struct {
         unreachable;
     }
 
+    pub fn scanIndexToWireJson(self: *PgStore, query: *const IndexQuery, out_w: *std.Io.Writer) !void {
+        var sql: std.Io.Writer.Allocating = .init(self.allocator);
+        defer sql.deinit();
+        const w = &sql.writer;
+
+        const q_ns = try quoteSql(self.allocator, query.namespace);
+        defer self.allocator.free(q_ns);
+        const q_tbl = try quoteSql(self.allocator, query.table);
+        defer self.allocator.free(q_tbl);
+        const q_idx = try quoteSql(self.allocator, query.index_name);
+        defer self.allocator.free(q_idx);
+
+        try w.print(
+            \\SELECT d.doc_id, d.creation_time_ms, d.body_json::text
+            \\FROM index_entries ie
+            \\INNER JOIN documents d
+            \\  ON d.deployment_id = ie.deployment_id
+            \\ AND d.namespace = ie.namespace
+            \\ AND d.table_name = ie.table_name
+            \\ AND d.doc_id = ie.doc_id
+            \\WHERE ie.deployment_id = {s} AND ie.namespace = {s} AND ie.table_name = {s} AND ie.index_name = {s}
+        , .{ self.quoted_deployment_id, q_ns, q_tbl, q_idx });
+
+        switch (query.start) {
+            .unbounded => {},
+            .included => |k| {
+                const hex = try quoteByteaHex(self.allocator, k);
+                defer self.allocator.free(hex);
+                try w.print(" AND ie.encoded_key >= {s}", .{hex});
+            },
+            .excluded => |k| {
+                const hex = try quoteByteaHex(self.allocator, k);
+                defer self.allocator.free(hex);
+                try w.print(" AND ie.encoded_key > {s}", .{hex});
+            },
+        }
+        switch (query.end) {
+            .unbounded => {},
+            .included => |k| {
+                const hex = try quoteByteaHex(self.allocator, k);
+                defer self.allocator.free(hex);
+                try w.print(" AND ie.encoded_key <= {s}", .{hex});
+            },
+            .excluded => |k| {
+                const hex = try quoteByteaHex(self.allocator, k);
+                defer self.allocator.free(hex);
+                try w.print(" AND ie.encoded_key < {s}", .{hex});
+            },
+        }
+        switch (query.order) {
+            .asc => try w.writeAll(" ORDER BY ie.encoded_key ASC, ie.doc_id ASC"),
+            .desc => try w.writeAll(" ORDER BY ie.encoded_key DESC, ie.doc_id DESC"),
+        }
+        if (query.limit) |lim| {
+            try w.print(" LIMIT {d}", .{lim});
+        }
+
+        for (0..2) |attempt| {
+            const conn = try self.acquireConn();
+            var healthy = false;
+            defer self.releaseConn(conn, healthy);
+
+            const rows = conn.queryRows(self.allocator, sql.written()) catch |err| {
+                if (attempt == 0) continue;
+                return err;
+            };
+            healthy = true;
+            defer {
+                for (rows) |*r| r.deinit(self.allocator);
+                self.allocator.free(rows);
+            }
+
+            try out_w.writeByte('[');
+            for (rows, 0..) |row, i| {
+                if (i > 0) try out_w.writeByte(',');
+                const doc = Document{
+                    .id = row.cols[0],
+                    .creation_time_ms = std.fmt.parseInt(i64, row.cols[1], 10) catch 0,
+                    .body_json = row.cols[2],
+                };
+                try doc.writeWireJson(out_w);
+            }
+            try out_w.writeByte(']');
+            return;
+        }
+    }
+
     pub fn commitTx(
         self: *PgStore,
         allocator: Allocator,
@@ -899,25 +999,21 @@ pub const PgStore = struct {
         var healthy = false;
         defer self.releaseConn(conn, healthy);
 
-        const q_dep = try quoteSql(self.allocator, self.deployment_id);
-        defer self.allocator.free(q_dep);
+        const q_dep = self.quoted_deployment_id;
 
-        try conn.exec("BEGIN");
-        errdefer conn.exec("ROLLBACK") catch {};
-
-        const lock_sql = try std.fmt.allocPrint(self.allocator, "SELECT pg_advisory_xact_lock(hashtext({s}))", .{q_dep});
-        defer self.allocator.free(lock_sql);
-        try conn.exec(lock_sql);
-
-        const ts_sql = try std.fmt.allocPrint(
+        // Coalesce BEGIN + advisory lock + MAX(commit_ts) into 1 round trip (was 3)!
+        // Must be separate statements so Postgres acquires a fresh READ COMMITTED snapshot
+        // strictly AFTER `pg_advisory_xact_lock` is granted.
+        const begin_sql = try std.fmt.allocPrint(
             self.allocator,
-            "SELECT COALESCE(MAX(commit_ts), 0) FROM commit_log WHERE deployment_id = {s}",
-            .{q_dep},
+            "BEGIN; SELECT pg_advisory_xact_lock(hashtext({s})); SELECT COALESCE(MAX(commit_ts), 0) FROM commit_log WHERE deployment_id = {s};",
+            .{ q_dep, q_dep },
         );
-        defer self.allocator.free(ts_sql);
-        const ts_rows = try conn.queryRows(self.allocator, ts_sql);
-        const latest_ts: i64 = if (ts_rows.len > 0 and ts_rows[0].cols.len > 0)
-            std.fmt.parseInt(i64, ts_rows[0].cols[0], 10) catch 0
+        defer self.allocator.free(begin_sql);
+        const ts_rows = try conn.queryRows(self.allocator, begin_sql);
+        errdefer conn.exec("ROLLBACK") catch {};
+        const latest_ts: i64 = if (ts_rows.len > 0 and ts_rows[ts_rows.len - 1].cols.len > 0)
+            std.fmt.parseInt(i64, ts_rows[ts_rows.len - 1].cols[0], 10) catch 0
         else
             0;
         for (ts_rows) |*r| r.deinit(self.allocator);
@@ -971,14 +1067,14 @@ pub const PgStore = struct {
         const q_ws = try quoteSql(self.allocator, ws_json);
         defer self.allocator.free(q_ws);
 
-        const ins_log = try std.fmt.allocPrint(
+        // Coalesce commit_log insert + COMMIT into 1 round trip (was 2)!
+        const ins_commit = try std.fmt.allocPrint(
             self.allocator,
-            "INSERT INTO commit_log (deployment_id, commit_ts, writes_json) VALUES ({s}, {d}, {s}::jsonb)",
+            "INSERT INTO commit_log (deployment_id, commit_ts, writes_json) VALUES ({s}, {d}, {s}::jsonb); COMMIT;",
             .{ q_dep, next_ts, q_ws },
         );
-        defer self.allocator.free(ins_log);
-        try conn.exec(ins_log);
-        try conn.exec("COMMIT");
+        defer self.allocator.free(ins_commit);
+        try conn.exec(ins_commit);
         healthy = true;
 
         return .{ .commit_ts = next_ts, .write_set = write_set };
@@ -1198,20 +1294,23 @@ pub const PgStore = struct {
             for (entries) |*e| e.deinit(self.allocator);
             self.allocator.free(entries);
         }
-        for (entries) |e| {
+        if (entries.len == 0) return;
+
+        // Batch all secondary index rows for this document into ONE multi-row INSERT round trip!
+        var sql: std.Io.Writer.Allocating = .init(self.allocator);
+        defer sql.deinit();
+        const w = &sql.writer;
+        try w.writeAll("INSERT INTO index_entries (deployment_id, namespace, table_name, index_name, encoded_key, doc_id) VALUES ");
+        for (entries, 0..) |e, i| {
+            if (i > 0) try w.writeByte(',');
             const q_idx = try quoteSql(self.allocator, e.index_name);
             defer self.allocator.free(q_idx);
             const q_hex = try quoteByteaHex(self.allocator, e.encoded_key);
             defer self.allocator.free(q_hex);
-            const sql = try std.fmt.allocPrint(
-                self.allocator,
-                "INSERT INTO index_entries (deployment_id, namespace, table_name, index_name, encoded_key, doc_id) VALUES ({s}, {s}, {s}, {s}, {s}, {s})",
-                .{ q_dep, q_ns, q_tbl, q_idx, q_hex, q_id },
-            );
-            defer self.allocator.free(sql);
-            try conn.exec(sql);
+            try w.print("({s},{s},{s},{s},{s},{s})", .{ q_dep, q_ns, q_tbl, q_idx, q_hex, q_id });
             try write_set.recordIndexKey(ws_alloc, ns, table, e.index_name, e.encoded_key);
         }
+        try conn.exec(sql.written());
     }
 
     pub fn commitsSince(self: *PgStore, allocator: Allocator, since_ts: i64) ![]CommitEntry {
@@ -1258,11 +1357,6 @@ pub const PgStore = struct {
         unreachable;
     }
 };
-
-fn allocSqlFormat(allocator: Allocator, comptime fmt: []const u8, args: anytype) ![]u8 {
-    defer allocator.free(args[0]);
-    return try std.fmt.allocPrint(allocator, fmt, args);
-}
 
 fn quoteSql(allocator: Allocator, s: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
