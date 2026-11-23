@@ -117,24 +117,34 @@ pub fn main(init: std.process.Init) !void {
         });
     } else if (std.mem.eql(u8, cmd, "init")) {
         if (args.len < 3) {
-            std.debug.print("Usage: concave init <dir> [--platform <path>] [--sdk <path>]\n", .{});
+            std.debug.print("Usage: concave init <dir> [--template minimal|chat|kanban] [--platform <path>] [--sdk <path>]\n", .{});
             return;
         }
         const dir = args[2];
+        var template: []const u8 = "minimal";
         var platform: []const u8 = "./platform/main.roc";
         var sdk: []const u8 = "./packages/concave-sdk/main.roc";
         var i: usize = 3;
         while (i < args.len) : (i += 1) {
-            if (std.mem.eql(u8, args[i], "--platform") and i + 1 < args.len) {
+            if (std.mem.eql(u8, args[i], "--template") and i + 1 < args.len) {
+                i += 1;
+                template = args[i];
+            } else if (std.mem.startsWith(u8, args[i], "--template=")) {
+                template = args[i]["--template=".len..];
+            } else if (std.mem.eql(u8, args[i], "--platform") and i + 1 < args.len) {
                 i += 1;
                 platform = args[i];
+            } else if (std.mem.startsWith(u8, args[i], "--platform=")) {
+                platform = args[i]["--platform=".len..];
             } else if (std.mem.eql(u8, args[i], "--sdk") and i + 1 < args.len) {
                 i += 1;
                 sdk = args[i];
+            } else if (std.mem.startsWith(u8, args[i], "--sdk=")) {
+                sdk = args[i]["--sdk=".len..];
             }
         }
-        try scaffoldApp(gpa, io, dir, platform, sdk);
-        std.debug.print("Initialized Concave app in {s}\n", .{dir});
+        try scaffoldApp(gpa, io, dir, template, platform, sdk);
+        std.debug.print("Initialized Concave app ({s} template) in {s}\n", .{ template, dir });
     } else {
         printUsage();
     }
@@ -148,7 +158,7 @@ fn printUsage() void {
         \\  codegen  Build Roc app, run --introspect, emit api.js / api.d.ts / dataModel.d.ts
         \\  dev      Watch .roc files, rebuild, run codegen, and supervise the live server
         \\  build    Build a standalone native Concave server executable
-        \\  init     Scaffold a new Concave Roc application
+        \\  init     Scaffold a new Concave app (--template minimal|chat|kanban)
         \\
     , .{});
 }
@@ -304,59 +314,384 @@ fn runDevLoop(allocator: Allocator, io: std.Io, opts: DevOptions) !void {
     }
 }
 
-fn scaffoldApp(allocator: Allocator, io: std.Io, dir: []const u8, platform: []const u8, sdk: []const u8) !void {
+fn scaffoldApp(
+    allocator: Allocator,
+    io: std.Io,
+    dir: []const u8,
+    template: []const u8,
+    platform: []const u8,
+    sdk: []const u8,
+) !void {
     const backend_dir = try std.fs.path.join(allocator, &.{ dir, "backend" });
     defer allocator.free(backend_dir);
     try std.Io.Dir.cwd().createDirPath(io, backend_dir);
 
-    const content = try std.fmt.allocPrint(
-        allocator,
-        \\app [concave_app] {{
-        \\    pf: platform "{s}",
-        \\    sdk: "{s}",
-        \\}}
-        \\
-        \\import sdk.App
-        \\import sdk.Ctx
-        \\import sdk.Db
-        \\import sdk.Schema
-        \\import sdk.Table
-        \\
-        \\NoteDoc : {{
-        \\    id : Str,
-        \\    created_at : I64,
-        \\    text : Str,
-        \\}}
-        \\
-        \\notes_schema : Schema
-        \\notes_schema = Schema.record([
-        \\    Schema.field("text", Schema.str),
-        \\])
-        \\
-        \\notes_table : Table(NoteDoc)
-        \\notes_table = Table.define("notes", notes_schema)
-        \\
-        \\list_notes! : Ctx.QueryCtx, {{}} => Try(List(NoteDoc), Str)
-        \\list_notes! = |ctx, _|
-        \\    Db.query(notes_table) |> Db.desc() |> Db.collect!(ctx.db)
-        \\
-        \\add_note! : Ctx.MutationCtx, {{ text : Str }} => Try(Str, Str)
-        \\add_note! = |ctx, args|
-        \\    Db.insert!(ctx.db, notes_table, {{ text: args.text }})
-        \\
-        \\concave_app : () -> App
-        \\concave_app = ||
-        \\    App.new("my-concave-app")
-        \\    |> App.table(notes_table)
-        \\    |> App.query("notes.list", Schema.record([]), Schema.list(Table.doc_schema(notes_table)), list_notes!)
-        \\    |> App.mutation("notes.add", Schema.record([Schema.field("text", Schema.str)]), Schema.id("notes"), add_note!)
-        \\
-    ,
-        .{ platform, sdk },
-    );
-    defer allocator.free(content);
+    const frontend_src = try std.fs.path.join(allocator, &.{ dir, "frontend", "src" });
+    defer allocator.free(frontend_src);
+    try std.Io.Dir.cwd().createDirPath(io, frontend_src);
+
+    const roc_content = if (std.mem.eql(u8, template, "kanban"))
+        try std.fmt.allocPrint(
+            allocator,
+            \\app [concave_app] {{
+            \\    pf: platform "{s}",
+            \\    sdk: "{s}",
+            \\}}
+            \\
+            \\import sdk.App
+            \\import sdk.Ctx
+            \\import sdk.Db
+            \\import sdk.Key
+            \\import sdk.Schema
+            \\import sdk.Table
+            \\
+            \\CardDoc : {{
+            \\    id : Str,
+            \\    created_at : I64,
+            \\    title : Str,
+            \\    column : Str,
+            \\    assignee : Str,
+            \\}}
+            \\
+            \\cards_schema : Schema
+            \\cards_schema = Schema.record([
+            \\    Schema.field("title", Schema.str),
+            \\    Schema.field("column", Schema.str),
+            \\    Schema.field("assignee", Schema.str),
+            \\])
+            \\
+            \\cards_table : Table(CardDoc)
+            \\cards_table =
+            \\    Table.define("cards", cards_schema)
+            \\    |> Table.with_index("by_column", ["column"])
+            \\
+            \\list_cards! : Ctx.QueryCtx, {{}} => Try(Str, Str)
+            \\list_cards! = |ctx, _|
+            \\    Db.query(cards_table) |> Db.asc() |> Db.collect_raw!(ctx.db)
+            \\
+            \\create_card! : Ctx.MutationCtx, {{ title : Str, column : Str, assignee : Str }} => Try(Str, Str)
+            \\create_card! = |ctx, args| {{
+            \\    trimmed = Str.trim(args.title)
+            \\    if Str.is_empty(trimmed) {{
+            \\        return Err("Card title cannot be empty")
+            \\    }}
+            \\    Db.insert!(ctx.db, cards_table, {{
+            \\        title: trimmed,
+            \\        column: args.column,
+            \\        assignee: args.assignee,
+            \\    }})
+            \\}}
+            \\
+            \\move_card! : Ctx.MutationCtx, {{ id : Str, column : Str }} => Try({{}}, Str)
+            \\move_card! = |ctx, args|
+            \\    Db.patch!(ctx.db, cards_table, args.id, {{ column: args.column }})
+            \\
+            \\delete_card! : Ctx.MutationCtx, {{ id : Str }} => Try({{}}, Str)
+            \\delete_card! = |ctx, args|
+            \\    Db.delete!(ctx.db, cards_table, args.id)
+            \\
+            \\concave_app : () -> App
+            \\concave_app = ||
+            \\    App.new("concave-kanban")
+            \\    |> App.table(cards_table)
+            \\    |> App.query_raw("cards.list", Schema.record([]), Schema.list(Table.doc_schema(cards_table)), list_cards!)
+            \\    |> App.mutation(
+            \\        "cards.create",
+            \\        Schema.record([
+            \\            Schema.field("title", Schema.str),
+            \\            Schema.field("column", Schema.str),
+            \\            Schema.field("assignee", Schema.str),
+            \\        ]),
+            \\        Schema.id("cards"),
+            \\        create_card!,
+            \\    )
+            \\    |> App.mutation(
+            \\        "cards.move",
+            \\        Schema.record([
+            \\            Schema.field("id", Schema.id("cards")),
+            \\            Schema.field("column", Schema.str),
+            \\        ]),
+            \\        Schema.record([]),
+            \\        move_card!,
+            \\    )
+            \\    |> App.mutation(
+            \\        "cards.delete",
+            \\        Schema.record([Schema.field("id", Schema.id("cards"))]),
+            \\        Schema.record([]),
+            \\        delete_card!,
+            \\    )
+            \\
+        ,
+            .{ platform, sdk },
+        )
+    else if (std.mem.eql(u8, template, "chat"))
+        try std.fmt.allocPrint(
+            allocator,
+            \\app [concave_app] {{
+            \\    pf: platform "{s}",
+            \\    sdk: "{s}",
+            \\}}
+            \\
+            \\import sdk.App
+            \\import sdk.Ctx
+            \\import sdk.Db
+            \\import sdk.Key
+            \\import sdk.Schema
+            \\import sdk.Table
+            \\
+            \\MessageDoc : {{
+            \\    id : Str,
+            \\    created_at : I64,
+            \\    room : Str,
+            \\    author : Str,
+            \\    body : Str,
+            \\}}
+            \\
+            \\messages_schema : Schema
+            \\messages_schema = Schema.record([
+            \\    Schema.field("room", Schema.str),
+            \\    Schema.field("author", Schema.str),
+            \\    Schema.field("body", Schema.str),
+            \\])
+            \\
+            \\messages_table : Table(MessageDoc)
+            \\messages_table =
+            \\    Table.define("messages", messages_schema)
+            \\    |> Table.with_index("by_room", ["room"])
+            \\
+            \\by_room : Table.Index(MessageDoc)
+            \\by_room = Table.index_ref(messages_table, "by_room")
+            \\
+            \\list_messages! : Ctx.QueryCtx, {{ room : Str }} => Try(Str, Str)
+            \\list_messages! = |ctx, args|
+            \\    Db.from_index(by_room)
+            \\    |> Db.eq([Key.str(args.room)])
+            \\    |> Db.asc()
+            \\    |> Db.take(100)
+            \\    |> Db.collect_raw!(ctx.db)
+            \\
+            \\send_message! : Ctx.MutationCtx, {{ room : Str, author : Str, body : Str }} => Try(Str, Str)
+            \\send_message! = |ctx, args| {{
+            \\    trimmed = Str.trim(args.body)
+            \\    if Str.is_empty(trimmed) {{
+            \\        return Err("Message cannot be empty")
+            \\    }}
+            \\    Db.insert!(ctx.db, messages_table, {{
+            \\        room: args.room,
+            \\        author: args.author,
+            \\        body: trimmed,
+            \\    }})
+            \\}}
+            \\
+            \\concave_app : () -> App
+            \\concave_app = ||
+            \\    App.new("concave-chat-starter")
+            \\    |> App.table(messages_table)
+            \\    |> App.query_raw(
+            \\        "messages.list",
+            \\        Schema.record([Schema.field("room", Schema.str)]),
+            \\        Schema.list(Table.doc_schema(messages_table)),
+            \\        list_messages!,
+            \\    )
+            \\    |> App.mutation(
+            \\        "messages.send",
+            \\        Schema.record([
+            \\            Schema.field("room", Schema.str),
+            \\            Schema.field("author", Schema.str),
+            \\            Schema.field("body", Schema.str),
+            \\        ]),
+            \\        Schema.id("messages"),
+            \\        send_message!,
+            \\    )
+            \\
+        ,
+            .{ platform, sdk },
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            \\app [concave_app] {{
+            \\    pf: platform "{s}",
+            \\    sdk: "{s}",
+            \\}}
+            \\
+            \\import sdk.App
+            \\import sdk.Ctx
+            \\import sdk.Db
+            \\import sdk.Schema
+            \\import sdk.Table
+            \\
+            \\NoteDoc : {{
+            \\    id : Str,
+            \\    created_at : I64,
+            \\    text : Str,
+            \\}}
+            \\
+            \\notes_schema : Schema
+            \\notes_schema = Schema.record([
+            \\    Schema.field("text", Schema.str),
+            \\])
+            \\
+            \\notes_table : Table(NoteDoc)
+            \\notes_table = Table.define("notes", notes_schema)
+            \\
+            \\list_notes! : Ctx.QueryCtx, {{}} => Try(Str, Str)
+            \\list_notes! = |ctx, _|
+            \\    Db.query(notes_table) |> Db.desc() |> Db.collect_raw!(ctx.db)
+            \\
+            \\add_note! : Ctx.MutationCtx, {{ text : Str }} => Try(Str, Str)
+            \\add_note! = |ctx, args|
+            \\    Db.insert!(ctx.db, notes_table, {{ text: args.text }})
+            \\
+            \\concave_app : () -> App
+            \\concave_app = ||
+            \\    App.new("my-concave-app")
+            \\    |> App.table(notes_table)
+            \\    |> App.query_raw("notes.list", Schema.record([]), Schema.list(Table.doc_schema(notes_table)), list_notes!)
+            \\    |> App.mutation("notes.add", Schema.record([Schema.field("text", Schema.str)]), Schema.id("notes"), add_note!)
+            \\
+        ,
+            .{ platform, sdk },
+        );
+    defer allocator.free(roc_content);
 
     const main_path = try std.fs.path.join(allocator, &.{ backend_dir, "main.roc" });
     defer allocator.free(main_path);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = main_path, .data = content });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = main_path, .data = roc_content });
+
+    // Write zero-dependency reactive frontend starter (`frontend/index.html` + `frontend/src/main.js`).
+    const html_path = try std.fs.path.join(allocator, &.{ dir, "frontend", "index.html" });
+    defer allocator.free(html_path);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = html_path,
+        .data =
+        \\<!doctype html>
+        \\<html lang="en">
+        \\<head>
+        \\  <meta charset="utf-8" />
+        \\  <meta name="viewport" content="width=device-width, initial-scale=1" />
+        \\  <title>Concave App</title>
+        \\  <style>
+        \\    body { font-family: system-ui, -apple-system, sans-serif; max-width: 820px; margin: 2rem auto; padding: 0 1rem; background: #0f1115; color: #e6edf3; }
+        \\    input, button { padding: 0.5rem 0.75rem; border-radius: 6px; border: 1px solid #30363d; background: #161b22; color: #e6edf3; }
+        \\    button { background: #238636; border-color: #2ea043; cursor: pointer; }
+        \\    .cols { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-top: 1rem; }
+        \\    .col { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 0.75rem; }
+        \\    .card { background: #21262d; padding: 0.6rem; border-radius: 6px; margin-bottom: 0.5rem; display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; }
+        \\    a { color: #58a6ff; }
+        \\  </style>
+        \\</head>
+        \\<body>
+        \\  <div id="app"></div>
+        \\  <script type="module" src="/src/main.js"></script>
+        \\</body>
+        \\</html>
+        \\
+        ,
+    });
+
+    const js_data = if (std.mem.eql(u8, template, "kanban"))
+        \\import { ConcaveClient, el, each, mount } from "/_concave/index.js";
+        \\import { api } from "./_generated/api.js";
+        \\
+        \\const client = new ConcaveClient(window.location.origin);
+        \\const cards = client.query(api.cards.list, {});
+        \\const COLS = ["todo", "doing", "done"];
+        \\let inputEl;
+        \\
+        \\mount(document.getElementById("app"), () => el("div", {},
+        \\  el("h1", {}, "Concave Live Kanban"),
+        \\  el("p", {}, "Open a second tab — every move syncs live. ", el("a", { href: "/_dashboard", target: "_blank" }, "Open Dashboard")),
+        \\  el("form", {
+        \\    onsubmit: async (e) => {
+        \\      e.preventDefault();
+        \\      const title = inputEl.value.trim();
+        \\      if (!title) return;
+        \\      inputEl.value = "";
+        \\      await client.mutate(api.cards.create, { title, column: "todo", assignee: "you" });
+        \\    },
+        \\  },
+        \\    (inputEl = el("input", { placeholder: "New task...", style: "width: 65%; margin-right: 0.5rem;" })),
+        \\    el("button", { type: "submit" }, "Add Card"),
+        \\  ),
+        \\  el("div", { class: "cols" }, ...COLS.map((col) =>
+        \\    el("div", { class: "col" },
+        \\      el("h3", {}, col.toUpperCase()),
+        \\      each(() => (cards().data ?? []).filter((c) => c.column === col), (c) => c.id, (card) =>
+        \\        el("div", { class: "card" },
+        \\          el("span", {}, () => card().title),
+        \\          el("div", {},
+        \\            col !== "done" ? el("button", { onclick: () => client.mutate(api.cards.move, { id: card().id, column: COLS[COLS.indexOf(col) + 1] }) }, "→") : "",
+        \\          ),
+        \\        ),
+        \\      ),
+        \\    ),
+        \\  )),
+        \\));
+        \\
+    else if (std.mem.eql(u8, template, "chat"))
+        \\import { ConcaveClient, el, each, mount } from "/_concave/index.js";
+        \\import { api } from "./_generated/api.js";
+        \\
+        \\const client = new ConcaveClient(window.location.origin);
+        \\const messages = client.query(api.messages.list, { room: "general" });
+        \\let inputEl;
+        \\
+        \\mount(document.getElementById("app"), () => el("div", {},
+        \\  el("h1", {}, "Concave Live Chat (#general)"),
+        \\  el("p", {}, "Zero npm dependencies. ", el("a", { href: "/_dashboard", target: "_blank" }, "Open Dashboard")),
+        \\  el("div", {},
+        \\    each(() => messages().data ?? [], (m) => m.id, (msg) =>
+        \\      el("div", { class: "card" }, el("span", {}, () => `${msg().author}: ${msg().body}`)),
+        \\    ),
+        \\  ),
+        \\  el("form", {
+        \\    onsubmit: async (e) => {
+        \\      e.preventDefault();
+        \\      const body = inputEl.value.trim();
+        \\      if (!body) return;
+        \\      inputEl.value = "";
+        \\      await client.mutate(api.messages.send, { room: "general", author: "You", body });
+        \\    },
+        \\  },
+        \\    (inputEl = el("input", { placeholder: "Say hi...", style: "width: 70%; margin-right: 0.5rem;" })),
+        \\    el("button", { type: "submit" }, "Send"),
+        \\  ),
+        \\));
+        \\
+    else
+        \\import { ConcaveClient, el, each, mount } from "/_concave/index.js";
+        \\import { api } from "./_generated/api.js";
+        \\
+        \\const client = new ConcaveClient(window.location.origin);
+        \\const notes = client.query(api.notes.list, {});
+        \\let inputEl;
+        \\
+        \\mount(document.getElementById("app"), () => el("div", {},
+        \\  el("h1", {}, "Concave Live Notes"),
+        \\  el("p", {}, "Zero npm dependencies. ", el("a", { href: "/_dashboard", target: "_blank" }, "Open Dashboard")),
+        \\  el("form", {
+        \\    onsubmit: async (e) => {
+        \\      e.preventDefault();
+        \\      const text = inputEl.value.trim();
+        \\      if (!text) return;
+        \\      inputEl.value = "";
+        \\      await client.mutate(api.notes.add, { text });
+        \\    },
+        \\  },
+        \\    (inputEl = el("input", { placeholder: "Write a note...", style: "width: 70%; margin-right: 0.5rem;" })),
+        \\    el("button", { type: "submit" }, "Add"),
+        \\  ),
+        \\  el("div", { style: "margin-top: 1rem;" },
+        \\    each(() => notes().data ?? [], (n) => n.id, (note) =>
+        \\      el("div", { class: "card" }, el("span", {}, () => note().text)),
+        \\    ),
+        \\  ),
+        \\));
+        \\
+    ;
+
+    const js_path = try std.fs.path.join(allocator, &.{ frontend_src, "main.js" });
+    defer allocator.free(js_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = js_path, .data = js_data });
 }
