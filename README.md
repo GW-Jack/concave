@@ -10,9 +10,9 @@
 
 Building a modern web app usually means wiring together a REST/GraphQL server, an ORM, WebSockets, client cache invalidation, a background job queue, a webhook handler, file uploads, an analytics SDK, an error tracker, a bundler, and 400 MB of `node_modules` — all before you build your actual product.
 
-**Concave replaces that whole pile with one [Roc](https://www.roc-lang.org/) backend and a single ~2 MB native binary.**
+**Concave replaces that whole pile with one [Roc](https://www.roc-lang.org/) backend, a single ~2 MB native binary, a 4.6 KB gzipped browser runtime, and literally zero external dependencies.**
 
-Write ordinary, type-safe Roc functions. Concave keeps your database and every connected browser tab in sync automatically, compiles in a blink, runs on your laptop with zero setup, and scales out on Postgres when you're ready to launch.
+Write ordinary, type-safe Roc functions. Concave keeps your database and every connected browser tab in sync automatically over WebSockets, serves bundled/minified/pre-gzipped assets over HTTP/1.1 Keep-Alive and HTTP/2 (`h2c`), runs on your laptop with zero setup, and scales out on Postgres when you're ready to launch.
 
 ---
 
@@ -73,7 +73,7 @@ When a message is sent from another tab, a webhook, or a cron job:
 ## What you get to delete
 
 - **No manual WebSockets or cache invalidation.** Queries are live subscriptions by default, with optimistic updates that reconcile or roll back automatically.
-- **No `node_modules` or frontend build pipeline.** Concave serves its tiny reactive UI runtime straight from `/_concave/index.js` alongside your `.js` + `.d.ts` files.
+- **No `node_modules` or frontend build pipeline.** The entire browser runtime — WebSocket sync, optimistic updates, glitch-free signals, and surgical DOM helpers — ships embedded at `/_concave/index.js` in **1 single request: 4.6 KB gzipped** (16.0 KB minified) with pre-compressed gzip + ETag caching and zero dependencies.
 - **No Redis or separate worker fleet.** Delayed jobs (`ctx.scheduler`) and recurring crons (`App.cron`) live right inside your app's transactions.
 - **No bolted-on SaaS sprawl on day one.** Drop-in pure-Roc components give you live **Presence**, **Rate Limiting**, **PostHog-style Analytics & Feature Flags**, and **Sentry-style Error & Log Monitoring** — all sharing your database and your transactions.
 - **No local Docker needed to code.** Develop against a single local file with instant hot reloads and a built-in Dev Dashboard at `/_dashboard`. When it's time to deploy, set `DATABASE_URL` to Postgres (Neon, PlanetScale, Cloud SQL, or self-hosted) and ship a single ~7.6 MB Docker image.
@@ -117,7 +117,8 @@ Save any `.roc` file and Concave rebuilds, regenerates your typed client API, an
 
 | Built right in | Why it's nice |
 | --- | --- |
-| **Live Queries & Optimistic UI** | Instant local feedback with consistent, glitch-free live updates across every tab and server replica. |
+| **Live Queries & Optimistic UI** | Instant local feedback with consistent, glitch-free live updates across every tab and server replica — all in a **4.6 KB gzipped** zero-dependency browser bundle. |
+| **Fast Built-in Transport** | Persistent WebSockets (`/ws`) for low-latency multiplexed RPCs & live sync, plus HTTP/1.1 Keep-Alive, HTTP/2 (`h2c`), automatic gzip, and `ETag`/`304` caching on the same port. |
 | **Built-in Dev Dashboard (`/_dashboard`)** | Browse tables, invoke functions, stream live subscriptions, test webhooks, and monitor jobs without installing a separate tool. |
 | **Jobs, Crons, Webhooks & File Uploads** | Transactional `ctx.scheduler`, `App.cron`, custom `App.http_route` webhooks, and signed file uploads (`ctx.storage`, local or S3/R2/GCS). |
 | **Search & Pagination** | Reactive `Db.search!` and cursor-based `Db.paginate!` that update live as matching documents arrive. |

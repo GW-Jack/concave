@@ -1,19 +1,14 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const assets = @import("embedded_assets");
 const storage_mod = @import("../core/storage.zig");
 const auth_mod = @import("auth.zig");
+const compress = @import("compress.zig");
 const engine_mod = @import("engine.zig");
+const http2 = @import("http2.zig");
 const ws_mod = @import("ws.zig");
 
-const CLIENT_INDEX_JS = @embedFile("concave_client_index_js");
-const CLIENT_SIGNALS_JS = @embedFile("concave_client_signals_js");
-const CLIENT_CLIENT_JS = @embedFile("concave_client_client_js");
-const CLIENT_DOM_JS = @embedFile("concave_client_dom_js");
-const ANALYTICS_CLIENT_JS = @embedFile("concave_analytics_client_js");
-const MONITOR_CLIENT_JS = @embedFile("concave_monitor_client_js");
-const DASHBOARD_INDEX_HTML = @embedFile("concave_dashboard_index_html");
-const DASHBOARD_STYLES_CSS = @embedFile("concave_dashboard_styles_css");
-const DASHBOARD_APP_JS = @embedFile("concave_dashboard_app_js");
+const DYNAMIC_GZIP_MIN_BYTES: usize = 512;
 
 pub const ServerConfig = struct {
     host: []const u8 = "127.0.0.1",
@@ -23,6 +18,16 @@ pub const ServerConfig = struct {
     operator_token: ?[]const u8 = null,
     shutdown_flag: ?*std.atomic.Value(bool) = null,
 };
+
+fn enableTcpNoDelay(stream: std.Io.net.Stream) void {
+    const one: i32 = 1;
+    std.posix.setsockopt(
+        stream.socket.handle,
+        std.posix.IPPROTO.TCP,
+        std.posix.TCP.NODELAY,
+        std.mem.asBytes(&one),
+    ) catch {};
+}
 
 pub fn serve(
     allocator: Allocator,
@@ -34,7 +39,7 @@ pub fn serve(
     var listener = try addr.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
 
-    std.debug.print("Concave server listening on http://{s}:{d}\n", .{ config.host, config.port });
+    std.debug.print("Concave server listening on http://{s}:{d} (HTTP/1.1 + HTTP/2 h2c + WS)\n", .{ config.host, config.port });
 
     while (true) {
         if (config.shutdown_flag) |sf| {
@@ -54,6 +59,8 @@ pub fn serve(
             }
         }
 
+        enableTcpNoDelay(stream);
+
         const ConnCtx = struct {
             allocator: Allocator,
             io: std.Io,
@@ -61,10 +68,20 @@ pub fn serve(
             static_dir: ?[]const u8,
             admin_key: ?[]const u8,
             operator_token: ?[]const u8,
+            shutdown_flag: ?*std.atomic.Value(bool),
             stream: std.Io.net.Stream,
 
             fn run(ctx: @This()) void {
-                handleConnection(ctx.allocator, ctx.io, ctx.engine, ctx.static_dir, ctx.admin_key, ctx.operator_token, ctx.stream);
+                handleConnection(
+                    ctx.allocator,
+                    ctx.io,
+                    ctx.engine,
+                    ctx.static_dir,
+                    ctx.admin_key,
+                    ctx.operator_token,
+                    ctx.shutdown_flag,
+                    ctx.stream,
+                );
             }
         };
 
@@ -75,6 +92,7 @@ pub fn serve(
             .static_dir = config.static_dir,
             .admin_key = config.admin_key,
             .operator_token = config.operator_token,
+            .shutdown_flag = config.shutdown_flag,
             .stream = stream,
         }}) catch {
             stream.close(io);
@@ -90,8 +108,12 @@ pub const HttpRequest = struct {
     query: []u8,
     content_type: ?[]u8 = null,
     authorization: ?[]u8 = null,
+    accept_encoding: ?[]u8 = null,
+    if_none_match: ?[]u8 = null,
+    keep_alive: bool = true,
     upgrade_ws: bool = false,
     ws_key: ?[]u8 = null,
+    is_h2_preface: bool = false,
     body: []u8,
 
     pub fn deinit(self: *const HttpRequest, allocator: Allocator) void {
@@ -100,8 +122,23 @@ pub const HttpRequest = struct {
         allocator.free(self.query);
         if (self.content_type) |ct| allocator.free(ct);
         if (self.authorization) |a| allocator.free(a);
+        if (self.accept_encoding) |ae| allocator.free(ae);
+        if (self.if_none_match) |inm| allocator.free(inm);
         if (self.ws_key) |k| allocator.free(k);
         allocator.free(self.body);
+    }
+
+    pub fn asH2View(self: *const HttpRequest) http2.H2Request {
+        return .{
+            .method = self.method,
+            .path = self.path,
+            .query = self.query,
+            .content_type = self.content_type,
+            .authorization = self.authorization,
+            .accept_encoding = self.accept_encoding,
+            .if_none_match = self.if_none_match,
+            .body = self.body,
+        };
     }
 };
 
@@ -125,6 +162,19 @@ pub fn readHttpRequest(allocator: Allocator, reader: *std.Io.Reader) !?HttpReque
     var req_parts = std.mem.splitScalar(u8, req_line, ' ');
     const method_raw = req_parts.next() orelse return null;
     const target_raw = req_parts.next() orelse return null;
+    const version_raw = req_parts.next() orelse "HTTP/1.1";
+
+    // RFC 9113 HTTP/2 prior-knowledge connection preface begins with `"PRI * HTTP/2.0\r\n\r\n"`.
+    if (std.mem.eql(u8, method_raw, "PRI") and std.mem.eql(u8, target_raw, "*") and std.mem.eql(u8, version_raw, "HTTP/2.0")) {
+        return .{
+            .method = try allocator.dupe(u8, "PRI"),
+            .path = try allocator.dupe(u8, "*"),
+            .query = try allocator.dupe(u8, ""),
+            .is_h2_preface = true,
+            .body = try allocator.alloc(u8, 0),
+        };
+    }
+
     const path_raw = if (std.mem.indexOfScalar(u8, target_raw, '?')) |qi| target_raw[0..qi] else target_raw;
     const query_raw = if (std.mem.indexOfScalar(u8, target_raw, '?')) |qi| target_raw[qi + 1 ..] else "";
 
@@ -133,6 +183,11 @@ pub fn readHttpRequest(allocator: Allocator, reader: *std.Io.Reader) !?HttpReque
     errdefer if (content_type) |ct| allocator.free(ct);
     var auth_header: ?[]u8 = null;
     errdefer if (auth_header) |a| allocator.free(a);
+    var accept_encoding: ?[]u8 = null;
+    errdefer if (accept_encoding) |ae| allocator.free(ae);
+    var if_none_match: ?[]u8 = null;
+    errdefer if (if_none_match) |inm| allocator.free(inm);
+    var keep_alive = !std.mem.eql(u8, version_raw, "HTTP/1.0");
     var upgrade_ws = false;
     var ws_key: ?[]u8 = null;
     errdefer if (ws_key) |k| allocator.free(k);
@@ -150,6 +205,18 @@ pub fn readHttpRequest(allocator: Allocator, reader: *std.Io.Reader) !?HttpReque
         } else if (std.ascii.eqlIgnoreCase(hname, "Authorization")) {
             if (auth_header) |old| allocator.free(old);
             auth_header = try allocator.dupe(u8, hval);
+        } else if (std.ascii.eqlIgnoreCase(hname, "Accept-Encoding")) {
+            if (accept_encoding) |old| allocator.free(old);
+            accept_encoding = try allocator.dupe(u8, hval);
+        } else if (std.ascii.eqlIgnoreCase(hname, "If-None-Match")) {
+            if (if_none_match) |old| allocator.free(old);
+            if_none_match = try allocator.dupe(u8, hval);
+        } else if (std.ascii.eqlIgnoreCase(hname, "Connection")) {
+            if (containsAsciiIgnoreCase(hval, "close")) {
+                keep_alive = false;
+            } else if (containsAsciiIgnoreCase(hval, "keep-alive")) {
+                keep_alive = true;
+            }
         } else if (std.ascii.eqlIgnoreCase(hname, "Upgrade") and std.ascii.eqlIgnoreCase(hval, "websocket")) {
             upgrade_ws = true;
         } else if (std.ascii.eqlIgnoreCase(hname, "Sec-WebSocket-Key")) {
@@ -171,11 +238,27 @@ pub fn readHttpRequest(allocator: Allocator, reader: *std.Io.Reader) !?HttpReque
         .query = try allocator.dupe(u8, query_raw),
         .content_type = content_type,
         .authorization = auth_header,
+        .accept_encoding = accept_encoding,
+        .if_none_match = if_none_match,
+        .keep_alive = keep_alive,
         .upgrade_ws = upgrade_ws,
         .ws_key = ws_key,
         .body = body,
     };
 }
+
+const DispatchCtx = struct {
+    io: std.Io,
+    engine: *engine_mod.ConcaveEngine,
+    static_dir: ?[]const u8,
+    admin_key: ?[]const u8,
+    operator_token: ?[]const u8,
+
+    fn h2Dispatch(ptr: *anyopaque, allocator: Allocator, req: *const http2.H2Request) http2.H2Response {
+        const self: *DispatchCtx = @ptrCast(@alignCast(ptr));
+        return dispatchHttpRequest(allocator, self.io, self.engine, self.static_dir, self.admin_key, self.operator_token, req);
+    }
+};
 
 fn handleConnection(
     allocator: Allocator,
@@ -184,152 +267,190 @@ fn handleConnection(
     static_dir: ?[]const u8,
     admin_key: ?[]const u8,
     operator_token: ?[]const u8,
+    shutdown_flag: ?*std.atomic.Value(bool),
     stream: std.Io.net.Stream,
 ) void {
     defer stream.close(io);
-    t_active_engine = engine;
-    defer t_active_engine = null;
 
     var rbuf: [8192]u8 = undefined;
     var sr = stream.reader(io, &rbuf);
 
-    const maybe_req = readHttpRequest(allocator, &sr.interface) catch return;
-    const req = maybe_req orelse return;
-    defer req.deinit(allocator);
+    var dctx = DispatchCtx{
+        .io = io,
+        .engine = engine,
+        .static_dir = static_dir,
+        .admin_key = admin_key,
+        .operator_token = operator_token,
+    };
 
-    // WebSocket upgrade on `/ws`
-    if (req.upgrade_ws and std.mem.eql(u8, req.path, "/ws")) {
-        const key = req.ws_key orelse {
-            writeHttpResponse(io, stream, 400, "Bad Request", "text/plain", "missing Sec-WebSocket-Key");
+    var first_req = true;
+    while (true) {
+        if (shutdown_flag) |sf| {
+            if (sf.load(.acquire)) break;
+        }
+        const maybe_req = readHttpRequest(allocator, &sr.interface) catch return;
+        const req = maybe_req orelse return;
+        defer req.deinit(allocator);
+
+        // Seamless HTTP/2 (`h2c` prior knowledge) upgrade on first request preface
+        if (first_req and req.is_h2_preface) {
+            var tail: [6]u8 = undefined;
+            sr.interface.readSliceAll(&tail) catch return;
+            if (!std.mem.eql(u8, &tail, "SM\r\n\r\n")) return;
+            http2.serveConnection(allocator, io, stream, &sr.interface, @ptrCast(&dctx), &DispatchCtx.h2Dispatch);
             return;
-        };
-        var accept_buf: [28]u8 = undefined;
-        const accept = ws_mod.computeAcceptKey(key, &accept_buf);
+        }
+        first_req = false;
 
-        var wbuf: [512]u8 = undefined;
-        var sw = stream.writer(io, &wbuf);
-        sw.interface.print(
-            "HTTP/1.1 101 Switching Protocols\r\n" ++
-                "Upgrade: websocket\r\n" ++
-                "Connection: Upgrade\r\n" ++
-                "Sec-WebSocket-Accept: {s}\r\n\r\n",
-            .{accept},
-        ) catch return;
-        sw.interface.flush() catch return;
+        // WebSocket upgrade on `/ws`
+        if (req.upgrade_ws and std.mem.eql(u8, req.path, "/ws")) {
+            const key = req.ws_key orelse {
+                const err_resp = makePlainResponse(allocator, 400, "text/plain", "missing Sec-WebSocket-Key") catch return;
+                defer err_resp.deinit(allocator);
+                engine.metrics.recordHttpStatus(400);
+                writeHttp1Response(io, stream, &err_resp, false);
+                return;
+            };
+            var accept_buf: [28]u8 = undefined;
+            const accept = ws_mod.computeAcceptKey(key, &accept_buf);
 
-        handleWebSocket(allocator, io, engine, stream, &sr.interface);
-        return;
+            var wbuf: [512]u8 = undefined;
+            var sw = stream.writer(io, &wbuf);
+            sw.interface.print(
+                "HTTP/1.1 101 Switching Protocols\r\n" ++
+                    "Upgrade: websocket\r\n" ++
+                    "Connection: Upgrade\r\n" ++
+                    "Sec-WebSocket-Accept: {s}\r\n\r\n",
+                .{accept},
+            ) catch return;
+            sw.interface.flush() catch return;
+
+            handleWebSocket(allocator, io, engine, stream, &sr.interface);
+            return;
+        }
+
+        const h2_view = req.asH2View();
+        const resp = dispatchHttpRequest(allocator, io, engine, static_dir, admin_key, operator_token, &h2_view);
+        defer resp.deinit(allocator);
+
+        const shutting_down = if (shutdown_flag) |sf| sf.load(.acquire) else false;
+        const keep_conn = req.keep_alive and !shutting_down and resp.status < 400;
+        writeHttp1Response(io, stream, &resp, keep_conn);
+        if (!keep_conn) break;
     }
+}
+
+/// Unified HTTP/1.1 + HTTP/2 request router with zero-cost pre-compressed embedded assets,
+/// ETag/304 caching, and automatic gzip compression for dynamic & static payloads.
+fn dispatchHttpRequest(
+    allocator: Allocator,
+    io: std.Io,
+    engine: *engine_mod.ConcaveEngine,
+    static_dir: ?[]const u8,
+    admin_key: ?[]const u8,
+    operator_token: ?[]const u8,
+    req: *const http2.H2Request,
+) http2.H2Response {
+    const resp = dispatchHttpRequestInner(allocator, io, engine, static_dir, admin_key, operator_token, req);
+    engine.metrics.recordHttpStatus(resp.status);
+    return resp;
+}
+
+fn dispatchHttpRequestInner(
+    allocator: Allocator,
+    io: std.Io,
+    engine: *engine_mod.ConcaveEngine,
+    static_dir: ?[]const u8,
+    admin_key: ?[]const u8,
+    operator_token: ?[]const u8,
+    req: *const http2.H2Request,
+) http2.H2Response {
+    const want_gzip = compress.acceptsGzip(req.accept_encoding);
 
     // CORS preflight
     if (std.mem.eql(u8, req.method, "OPTIONS")) {
-        writeHttpResponse(io, stream, 204, "No Content", "text/plain", "");
-        return;
+        return makeEmptyResponse(204, "text/plain");
     }
 
     // Health & Readiness probes
     if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/health")) {
-        writeHttpResponse(io, stream, 200, "OK", "application/json", "{\"status\":\"ok\"}");
-        return;
+        return makeResponse(allocator, 200, "application/json", "{\"status\":\"ok\"}", false);
     }
     if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/ready")) {
         const ts = engine.readyCheck() catch {
-            writeHttpResponse(io, stream, 503, "Service Unavailable", "application/json", "{\"status\":\"unavailable\"}");
-            return;
+            return makeResponse(allocator, 503, "application/json", "{\"status\":\"unavailable\"}", false);
         };
-        const body = std.fmt.allocPrint(allocator, "{{\"status\":\"ready\",\"commit_ts\":{d}}}", .{ts}) catch return;
+        const body = std.fmt.allocPrint(allocator, "{{\"status\":\"ready\",\"commit_ts\":{d}}}", .{ts}) catch
+            return makeEmptyResponse(500, "application/json");
         defer allocator.free(body);
-        writeHttpResponse(io, stream, 200, "OK", "application/json", body);
-        return;
+        return makeResponse(allocator, 200, "application/json", body, false);
     }
 
     if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/api/manifest")) {
-        writeHttpResponse(io, stream, 200, "OK", "application/json", engine.manifest.raw_json);
-        return;
+        return makeResponse(allocator, 200, "application/json", engine.manifest.raw_json, want_gzip);
     }
 
-    // Embedded Live Dev Dashboard (`/_dashboard`)
-    if (std.mem.eql(u8, req.method, "GET") and
-        (std.mem.eql(u8, req.path, "/_dashboard") or std.mem.eql(u8, req.path, "/_dashboard/")))
-    {
-        writeHttpResponse(io, stream, 200, "OK", "text/html; charset=utf-8", DASHBOARD_INDEX_HTML);
-        return;
-    }
-    if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/_dashboard/styles.css")) {
-        writeHttpResponse(io, stream, 200, "OK", "text/css; charset=utf-8", DASHBOARD_STYLES_CSS);
-        return;
-    }
-    if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/_dashboard/app.js")) {
-        writeHttpResponse(io, stream, 200, "OK", "text/javascript; charset=utf-8", DASHBOARD_APP_JS);
-        return;
+    // Embedded Live Dev Dashboard (`/_dashboard`) — minified, pre-gzipped, ETag-cached
+    if (std.mem.eql(u8, req.method, "GET")) {
+        if (std.mem.eql(u8, req.path, "/_dashboard") or std.mem.eql(u8, req.path, "/_dashboard/")) {
+            return serveEmbeddedAsset(allocator, &assets.dashboard_index_html, want_gzip, req.if_none_match);
+        }
+        if (std.mem.eql(u8, req.path, "/_dashboard/styles.css")) {
+            return serveEmbeddedAsset(allocator, &assets.dashboard_styles_css, want_gzip, req.if_none_match);
+        }
+        if (std.mem.eql(u8, req.path, "/_dashboard/app.js")) {
+            return serveEmbeddedAsset(allocator, &assets.dashboard_app_js, want_gzip, req.if_none_match);
+        }
     }
 
     // Platform Operator Reliability Endpoints (`/_internal/metrics`, `/_internal/status`)
-    // Strictly owned by the platform operator; storage-independent and protected by `CONCAVE_OPERATOR_TOKEN`
-    // (falling back to `CONCAVE_ADMIN_KEY`, or dev mode when neither is configured).
     if (std.mem.eql(u8, req.method, "GET") and std.mem.startsWith(u8, req.path, "/_internal/")) {
         const expected_tok = operator_token orelse admin_key;
         if (!isOperatorAuthorized(engine, expected_tok, req.authorization, req.query)) {
             const status: u16 = if (expected_tok != null) 401 else 403;
-            const reason = if (expected_tok != null) "Unauthorized" else "Forbidden";
-            writeHttpResponse(io, stream, status, reason, "application/json", "{\"error\":\"operator access denied\"}");
-            return;
+            return makeResponse(allocator, status, "application/json", "{\"error\":\"operator access denied\"}", false);
         }
         if (std.mem.eql(u8, req.path, "/_internal/metrics")) {
-            const body = engine.formatPrometheusMetrics(allocator) catch {
-                writeHttpResponse(io, stream, 500, "Internal Server Error", "text/plain", "metrics unavailable");
-                return;
-            };
+            const body = engine.formatPrometheusMetrics(allocator) catch
+                return makeResponse(allocator, 500, "text/plain", "metrics unavailable", false);
             defer allocator.free(body);
-            writeHttpResponse(io, stream, 200, "OK", "text/plain; version=0.0.4; charset=utf-8", body);
-            return;
+            return makeResponse(allocator, 200, "text/plain; version=0.0.4; charset=utf-8", body, want_gzip);
         }
         if (std.mem.eql(u8, req.path, "/_internal/status")) {
-            const body = engine.formatInternalStatusJson(allocator) catch {
-                writeHttpResponse(io, stream, 500, "Internal Server Error", "application/json", "{\"error\":\"status unavailable\"}");
-                return;
-            };
+            const body = engine.formatInternalStatusJson(allocator) catch
+                return makeResponse(allocator, 500, "application/json", "{\"error\":\"status unavailable\"}", false);
             defer allocator.free(body);
-            writeHttpResponse(io, stream, 200, "OK", "application/json", body);
-            return;
+            return makeResponse(allocator, 200, "application/json", body, want_gzip);
         }
-        writeHttpResponse(io, stream, 404, "Not Found", "application/json", "{\"error\":\"unknown internal endpoint\"}");
-        return;
+        return makeResponse(allocator, 404, "application/json", "{\"error\":\"unknown internal endpoint\"}", false);
     }
 
     // Admin inspection endpoints (`/_admin/stats`, `/_admin/table`, `/_admin/jobs`)
     if (std.mem.eql(u8, req.method, "GET") and std.mem.startsWith(u8, req.path, "/_admin/")) {
         if (!isAdminAuthorized(engine, admin_key, req.authorization, req.query)) {
             const status: u16 = if (admin_key != null) 401 else 403;
-            const reason = if (admin_key != null) "Unauthorized" else "Forbidden";
-            writeHttpResponse(io, stream, status, reason, "application/json", "{\"error\":\"admin access denied\"}");
-            return;
+            return makeResponse(allocator, status, "application/json", "{\"error\":\"admin access denied\"}", false);
         }
         if (std.mem.eql(u8, req.path, "/_admin/stats")) {
             const stats = engine.getStats();
             const raw = engine.manifest.raw_json;
-            // Splice live runtime metrics into the manifest JSON object.
             const inner = if (raw.len >= 2 and raw[0] == '{' and raw[raw.len - 1] == '}') raw[1 .. raw.len - 1] else "";
             const body = std.fmt.allocPrint(
                 allocator,
                 "{{\"commit_ts\":{d},\"active_clients\":{d},\"active_subscriptions\":{d},{s}}}",
                 .{ stats.commit_ts, stats.active_clients, stats.active_subscriptions, inner },
-            ) catch return;
+            ) catch return makeEmptyResponse(500, "application/json");
             defer allocator.free(body);
-            writeHttpResponse(io, stream, 200, "OK", "application/json", body);
-            return;
+            return makeResponse(allocator, 200, "application/json", body, want_gzip);
         }
         if (std.mem.eql(u8, req.path, "/_admin/jobs")) {
-            const docs = engine.adminScanTable(allocator, "_system", "_scheduled_jobs", 100) catch {
-                writeHttpResponse(io, stream, 500, "Internal Server Error", "application/json", "{\"error\":\"failed to list jobs\"}");
-                return;
-            };
+            const docs = engine.adminScanTable(allocator, "_system", "_scheduled_jobs", 100) catch
+                return makeResponse(allocator, 500, "application/json", "{\"error\":\"failed to list jobs\"}", false);
             defer {
                 for (docs) |*d| d.deinit(allocator);
                 allocator.free(docs);
             }
-            sendDocsJsonArray(allocator, io, stream, docs);
-            return;
+            return buildDocsJsonResponse(allocator, docs, want_gzip);
         }
         if (std.mem.eql(u8, req.path, "/_admin/table")) {
             const ns = getQueryParamDecoded(allocator, req.query, "ns") catch null;
@@ -337,51 +458,44 @@ fn handleConnection(
             const tbl = getQueryParamDecoded(allocator, req.query, "table") catch null;
             defer if (tbl) |v| allocator.free(v);
             if (tbl == null or tbl.?.len == 0) {
-                writeHttpResponse(io, stream, 400, "Bad Request", "application/json", "{\"error\":\"missing table parameter\"}");
-                return;
+                return makeResponse(allocator, 400, "application/json", "{\"error\":\"missing table parameter\"}", false);
             }
             const lim_str = getQueryParamDecoded(allocator, req.query, "limit") catch null;
             defer if (lim_str) |v| allocator.free(v);
             const limit: usize = if (lim_str) |ls| std.fmt.parseInt(usize, ls, 10) catch 100 else 100;
 
-            const docs = engine.adminScanTable(allocator, ns orelse "", tbl.?, limit) catch {
-                writeHttpResponse(io, stream, 500, "Internal Server Error", "application/json", "{\"error\":\"failed to scan table\"}");
-                return;
-            };
+            const docs = engine.adminScanTable(allocator, ns orelse "", tbl.?, limit) catch
+                return makeResponse(allocator, 500, "application/json", "{\"error\":\"failed to scan table\"}", false);
             defer {
                 for (docs) |*d| d.deinit(allocator);
                 allocator.free(docs);
             }
-            sendDocsJsonArray(allocator, io, stream, docs);
-            return;
+            return buildDocsJsonResponse(allocator, docs, want_gzip);
         }
-        writeHttpResponse(io, stream, 404, "Not Found", "application/json", "{\"error\":\"unknown admin endpoint\"}");
-        return;
+        return makeResponse(allocator, 404, "application/json", "{\"error\":\"unknown admin endpoint\"}", false);
     }
 
-    // Embedded zero-dependency browser ESM client at `/_concave/{index,signals,client,dom}.js`
+    // Embedded zero-dependency browser ESM client at `/_concave/*` — bundled, minified, pre-gzipped, ETag-cached
     if (std.mem.eql(u8, req.method, "GET") and std.mem.startsWith(u8, req.path, "/_concave/")) {
         const file = req.path["/_concave/".len..];
-        const js: ?[]const u8 = if (std.mem.eql(u8, file, "index.js"))
-            CLIENT_INDEX_JS
+        const maybe_asset: ?*const assets.Asset = if (std.mem.eql(u8, file, "index.js"))
+            &assets.client_index_js
         else if (std.mem.eql(u8, file, "signals.js"))
-            CLIENT_SIGNALS_JS
+            &assets.client_signals_js
         else if (std.mem.eql(u8, file, "client.js"))
-            CLIENT_CLIENT_JS
+            &assets.client_client_js
         else if (std.mem.eql(u8, file, "dom.js"))
-            CLIENT_DOM_JS
+            &assets.client_dom_js
         else if (std.mem.eql(u8, file, "analytics.js"))
-            ANALYTICS_CLIENT_JS
+            &assets.analytics_client_js
         else if (std.mem.eql(u8, file, "monitor.js"))
-            MONITOR_CLIENT_JS
+            &assets.monitor_client_js
         else
             null;
-        if (js) |content| {
-            writeHttpResponse(io, stream, 200, "OK", "text/javascript; charset=utf-8", content);
-        } else {
-            writeHttpResponse(io, stream, 404, "Not Found", "text/plain", "not found");
+        if (maybe_asset) |a| {
+            return serveEmbeddedAsset(allocator, a, want_gzip, req.if_none_match);
         }
-        return;
+        return makeResponse(allocator, 404, "text/plain", "not found", false);
     }
 
     // HTTP RPC endpoints: `/api/query/<name>`, `/api/mutation/<name>`, `/api/action/<name>`
@@ -390,41 +504,31 @@ fn handleConnection(
         defer if (auth_id) |*a| a.deinit(allocator);
         if (req.authorization) |raw_auth| {
             auth_id = engine.verifyAuthToken(allocator, raw_auth) catch {
-                writeHttpResponse(io, stream, 401, "Unauthorized", "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}");
-                return;
+                return makeResponse(allocator, 401, "application/json", "{\"ok\":false,\"error\":\"unauthorized\"}", false);
             };
         }
         const args_json = if (req.body.len > 0) req.body else "{}";
 
         if (std.mem.startsWith(u8, req.path, "/api/query/")) {
             const name = req.path["/api/query/".len..];
-            const res = engine.executeQuery(allocator, name, args_json, if (auth_id) |*a| a else null) catch {
-                writeHttpResponse(io, stream, 500, "Internal Server Error", "application/json", "{\"ok\":false,\"error\":\"internal error\"}");
-                return;
-            };
+            const res = engine.executeQuery(allocator, name, args_json, if (auth_id) |*a| a else null) catch
+                return makeResponse(allocator, 500, "application/json", "{\"ok\":false,\"error\":\"internal error\"}", false);
             defer res.deinit(allocator);
-            sendHttpRpcResult(allocator, io, stream, res, null);
-            return;
+            return buildRpcResultResponse(allocator, res, null, want_gzip);
         }
         if (std.mem.startsWith(u8, req.path, "/api/mutation/")) {
             const name = req.path["/api/mutation/".len..];
-            const mres = engine.executeMutation(allocator, name, args_json, if (auth_id) |*a| a else null) catch {
-                writeHttpResponse(io, stream, 500, "Internal Server Error", "application/json", "{\"ok\":false,\"error\":\"internal error\"}");
-                return;
-            };
+            const mres = engine.executeMutation(allocator, name, args_json, if (auth_id) |*a| a else null) catch
+                return makeResponse(allocator, 500, "application/json", "{\"ok\":false,\"error\":\"internal error\"}", false);
             defer mres.deinit(allocator);
-            sendHttpRpcResult(allocator, io, stream, mres.result, if (mres.result == .ok) mres.commit_ts else null);
-            return;
+            return buildRpcResultResponse(allocator, mres.result, if (mres.result == .ok) mres.commit_ts else null, want_gzip);
         }
         if (std.mem.startsWith(u8, req.path, "/api/action/")) {
             const name = req.path["/api/action/".len..];
-            const res = engine.executeAction(allocator, name, args_json, if (auth_id) |*a| a else null) catch {
-                writeHttpResponse(io, stream, 500, "Internal Server Error", "application/json", "{\"ok\":false,\"error\":\"internal error\"}");
-                return;
-            };
+            const res = engine.executeAction(allocator, name, args_json, if (auth_id) |*a| a else null) catch
+                return makeResponse(allocator, 500, "application/json", "{\"ok\":false,\"error\":\"internal error\"}", false);
             defer res.deinit(allocator);
-            sendHttpRpcResult(allocator, io, stream, res, null);
-            return;
+            return buildRpcResultResponse(allocator, res, null, want_gzip);
         }
     }
 
@@ -432,43 +536,34 @@ fn handleConnection(
     if (std.mem.startsWith(u8, req.path, "/_storage/upload/") and
         (std.mem.eql(u8, req.method, "POST") or std.mem.eql(u8, req.method, "PUT")))
     {
-        const bs = engine.blob_store orelse {
-            writeHttpResponse(io, stream, 503, "Service Unavailable", "application/json", "{\"error\":\"storage not configured\"}");
-            return;
-        };
+        const bs = engine.blob_store orelse
+            return makeResponse(allocator, 503, "application/json", "{\"error\":\"storage not configured\"}", false);
         const token = req.path["/_storage/upload/".len..];
-        const storage_id = bs.verifyUploadToken(allocator, token) catch {
-            writeHttpResponse(io, stream, 403, "Forbidden", "application/json", "{\"error\":\"invalid or expired upload token\"}");
-            return;
-        };
+        const storage_id = bs.verifyUploadToken(allocator, token) catch
+            return makeResponse(allocator, 403, "application/json", "{\"error\":\"invalid or expired upload token\"}", false);
         defer allocator.free(storage_id);
         const ct = req.content_type orelse "application/octet-stream";
-        bs.putLocalBlob(storage_id, ct, req.body) catch {
-            writeHttpResponse(io, stream, 500, "Internal Server Error", "application/json", "{\"error\":\"failed to store blob\"}");
-            return;
-        };
+        bs.putLocalBlob(storage_id, ct, req.body) catch
+            return makeResponse(allocator, 500, "application/json", "{\"error\":\"failed to store blob\"}", false);
         var out: std.Io.Writer.Allocating = .init(allocator);
         defer out.deinit();
-        out.writer.writeAll("{\"storage_id\":") catch return;
-        storage_mod.writeJsonString(&out.writer, storage_id) catch return;
-        out.writer.writeByte('}') catch return;
-        writeHttpResponse(io, stream, 200, "OK", "application/json", out.written());
-        return;
+        out.writer.writeAll("{\"storage_id\":") catch return makeEmptyResponse(500, "application/json");
+        storage_mod.writeJsonString(&out.writer, storage_id) catch return makeEmptyResponse(500, "application/json");
+        out.writer.writeByte('}') catch return makeEmptyResponse(500, "application/json");
+        return makeResponse(allocator, 200, "application/json", out.written(), false);
     }
 
     if (std.mem.eql(u8, req.method, "GET") and std.mem.startsWith(u8, req.path, "/_storage/")) {
-        const bs = engine.blob_store orelse {
-            writeHttpResponse(io, stream, 503, "Service Unavailable", "text/plain", "storage not configured");
-            return;
-        };
+        const bs = engine.blob_store orelse
+            return makeResponse(allocator, 503, "text/plain", "storage not configured", false);
         const storage_id = req.path["/_storage/".len..];
-        const blob = bs.getLocalBlob(allocator, storage_id) catch {
-            writeHttpResponse(io, stream, 404, "Not Found", "text/plain", "blob not found");
-            return;
-        };
+        const blob = bs.getLocalBlob(allocator, storage_id) catch
+            return makeResponse(allocator, 404, "text/plain", "blob not found", false);
         defer blob.deinit(allocator);
-        writeHttpResponse(io, stream, 200, "OK", blob.content_type, blob.bytes);
-        return;
+        // Copy content_type-safe slice? Wait: `blob.content_type` is freed at defer; pick static mime or dupe?
+        // Return static common MIME or octet-stream to avoid lifetime issue on `H2Response.content_type`:
+        const ct_static = internCommonMime(blob.content_type);
+        return makeResponse(allocator, 200, ct_static, blob.bytes, want_gzip);
     }
 
     // Custom application HTTP routes / webhooks (`App.http_route`)
@@ -477,25 +572,24 @@ fn handleConnection(
         defer if (auth_id) |*a| a.deinit(allocator);
         if (req.authorization) |raw_auth| {
             auth_id = engine.verifyAuthToken(allocator, raw_auth) catch {
-                writeHttpResponse(io, stream, 401, "Unauthorized", "application/json", "{\"error\":\"unauthorized\"}");
-                return;
+                return makeResponse(allocator, 401, "application/json", "{\"error\":\"unauthorized\"}", false);
             };
         }
 
         var req_out: std.Io.Writer.Allocating = .init(allocator);
         defer req_out.deinit();
         const rw = &req_out.writer;
-        rw.writeAll("{\"method\":") catch return;
-        storage_mod.writeJsonString(rw, req.method) catch return;
-        rw.writeAll(",\"path\":") catch return;
-        storage_mod.writeJsonString(rw, req.path) catch return;
-        rw.writeAll(",\"query\":") catch return;
-        storage_mod.writeJsonString(rw, req.query) catch return;
-        rw.writeAll(",\"body\":") catch return;
-        storage_mod.writeJsonString(rw, req.body) catch return;
-        rw.writeAll(",\"content_type\":") catch return;
-        storage_mod.writeJsonString(rw, req.content_type orelse "") catch return;
-        rw.writeByte('}') catch return;
+        rw.writeAll("{\"method\":") catch return makeEmptyResponse(500, "application/json");
+        storage_mod.writeJsonString(rw, req.method) catch return makeEmptyResponse(500, "application/json");
+        rw.writeAll(",\"path\":") catch return makeEmptyResponse(500, "application/json");
+        storage_mod.writeJsonString(rw, req.path) catch return makeEmptyResponse(500, "application/json");
+        rw.writeAll(",\"query\":") catch return makeEmptyResponse(500, "application/json");
+        storage_mod.writeJsonString(rw, req.query) catch return makeEmptyResponse(500, "application/json");
+        rw.writeAll(",\"body\":") catch return makeEmptyResponse(500, "application/json");
+        storage_mod.writeJsonString(rw, req.body) catch return makeEmptyResponse(500, "application/json");
+        rw.writeAll(",\"content_type\":") catch return makeEmptyResponse(500, "application/json");
+        storage_mod.writeJsonString(rw, req.content_type orelse "") catch return makeEmptyResponse(500, "application/json");
+        rw.writeByte('}') catch return makeEmptyResponse(500, "application/json");
 
         const res = engine.executeHttpRoute(
             allocator,
@@ -503,10 +597,7 @@ fn handleConnection(
             req.path,
             req_out.written(),
             if (auth_id) |*a| a else null,
-        ) catch {
-            writeHttpResponse(io, stream, 500, "Internal Server Error", "application/json", "{\"error\":\"internal error\"}");
-            return;
-        };
+        ) catch return makeResponse(allocator, 500, "application/json", "{\"error\":\"internal error\"}", false);
         defer res.deinit(allocator);
 
         switch (res) {
@@ -514,15 +605,14 @@ fn handleConnection(
                 var arena = std.heap.ArenaAllocator.init(allocator);
                 defer arena.deinit();
                 const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), val, .{}) catch {
-                    writeHttpResponse(io, stream, 200, "OK", "application/json", val);
-                    return;
+                    return makeResponse(allocator, 200, "application/json", val, want_gzip);
                 };
                 if (parsed == .object) {
                     const status: u16 = if (parsed.object.get("status")) |sv|
                         (if (sv == .integer and sv.integer >= 100 and sv.integer <= 599) @intCast(sv.integer) else 200)
                     else
                         200;
-                    const ct = if (parsed.object.get("content_type")) |cv|
+                    const ct_raw = if (parsed.object.get("content_type")) |cv|
                         (if (cv == .string and cv.string.len > 0) cv.string else "application/json")
                     else
                         "application/json";
@@ -530,56 +620,141 @@ fn handleConnection(
                         (if (bv == .string) bv.string else "")
                     else
                         "";
-                    writeHttpResponse(io, stream, status, httpStatusReason(status), ct, resp_body);
-                    return;
+                    return makeResponse(allocator, status, internCommonMime(ct_raw), resp_body, want_gzip);
                 }
-                writeHttpResponse(io, stream, 200, "OK", "application/json", val);
-                return;
+                return makeResponse(allocator, 200, "application/json", val, want_gzip);
             },
             .err => |msg| {
                 var eout: std.Io.Writer.Allocating = .init(allocator);
                 defer eout.deinit();
-                eout.writer.writeAll("{\"error\":") catch return;
-                storage_mod.writeJsonString(&eout.writer, msg) catch return;
-                eout.writer.writeByte('}') catch return;
-                writeHttpResponse(io, stream, 500, "Internal Server Error", "application/json", eout.written());
-                return;
+                eout.writer.writeAll("{\"error\":") catch return makeEmptyResponse(500, "application/json");
+                storage_mod.writeJsonString(&eout.writer, msg) catch return makeEmptyResponse(500, "application/json");
+                eout.writer.writeByte('}') catch return makeEmptyResponse(500, "application/json");
+                return makeResponse(allocator, 500, "application/json", eout.written(), false);
             },
         }
     }
 
-    // Static frontend serving from `--static-dir`
+    // Static frontend serving from `--static-dir` (with ETag/304 + gzip compression)
     if (std.mem.eql(u8, req.method, "GET")) {
         if (static_dir) |root| {
-            serveStaticFile(allocator, io, stream, root, req.path);
-            return;
+            return serveStaticFileResponse(allocator, io, root, req.path, want_gzip, req.if_none_match);
         }
     }
 
-    writeHttpResponse(io, stream, 404, "Not Found", "text/plain", "not found");
+    return makeResponse(allocator, 404, "text/plain", "not found", false);
 }
 
-fn sendHttpRpcResult(allocator: Allocator, io: std.Io, stream: std.Io.net.Stream, res: engine_mod.ExecResult, commit_ts: ?i64) void {
+fn serveEmbeddedAsset(
+    allocator: Allocator,
+    asset: *const assets.Asset,
+    want_gzip: bool,
+    if_none_match: ?[]const u8,
+) http2.H2Response {
+    const etag_copy = allocator.dupe(u8, asset.etag) catch null;
+    if (compress.etagMatches(if_none_match, asset.etag)) {
+        return .{
+            .status = 304,
+            .content_type = asset.content_type,
+            .body = allocator.alloc(u8, 0) catch &.{},
+            .etag = etag_copy,
+            .cache_control = "public, max-age=3600",
+        };
+    }
+    const use_gz = want_gzip and asset.gzip.len < asset.raw.len;
+    const payload = if (use_gz) asset.gzip else asset.raw;
+    const body = allocator.dupe(u8, payload) catch {
+        if (etag_copy) |e| allocator.free(e);
+        return makeEmptyResponse(500, "text/plain");
+    };
+    return .{
+        .status = 200,
+        .content_type = asset.content_type,
+        .body = body,
+        .content_encoding = if (use_gz) "gzip" else null,
+        .etag = etag_copy,
+        .cache_control = "public, max-age=3600",
+    };
+}
+
+fn makeEmptyResponse(status: u16, content_type: []const u8) http2.H2Response {
+    return .{
+        .status = status,
+        .content_type = content_type,
+        .body = &.{},
+    };
+}
+
+fn makePlainResponse(allocator: Allocator, status: u16, content_type: []const u8, body: []const u8) !http2.H2Response {
+    return .{
+        .status = status,
+        .content_type = content_type,
+        .body = try allocator.dupe(u8, body),
+    };
+}
+
+fn makeResponse(
+    allocator: Allocator,
+    status: u16,
+    content_type: []const u8,
+    raw_body: []const u8,
+    want_gzip: bool,
+) http2.H2Response {
+    if (want_gzip and raw_body.len >= DYNAMIC_GZIP_MIN_BYTES and compress.isCompressibleMime(content_type)) {
+        if (compress.gzipCompress(allocator, raw_body, .fast)) |gz| {
+            if (gz.len < raw_body.len) {
+                return .{
+                    .status = status,
+                    .content_type = content_type,
+                    .body = gz,
+                    .content_encoding = "gzip",
+                };
+            }
+            allocator.free(gz);
+        } else |_| {}
+    }
+    return .{
+        .status = status,
+        .content_type = content_type,
+        .body = allocator.dupe(u8, raw_body) catch &.{},
+    };
+}
+
+fn buildRpcResultResponse(allocator: Allocator, res: engine_mod.ExecResult, commit_ts: ?i64, want_gzip: bool) http2.H2Response {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const w = &out.writer;
     switch (res) {
         .ok => |val| {
-            w.writeAll("{\"ok\":true,\"value\":") catch return;
-            w.writeAll(val) catch return;
+            w.writeAll("{\"ok\":true,\"value\":") catch return makeEmptyResponse(500, "application/json");
+            w.writeAll(val) catch return makeEmptyResponse(500, "application/json");
             if (commit_ts) |ts| {
-                w.print(",\"commit_ts\":{d}", .{ts}) catch return;
+                w.print(",\"commit_ts\":{d}", .{ts}) catch return makeEmptyResponse(500, "application/json");
             }
-            w.writeByte('}') catch return;
-            writeHttpResponse(io, stream, 200, "OK", "application/json", out.written());
+            w.writeByte('}') catch return makeEmptyResponse(500, "application/json");
+            return makeResponse(allocator, 200, "application/json", out.written(), want_gzip);
         },
         .err => |msg| {
-            w.writeAll("{\"ok\":false,\"error\":") catch return;
-            storage_mod.writeJsonString(w, msg) catch return;
-            w.writeByte('}') catch return;
-            writeHttpResponse(io, stream, 400, "Bad Request", "application/json", out.written());
+            w.writeAll("{\"ok\":false,\"error\":") catch return makeEmptyResponse(500, "application/json");
+            storage_mod.writeJsonString(w, msg) catch return makeEmptyResponse(500, "application/json");
+            w.writeByte('}') catch return makeEmptyResponse(500, "application/json");
+            return makeResponse(allocator, 400, "application/json", out.written(), false);
         },
     }
+}
+
+fn buildDocsJsonResponse(allocator: Allocator, docs: []const storage_mod.Document, want_gzip: bool) http2.H2Response {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    out.writer.writeByte('[') catch return makeEmptyResponse(500, "application/json");
+    for (docs, 0..) |*d, i| {
+        if (i > 0) out.writer.writeByte(',') catch return makeEmptyResponse(500, "application/json");
+        const wj = d.toWireJson(allocator) catch return makeEmptyResponse(500, "application/json");
+        defer allocator.free(wj);
+        out.writer.writeAll(wj) catch return makeEmptyResponse(500, "application/json");
+    }
+    out.writer.writeByte(']') catch return makeEmptyResponse(500, "application/json");
+    return makeResponse(allocator, 200, "application/json", out.written(), want_gzip);
 }
 
 /// Decode percent-encoding and reject path traversal (`..`, `\`, NUL bytes, control chars).
@@ -617,24 +792,45 @@ pub fn sanitizeStaticPath(allocator: Allocator, raw_path: []const u8) ![]u8 {
     return try allocator.dupe(u8, rel);
 }
 
-fn serveStaticFile(allocator: Allocator, io: std.Io, stream: std.Io.net.Stream, root: []const u8, raw_path: []const u8) void {
-    const rel = sanitizeStaticPath(allocator, raw_path) catch {
-        writeHttpResponse(io, stream, 403, "Forbidden", "text/plain", "forbidden");
-        return;
-    };
+fn serveStaticFileResponse(
+    allocator: Allocator,
+    io: std.Io,
+    root: []const u8,
+    raw_path: []const u8,
+    want_gzip: bool,
+    if_none_match: ?[]const u8,
+) http2.H2Response {
+    const rel = sanitizeStaticPath(allocator, raw_path) catch
+        return makeResponse(allocator, 403, "text/plain", "forbidden", false);
     defer allocator.free(rel);
 
-    const full_path = std.fs.path.join(allocator, &.{ root, rel }) catch return;
+    const full_path = std.fs.path.join(allocator, &.{ root, rel }) catch
+        return makeEmptyResponse(500, "text/plain");
     defer allocator.free(full_path);
 
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, full_path, allocator, .limited(16 * 1024 * 1024)) catch {
-        writeHttpResponse(io, stream, 404, "Not Found", "text/plain", "not found");
-        return;
-    };
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, full_path, allocator, .limited(16 * 1024 * 1024)) catch
+        return makeResponse(allocator, 404, "text/plain", "not found", false);
     defer allocator.free(bytes);
 
     const mime = mimeType(full_path);
-    writeHttpResponse(io, stream, 200, "OK", mime, bytes);
+    var etag_buf: [18]u8 = undefined;
+    const etag = compress.computeEtag(bytes, &etag_buf);
+    const etag_copy = allocator.dupe(u8, etag) catch null;
+
+    if (compress.etagMatches(if_none_match, etag)) {
+        return .{
+            .status = 304,
+            .content_type = mime,
+            .body = allocator.alloc(u8, 0) catch &.{},
+            .etag = etag_copy,
+            .cache_control = "public, max-age=60",
+        };
+    }
+
+    var resp = makeResponse(allocator, 200, mime, bytes, want_gzip);
+    resp.etag = etag_copy;
+    resp.cache_control = "public, max-age=60";
+    return resp;
 }
 
 fn mimeType(path: []const u8) []const u8 {
@@ -644,39 +840,69 @@ fn mimeType(path: []const u8) []const u8 {
     if (std.mem.endsWith(u8, path, ".json")) return "application/json; charset=utf-8";
     if (std.mem.endsWith(u8, path, ".svg")) return "image/svg+xml";
     if (std.mem.endsWith(u8, path, ".png")) return "image/png";
+    if (std.mem.endsWith(u8, path, ".jpg") or std.mem.endsWith(u8, path, ".jpeg")) return "image/jpeg";
+    if (std.mem.endsWith(u8, path, ".webp")) return "image/webp";
     if (std.mem.endsWith(u8, path, ".wasm")) return "application/wasm";
     return "application/octet-stream";
 }
 
-threadlocal var t_active_engine: ?*engine_mod.ConcaveEngine = null;
+fn internCommonMime(ct: []const u8) []const u8 {
+    if (std.mem.eql(u8, ct, "application/json")) return "application/json";
+    if (std.mem.eql(u8, ct, "application/json; charset=utf-8")) return "application/json; charset=utf-8";
+    if (std.mem.eql(u8, ct, "text/plain")) return "text/plain";
+    if (std.mem.eql(u8, ct, "text/plain; charset=utf-8")) return "text/plain; charset=utf-8";
+    if (std.mem.eql(u8, ct, "text/html")) return "text/html";
+    if (std.mem.eql(u8, ct, "text/html; charset=utf-8")) return "text/html; charset=utf-8";
+    if (std.mem.eql(u8, ct, "text/css; charset=utf-8")) return "text/css; charset=utf-8";
+    if (std.mem.eql(u8, ct, "text/javascript; charset=utf-8")) return "text/javascript; charset=utf-8";
+    if (std.mem.eql(u8, ct, "image/png")) return "image/png";
+    if (std.mem.eql(u8, ct, "image/jpeg")) return "image/jpeg";
+    if (std.mem.eql(u8, ct, "image/svg+xml")) return "image/svg+xml";
+    if (std.mem.eql(u8, ct, "image/webp")) return "image/webp";
+    if (std.mem.eql(u8, ct, "application/pdf")) return "application/pdf";
+    return "application/octet-stream";
+}
 
-fn writeHttpResponse(
+fn writeHttp1Response(
     io: std.Io,
     stream: std.Io.net.Stream,
-    status: u16,
-    reason: []const u8,
-    content_type: []const u8,
-    body: []const u8,
+    resp: *const http2.H2Response,
+    keep_alive: bool,
 ) void {
-    if (t_active_engine) |eng| {
-        eng.metrics.recordHttpStatus(status);
-    }
     var wbuf: [4096]u8 = undefined;
     var sw = stream.writer(io, &wbuf);
-    sw.interface.print(
+    const w = &sw.interface;
+    w.print(
         "HTTP/1.1 {d} {s}\r\n" ++
             "Content-Type: {s}\r\n" ++
             "Content-Length: {d}\r\n" ++
+            "Vary: Accept-Encoding\r\n" ++
             "Access-Control-Allow-Origin: *\r\n" ++
             "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
             "Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n" ++
-            "Connection: close\r\n\r\n",
-        .{ status, reason, content_type, body.len },
+            "Connection: {s}\r\n",
+        .{
+            resp.status,
+            httpStatusReason(resp.status),
+            resp.content_type,
+            resp.body.len,
+            if (keep_alive) "keep-alive" else "close",
+        },
     ) catch return;
-    if (body.len > 0) {
-        sw.interface.writeAll(body) catch return;
+    if (resp.content_encoding) |ce| {
+        w.print("Content-Encoding: {s}\r\n", .{ce}) catch return;
     }
-    sw.interface.flush() catch {};
+    if (resp.etag) |et| {
+        w.print("ETag: {s}\r\n", .{et}) catch return;
+    }
+    if (resp.cache_control) |cc| {
+        w.print("Cache-Control: {s}\r\n", .{cc}) catch return;
+    }
+    w.writeAll("\r\n") catch return;
+    if (resp.body.len > 0) {
+        w.writeAll(resp.body) catch return;
+    }
+    w.flush() catch {};
 }
 
 fn handleWebSocket(
@@ -877,6 +1103,16 @@ fn timingSafeStrEql(a: []const u8, b: []const u8) bool {
     return diff == 0;
 }
 
+fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
 fn getQueryParamDecoded(allocator: Allocator, query: []const u8, key: []const u8) !?[]u8 {
     var pairs = std.mem.splitScalar(u8, query, '&');
     while (pairs.next()) |pair| {
@@ -908,20 +1144,6 @@ fn getQueryParamDecoded(allocator: Allocator, query: []const u8, key: []const u8
     return null;
 }
 
-fn sendDocsJsonArray(allocator: Allocator, io: std.Io, stream: std.Io.net.Stream, docs: []const storage_mod.Document) void {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    out.writer.writeByte('[') catch return;
-    for (docs, 0..) |*d, i| {
-        if (i > 0) out.writer.writeByte(',') catch return;
-        const wj = d.toWireJson(allocator) catch return;
-        defer allocator.free(wj);
-        out.writer.writeAll(wj) catch return;
-    }
-    out.writer.writeByte(']') catch return;
-    writeHttpResponse(io, stream, 200, "OK", "application/json", out.written());
-}
-
 fn httpStatusReason(status: u16) []const u8 {
     return switch (status) {
         200 => "OK",
@@ -930,6 +1152,7 @@ fn httpStatusReason(status: u16) []const u8 {
         204 => "No Content",
         301 => "Moved Permanently",
         302 => "Found",
+        304 => "Not Modified",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",

@@ -9,6 +9,8 @@ comptime {
     _ = @import("core/blob_store.zig");
     _ = @import("codegen/codegen.zig");
     _ = @import("runtime/auth.zig");
+    _ = @import("runtime/compress.zig");
+    _ = @import("runtime/http2.zig");
     _ = @import("runtime/ws.zig");
     _ = @import("runtime/http_client.zig");
     _ = @import("runtime/metrics.zig");

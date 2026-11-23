@@ -4,6 +4,31 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // 0. Build-time zero-dependency asset bundler, JS/CSS/HTML minifier, ETag & gzip pre-compressor.
+    const asset_tool_mod = b.createModule(.{
+        .root_source_file = b.path("zig/tools/minify_assets.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseFast,
+    });
+    const asset_tool = b.addExecutable(.{
+        .name = "minify_assets",
+        .root_module = asset_tool_mod,
+    });
+    const run_assets = b.addRunArtifact(asset_tool);
+    const embedded_assets_file = run_assets.addOutputFileArg("embedded_assets.zig");
+    run_assets.addFileArg(b.path("client/concave-client/src/signals.js"));
+    run_assets.addFileArg(b.path("client/concave-client/src/client.js"));
+    run_assets.addFileArg(b.path("client/concave-client/src/dom.js"));
+    run_assets.addFileArg(b.path("packages/analytics/client.js"));
+    run_assets.addFileArg(b.path("packages/monitor/client.js"));
+    run_assets.addFileArg(b.path("client/concave-dashboard/index.html"));
+    run_assets.addFileArg(b.path("client/concave-dashboard/styles.css"));
+    run_assets.addFileArg(b.path("client/concave-dashboard/app.js"));
+
+    const embedded_assets_mod = b.createModule(.{
+        .root_source_file = embedded_assets_file,
+    });
+
     // 1. Native Roc 0.1.0_RC1 static library host (`libhost.a`) — ZERO third-party dependencies!
     const host_mod = b.createModule(.{
         .root_source_file = b.path("zig/host_root.zig"),
@@ -12,33 +37,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .pic = true,
     });
-    host_mod.addAnonymousImport("concave_client_index_js", .{
-        .root_source_file = b.path("client/concave-client/src/index.js"),
-    });
-    host_mod.addAnonymousImport("concave_client_signals_js", .{
-        .root_source_file = b.path("client/concave-client/src/signals.js"),
-    });
-    host_mod.addAnonymousImport("concave_client_client_js", .{
-        .root_source_file = b.path("client/concave-client/src/client.js"),
-    });
-    host_mod.addAnonymousImport("concave_client_dom_js", .{
-        .root_source_file = b.path("client/concave-client/src/dom.js"),
-    });
-    host_mod.addAnonymousImport("concave_analytics_client_js", .{
-        .root_source_file = b.path("packages/analytics/client.js"),
-    });
-    host_mod.addAnonymousImport("concave_monitor_client_js", .{
-        .root_source_file = b.path("packages/monitor/client.js"),
-    });
-    host_mod.addAnonymousImport("concave_dashboard_index_html", .{
-        .root_source_file = b.path("client/concave-dashboard/index.html"),
-    });
-    host_mod.addAnonymousImport("concave_dashboard_styles_css", .{
-        .root_source_file = b.path("client/concave-dashboard/styles.css"),
-    });
-    host_mod.addAnonymousImport("concave_dashboard_app_js", .{
-        .root_source_file = b.path("client/concave-dashboard/app.js"),
-    });
+    host_mod.addImport("embedded_assets", embedded_assets_mod);
 
     const host_lib = b.addLibrary(.{
         .name = "host",
@@ -80,33 +79,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    test_mod.addAnonymousImport("concave_client_index_js", .{
-        .root_source_file = b.path("client/concave-client/src/index.js"),
-    });
-    test_mod.addAnonymousImport("concave_client_signals_js", .{
-        .root_source_file = b.path("client/concave-client/src/signals.js"),
-    });
-    test_mod.addAnonymousImport("concave_client_client_js", .{
-        .root_source_file = b.path("client/concave-client/src/client.js"),
-    });
-    test_mod.addAnonymousImport("concave_client_dom_js", .{
-        .root_source_file = b.path("client/concave-client/src/dom.js"),
-    });
-    test_mod.addAnonymousImport("concave_analytics_client_js", .{
-        .root_source_file = b.path("packages/analytics/client.js"),
-    });
-    test_mod.addAnonymousImport("concave_monitor_client_js", .{
-        .root_source_file = b.path("packages/monitor/client.js"),
-    });
-    test_mod.addAnonymousImport("concave_dashboard_index_html", .{
-        .root_source_file = b.path("client/concave-dashboard/index.html"),
-    });
-    test_mod.addAnonymousImport("concave_dashboard_styles_css", .{
-        .root_source_file = b.path("client/concave-dashboard/styles.css"),
-    });
-    test_mod.addAnonymousImport("concave_dashboard_app_js", .{
-        .root_source_file = b.path("client/concave-dashboard/app.js"),
-    });
+    test_mod.addImport("embedded_assets", embedded_assets_mod);
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
     });

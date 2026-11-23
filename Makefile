@@ -77,6 +77,7 @@ test-e2e: host codegen-chat
 	node --test --test-timeout=20000 tests/e2e_monitor.mjs
 	node --test --test-timeout=25000 tests/e2e_platform_features.mjs
 	node --test --test-timeout=25000 tests/e2e_production_hardening.mjs
+	node --test --test-timeout=20000 tests/e2e_http2_compression.mjs
 
 test-ws: host
 	node --test --test-timeout=15000 tests/ws_conformance.mjs
