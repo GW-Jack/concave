@@ -149,6 +149,51 @@ App := {
         }
     }
 
+    ## Register a zero-parse pass-through reactive Query whose handler returns pre-encoded JSON
+    ## (e.g. from `Db.collect_raw!`), skipping redundant JSON decode/encode while keeping full schema & codegen.
+    query_raw :
+        App,
+        Str,
+        Schema,
+        Schema,
+        (Ctx.QueryCtx, args => Try(Str, Str))
+        -> App
+        where [
+            args.Json.Parseable([InvalidJson(Str)]),
+        ]
+    query_raw = |a, name, args_schema, returns_schema, handler!| {
+        wrapped! : Ctx.QueryCtx, Str => Try(Str, Str)
+        wrapped! = |ctx, raw_args| {
+            parsed : args
+            parsed = match Json.parse(raw_args) {
+                Ok(v) => v
+                Err(InvalidJson(msg)) => return Err("invalid query args for `${name}`: ${msg}")
+            }
+            handler!(ctx, parsed)
+        }
+        entry : QueryEntry
+        entry = {
+            meta: {
+                name,
+                kind: Query,
+                namespace: "",
+                args_schema,
+                returns_schema,
+            },
+            run!: Box.box(wrapped!),
+        }
+        {
+            app_name: a.app_name,
+            tables: a.tables,
+            components: a.components,
+            queries: List.append(a.queries, entry),
+            mutations: a.mutations,
+            actions: a.actions,
+            crons: a.crons,
+            http_routes: a.http_routes,
+        }
+    }
+
     ## Register a typed reactive Query endpoint scoped to a mounted Component's namespace.
     component_query :
         App,

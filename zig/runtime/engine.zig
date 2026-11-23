@@ -78,6 +78,13 @@ pub const ExecutionEnv = struct {
         };
     }
 
+    pub fn dbQueryToWireJson(self: *ExecutionEnv, allocator: Allocator, query: *const storage_mod.IndexQuery, w: *std.Io.Writer) !void {
+        return switch (self.mode) {
+            .tx => |t| t.scanIndexToWireJson(allocator, query, w),
+            .action => error.DbNotAllowedInAction,
+        };
+    }
+
     pub fn dbPaginate(
         self: *ExecutionEnv,
         allocator: Allocator,
@@ -232,10 +239,19 @@ pub const AppExecutor = struct {
 pub const ClientSink = struct {
     ptr: *anyopaque,
     sendFn: *const fn (ptr: *anyopaque, payload: []const u8) void,
+    sendBinaryFn: ?*const fn (ptr: *anyopaque, payload: []const u8) void = null,
     closeFn: ?*const fn (ptr: *anyopaque) void = null,
 
     pub fn send(self: ClientSink, payload: []const u8) void {
         self.sendFn(self.ptr, payload);
+    }
+
+    pub fn sendBinary(self: ClientSink, payload: []const u8) void {
+        if (self.sendBinaryFn) |f| {
+            f(self.ptr, payload);
+        } else {
+            self.sendFn(self.ptr, payload);
+        }
     }
 
     pub fn close(self: ClientSink) void {
@@ -248,12 +264,21 @@ pub const ClientSink = struct {
                 const ws: *ws_mod.WsSender = @ptrCast(@alignCast(ptr));
                 ws.sendText(payload) catch {};
             }
+            fn sendBin(ptr: *anyopaque, payload: []const u8) void {
+                const ws: *ws_mod.WsSender = @ptrCast(@alignCast(ptr));
+                ws.sendBinary(payload) catch {};
+            }
             fn closeWs(ptr: *anyopaque) void {
                 const ws: *ws_mod.WsSender = @ptrCast(@alignCast(ptr));
                 ws.sendClose();
             }
         };
-        return .{ .ptr = @ptrCast(sender), .sendFn = &Wrapper.sendText, .closeFn = &Wrapper.closeWs };
+        return .{
+            .ptr = @ptrCast(sender),
+            .sendFn = &Wrapper.sendText,
+            .sendBinaryFn = &Wrapper.sendBin,
+            .closeFn = &Wrapper.closeWs,
+        };
     }
 };
 
@@ -283,6 +308,7 @@ const ActiveSubscription = struct {
 const ClientSession = struct {
     id: u64,
     sink: ClientSink,
+    binary_protocol: bool = false,
     auth: ?auth_mod.AuthIdentity = null,
     subscriptions: std.StringHashMapUnmanaged(ActiveSubscription) = .empty,
 
@@ -309,6 +335,8 @@ pub const ConcaveEngine = struct {
     clients_mutex: std.Io.Mutex = .init,
     clients: std.AutoHashMapUnmanaged(u64, *ClientSession) = .empty,
     next_client_id: std.atomic.Value(u64) = .init(1),
+    /// Atomic count of active + in-progress subscriptions for lock-free zero-sub commit fast path.
+    active_sub_count: std.atomic.Value(usize) = .init(0),
 
     last_broadcast_ts: std.atomic.Value(i64) = .init(0),
     sync_mutex: std.Io.Mutex = .init,
@@ -449,10 +477,22 @@ pub const ConcaveEngine = struct {
         return id;
     }
 
+    pub fn setClientBinaryProtocol(self: *ConcaveEngine, client_id: u64, enabled: bool) void {
+        self.clients_mutex.lockUncancelable(self.io);
+        defer self.clients_mutex.unlock(self.io);
+        if (self.clients.get(client_id)) |sess| {
+            sess.binary_protocol = enabled;
+        }
+    }
+
     pub fn unregisterClient(self: *ConcaveEngine, client_id: u64) void {
         self.clients_mutex.lockUncancelable(self.io);
         defer self.clients_mutex.unlock(self.io);
         if (self.clients.fetchRemove(client_id)) |kv| {
+            const removed_subs = kv.value.subscriptions.count();
+            if (removed_subs > 0) {
+                _ = self.active_sub_count.fetchSub(removed_subs, .seq_cst);
+            }
             kv.value.deinit(self.allocator);
             self.allocator.destroy(kv.value);
         }
@@ -467,10 +507,21 @@ pub const ConcaveEngine = struct {
     }
 
     pub fn authenticateClient(self: *ConcaveEngine, client_id: u64, token: ?[]const u8) ![]u8 {
+        return self.authenticateClientWithMode(client_id, token, false);
+    }
+
+    pub fn authenticateClientBinary(self: *ConcaveEngine, client_id: u64, token: ?[]const u8) ![]u8 {
+        return self.authenticateClientWithMode(client_id, token, true);
+    }
+
+    fn authenticateClientWithMode(self: *ConcaveEngine, client_id: u64, token: ?[]const u8, binary_reply: bool) ![]u8 {
         var new_auth: ?auth_mod.AuthIdentity = null;
         if (token) |tok| {
             new_auth = auth_mod.verifyToken(self.allocator, self.io, self.auth_config, tok) catch |err| {
-                return try formatAuthError(self.allocator, @errorName(err));
+                return if (binary_reply)
+                    try formatAuthErrorBinary(self.allocator, @errorName(err))
+                else
+                    try formatAuthError(self.allocator, @errorName(err));
             };
         }
         defer if (new_auth) |*a| a.deinit(self.allocator);
@@ -489,11 +540,16 @@ pub const ConcaveEngine = struct {
             to_rerun.deinit(self.allocator);
         }
 
+        var use_binary_push = binary_reply;
         {
             self.clients_mutex.lockUncancelable(self.io);
             defer self.clients_mutex.unlock(self.io);
             const sess = self.clients.get(client_id) orelse
-                return try formatAuthError(self.allocator, "client disconnected");
+                return if (binary_reply)
+                    try formatAuthErrorBinary(self.allocator, "client disconnected")
+                else
+                    try formatAuthError(self.allocator, "client disconnected");
+            use_binary_push = sess.binary_protocol or binary_reply;
             if (sess.auth) |*old| old.deinit(self.allocator);
             sess.auth = if (new_auth) |*a| try a.clone(self.allocator) else null;
 
@@ -543,12 +599,18 @@ pub const ConcaveEngine = struct {
                 self.clients_mutex.unlock(self.io);
             }
 
-            const frame_json = try formatTransition(self.allocator, to_ts, updates.items);
-            defer self.allocator.free(frame_json);
-            self.sendToClientLockedCheck(client_id, frame_json);
+            const frame = if (use_binary_push)
+                try formatTransitionBinary(self.allocator, to_ts, updates.items)
+            else
+                try formatTransition(self.allocator, to_ts, updates.items);
+            defer self.allocator.free(frame);
+            self.sendToClientLockedCheck(client_id, frame, use_binary_push);
         }
 
-        return try formatAuthOk(self.allocator, if (new_auth) |*a| a else null);
+        return if (binary_reply)
+            try formatAuthOkBinary(self.allocator, if (new_auth) |*a| a else null)
+        else
+            try formatAuthOk(self.allocator, if (new_auth) |*a| a else null);
     }
 
     pub fn subscribe(self: *ConcaveEngine, client_id: u64, sub_id: []const u8, name: []const u8, args_json: []const u8) !void {
@@ -557,6 +619,14 @@ pub const ConcaveEngine = struct {
         // (eliminating both lost-update races and out-of-order `commit_ts` frames).
         self.sync_mutex.lockUncancelable(self.io);
         defer self.sync_mutex.unlock(self.io);
+
+        // Reserve an active-subscription slot BEFORE reading `snapshot_ts` so concurrent
+        // `handleLocalCommit` calls cannot take the zero-sub lock-free fast path and miss this sub.
+        _ = self.active_sub_count.fetchAdd(1, .seq_cst);
+        var slot_transferred = false;
+        defer if (!slot_transferred) {
+            _ = self.active_sub_count.fetchSub(1, .seq_cst);
+        };
 
         var auth_copy = self.cloneClientAuth(self.allocator, client_id);
         defer if (auth_copy) |*a| a.deinit(self.allocator);
@@ -571,8 +641,6 @@ pub const ConcaveEngine = struct {
             .sub_id = @constCast(sub_id),
             .result = ran.result,
         }};
-        const frame_json = try formatTransition(self.allocator, ran.snapshot_ts, &single_upd);
-        defer self.allocator.free(frame_json);
 
         var had_any_subs_before = false;
         {
@@ -589,11 +657,19 @@ pub const ConcaveEngine = struct {
 
             if (self.clients.get(client_id)) |sess| {
                 const key = try self.allocator.dupe(u8, sub_id);
+                var replaced_existing = false;
                 if (sess.subscriptions.fetchRemove(key)) |old| {
+                    replaced_existing = true;
                     self.allocator.free(old.key);
                     var old_val = old.value;
                     old_val.deinit(self.allocator);
                 }
+                const frame = if (sess.binary_protocol)
+                    try formatTransitionBinary(self.allocator, ran.snapshot_ts, &single_upd)
+                else
+                    try formatTransition(self.allocator, ran.snapshot_ts, &single_upd);
+                defer self.allocator.free(frame);
+
                 try sess.subscriptions.put(self.allocator, key, .{
                     .sub_id = try self.allocator.dupe(u8, sub_id),
                     .name = try self.allocator.dupe(u8, name),
@@ -602,9 +678,16 @@ pub const ConcaveEngine = struct {
                     .last_payload = ran.result,
                     .last_sent_ts = ran.snapshot_ts,
                 });
+                if (!replaced_existing) {
+                    slot_transferred = true;
+                }
                 // Send under `clients_mutex` so `unregisterClient` cannot free WsSender concurrently
                 // and initial frame strictly precedes any later broadcast.
-                sess.sink.send(frame_json);
+                if (sess.binary_protocol) {
+                    sess.sink.sendBinary(frame);
+                } else {
+                    sess.sink.send(frame);
+                }
             } else {
                 ran.read_set.deinit(self.allocator);
                 ran.result.deinit(self.allocator);
@@ -622,11 +705,15 @@ pub const ConcaveEngine = struct {
         }
     }
 
-    fn sendToClientLockedCheck(self: *ConcaveEngine, client_id: u64, payload: []const u8) void {
+    fn sendToClientLockedCheck(self: *ConcaveEngine, client_id: u64, payload: []const u8, binary: bool) void {
         self.clients_mutex.lockUncancelable(self.io);
         defer self.clients_mutex.unlock(self.io);
         if (self.clients.get(client_id)) |sess| {
-            sess.sink.send(payload);
+            if (binary) {
+                sess.sink.sendBinary(payload);
+            } else {
+                sess.sink.send(payload);
+            }
         }
     }
 
@@ -635,6 +722,7 @@ pub const ConcaveEngine = struct {
         defer self.clients_mutex.unlock(self.io);
         if (self.clients.get(client_id)) |sess| {
             if (sess.subscriptions.fetchRemove(sub_id)) |old| {
+                _ = self.active_sub_count.fetchSub(1, .seq_cst);
                 self.allocator.free(old.key);
                 var val = old.value;
                 val.deinit(self.allocator);
@@ -750,13 +838,10 @@ pub const ConcaveEngine = struct {
             var tx = tx_mod.TxContext.init(self.allocator, self.io, self.storage, self.manifest, snapshot_ts, false);
             defer tx.deinit();
 
-            const auth_clone = if (auth) |a| a.clone(self.allocator) catch null else null;
-            defer if (auth_clone) |*ac| ac.deinit(self.allocator);
-
             var env = ExecutionEnv{
                 .allocator = self.allocator,
                 .io = self.io,
-                .auth = auth_clone,
+                .auth = if (auth) |a| a.* else null,
                 .blob_store = self.blob_store,
                 .mode = .{ .tx = &tx },
             };
@@ -1149,6 +1234,15 @@ pub const ConcaveEngine = struct {
     }
 
     fn handleLocalCommit(self: *ConcaveEngine, commit_ts: i64, write_set: *const readset_mod.WriteSet) void {
+        // Lock-free fast path when zero subscriptions are active or registering.
+        if (self.active_sub_count.load(.seq_cst) == 0) {
+            var cur = self.last_broadcast_ts.load(.acquire);
+            while (commit_ts > cur) {
+                cur = self.last_broadcast_ts.cmpxchgWeak(cur, commit_ts, .release, .acquire) orelse break;
+            }
+            return;
+        }
+
         self.sync_mutex.lockUncancelable(self.io);
         defer self.sync_mutex.unlock(self.io);
 
@@ -1314,9 +1408,15 @@ pub const ConcaveEngine = struct {
                         }
                     }
                     if (updates.items.len > 0) {
-                        const frame_json = formatTransition(self.allocator, effective_ts, updates.items) catch break;
-                        defer self.allocator.free(frame_json);
-                        sess.sink.send(frame_json);
+                        if (sess.binary_protocol) {
+                            const frame_bin = formatTransitionBinary(self.allocator, effective_ts, updates.items) catch break;
+                            defer self.allocator.free(frame_bin);
+                            sess.sink.sendBinary(frame_bin);
+                        } else {
+                            const frame_json = formatTransition(self.allocator, effective_ts, updates.items) catch break;
+                            defer self.allocator.free(frame_json);
+                            sess.sink.send(frame_json);
+                        }
                         _ = self.metrics.ws_transitions_sent_total.fetchAdd(1, .monotonic);
                     }
                 }
@@ -1406,6 +1506,69 @@ fn formatAuthError(allocator: Allocator, err_msg: []const u8) ![]u8 {
     try storage_mod.writeJsonString(w, err_msg);
     try w.writeByte('}');
     return try out.toOwnedSlice();
+}
+
+/// Binary WebSocket transition frame (CBIN v1, tag `0x83`):
+/// `[0x83][i64_be to_ts][u16_be count]` + repeated `[u16_be sub_id_len][sub_id][u8 ok][u32_be payload_len][payload]`.
+pub fn formatTransitionBinary(allocator: Allocator, to_ts: i64, updates: []const UpdateFrame) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var hdr: [11]u8 = undefined;
+    hdr[0] = 0x83;
+    std.mem.writeInt(i64, hdr[1..9], to_ts, .big);
+    std.mem.writeInt(u16, hdr[9..11], @intCast(@min(updates.len, std.math.maxInt(u16))), .big);
+    try out.appendSlice(allocator, &hdr);
+
+    for (updates) |u| {
+        var slen: [2]u8 = undefined;
+        std.mem.writeInt(u16, &slen, @intCast(u.sub_id.len), .big);
+        try out.appendSlice(allocator, &slen);
+        try out.appendSlice(allocator, u.sub_id);
+
+        switch (u.result) {
+            .ok => |val_json| {
+                try out.append(allocator, 1);
+                var plen: [4]u8 = undefined;
+                std.mem.writeInt(u32, &plen, @intCast(val_json.len), .big);
+                try out.appendSlice(allocator, &plen);
+                try out.appendSlice(allocator, val_json);
+            },
+            .err => |err_msg| {
+                try out.append(allocator, 0);
+                var plen: [4]u8 = undefined;
+                std.mem.writeInt(u32, &plen, @intCast(err_msg.len), .big);
+                try out.appendSlice(allocator, &plen);
+                try out.appendSlice(allocator, err_msg);
+            },
+        }
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Binary WebSocket auth_result OK frame (CBIN v1, tag `0x81`):
+/// `[0x81][1][u32_be identity_json_len][identity_json]`.
+fn formatAuthOkBinary(allocator: Allocator, identity: ?*const auth_mod.AuthIdentity) ![]u8 {
+    const id_json: ?[]u8 = if (identity) |id| try id.toJson(allocator) else null;
+    defer if (id_json) |j| allocator.free(j);
+    const body = id_json orelse &.{};
+    var out = try allocator.alloc(u8, 6 + body.len);
+    out[0] = 0x81;
+    out[1] = 1;
+    std.mem.writeInt(u32, out[2..6], @intCast(body.len), .big);
+    if (body.len > 0) @memcpy(out[6..], body);
+    return out;
+}
+
+/// Binary WebSocket auth_result Error frame (CBIN v1, tag `0x81`):
+/// `[0x81][0][u32_be err_len][err_msg]`.
+fn formatAuthErrorBinary(allocator: Allocator, err_msg: []const u8) ![]u8 {
+    var out = try allocator.alloc(u8, 6 + err_msg.len);
+    out[0] = 0x81;
+    out[1] = 0;
+    std.mem.writeInt(u32, out[2..6], @intCast(err_msg.len), .big);
+    if (err_msg.len > 0) @memcpy(out[6..], err_msg);
+    return out;
 }
 
 test "cross-instance commit_log tailer pushes surgical transitions to remote subscribers" {

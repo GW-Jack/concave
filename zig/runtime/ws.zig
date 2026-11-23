@@ -6,6 +6,7 @@ const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 pub const Frame = union(enum) {
     text: []u8,
+    binary: []u8,
     ping: []u8,
     pong: []u8,
     close,
@@ -13,6 +14,7 @@ pub const Frame = union(enum) {
     pub fn deinit(self: *const Frame, allocator: Allocator) void {
         switch (self.*) {
             .text => |b| allocator.free(b),
+            .binary => |b| allocator.free(b),
             .ping => |b| allocator.free(b),
             .pong => |b| allocator.free(b),
             .close => {},
@@ -49,6 +51,10 @@ pub const WsSender = struct {
         try self.writeFrame(0x81, payload);
     }
 
+    pub fn sendBinary(self: *WsSender, payload: []const u8) !void {
+        try self.writeFrame(0x82, payload);
+    }
+
     pub fn sendPong(self: *WsSender, payload: []const u8) !void {
         try self.writeFrame(0x8A, payload);
     }
@@ -80,7 +86,7 @@ pub const WsSender = struct {
             hdr_len = 10;
         }
 
-        var wbuf: [4096]u8 = undefined;
+        var wbuf: [8192]u8 = undefined;
         var sw = self.stream.writer(self.io, &wbuf);
         sw.interface.writeAll(hdr[0..hdr_len]) catch {
             self.closed.store(true, .release);
@@ -114,6 +120,7 @@ pub fn readFrame(allocator: Allocator, reader: *std.Io.Reader) WsReadError!Frame
     var msg_buf: std.ArrayList(u8) = .empty;
     defer msg_buf.deinit(allocator);
     var in_fragment = false;
+    var frag_is_binary = false;
 
     while (true) {
         const b0 = reader.takeByte() catch return .close;
@@ -192,18 +199,23 @@ pub fn readFrame(allocator: Allocator, reader: *std.Io.Reader) WsReadError!Frame
             },
             0x1, 0x2 => {
                 if (in_fragment) return error.ProtocolError;
+                const is_bin = (opcode == 0x2);
                 if (fin) {
                     keep_chunk = true;
-                    return .{ .text = chunk };
+                    return if (is_bin) .{ .binary = chunk } else .{ .text = chunk };
                 }
                 in_fragment = true;
+                frag_is_binary = is_bin;
                 try msg_buf.appendSlice(allocator, chunk);
             },
             0x0 => {
                 if (!in_fragment) return error.ProtocolError;
                 if (msg_buf.items.len + chunk.len > MAX_MESSAGE_BYTES) return error.FrameTooLarge;
                 try msg_buf.appendSlice(allocator, chunk);
-                if (fin) return .{ .text = try msg_buf.toOwnedSlice(allocator) };
+                if (fin) {
+                    const owned = try msg_buf.toOwnedSlice(allocator);
+                    return if (frag_is_binary) .{ .binary = owned } else .{ .text = owned };
+                }
             },
             else => return error.ProtocolError,
         }

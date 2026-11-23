@@ -4,31 +4,33 @@ Concave exposes a unified **HTTP/1.1 Keep-Alive + HTTP/2 (`h2c` prior knowledge)
 
 ---
 
-## 1. WebSocket Sync Endpoint (`GET /ws`)
+## 1. WebSocket Sync Endpoint (`GET /ws` & `GET /ws?proto=bin`)
 
-All frames are UTF-8 JSON objects discriminated by `"type"`.
+Concave supports **both** UTF-8 JSON text frames (`opcode 0x01`, discriminated by `"type"`) and compact **CBIN v1 binary frames** (`opcode 0x02`, automatically negotiated by `ConcaveClient` via `?proto=bin` or triggered on the first binary frame). Binary framing eliminates outer JSON envelope parsing and `args` re-serialization on the server while supporting one-shot queries (`0x07` -> `0x87`) over the same persistent socket.
 
-### Client -> Server
+### Client -> Server (JSON text or CBIN v1 binary)
 
-| Frame | Fields | Description |
-| --- | --- | --- |
-| `authenticate` | `token: string \| null` | Authenticates the session (`Bearer <jwt>` or `dev:<subject>:<name>`). Re-evaluates all active subscriptions under the new identity and emits a fresh `transition`. |
-| `subscribe` | `sub_id: string`, `name: string`, `args: any` | Registers a reactive query subscription and triggers an immediate initial `transition`. |
-| `unsubscribe` | `sub_id: string` | Removes a subscription and releases server-side `ReadSet` tracking. |
-| `mutation` | `req_id: string`, `name: string`, `args: any` | Executes an ACID mutation (with automatic OCC conflict retries) and replies with `mutation_result`. |
-| `action` | `req_id: string`, `name: string`, `args: any` | Executes an external Action and replies with `action_result`. |
-| `ping` | `ts: number` | Keepalive ping; server responds with `pong`. |
+| Frame | Binary Tag | Fields | Description |
+| --- | --- | --- | --- |
+| `authenticate` | `0x01` | `token: string \| null` | Authenticates the session (`Bearer <jwt>` or `dev:<subject>:<name>`). Re-evaluates all active subscriptions under the new identity and emits a fresh `transition`. |
+| `subscribe` | `0x02` | `sub_id: string`, `name: string`, `args: any` | Registers a reactive query subscription and triggers an immediate initial `transition`. |
+| `unsubscribe` | `0x03` | `sub_id: string` | Removes a subscription and releases server-side `ReadSet` tracking. |
+| `mutation` | `0x04` | `req_id: string`, `name: string`, `args: any` | Executes an ACID mutation (with automatic OCC conflict retries) and replies with `mutation_result`. |
+| `action` | `0x05` | `req_id: string`, `name: string`, `args: any` | Executes an external Action and replies with `action_result`. |
+| `ping` | `0x06` | `ts: number` | Keepalive ping; server responds with `pong`. |
+| `query` | `0x07` | `req_id: string`, `name: string`, `args: any` | Executes a one-shot read-only query over the persistent WebSocket and replies with `query_result`. |
 
 ### Server -> Client
 
-| Frame | Fields | Description |
-| --- | --- | --- |
-| `auth_result` | `ok: boolean`, `identity?: AuthIdentity`, `error?: string` | Result of `authenticate`. |
-| `transition` | `to_ts: number`, `updates: QueryUpdate[]` | Consistent snapshot batch advancing all affected subscriptions for this client atomically to `to_ts`. |
-| `mutation_result` | `req_id: string`, `ok: boolean`, `value?: any`, `error?: string`, `commit_ts?: number` | Result of a mutation, including the authoritative `commit_ts` used by clients to reconcile optimistic updates. |
-| `action_result` | `req_id: string`, `ok: boolean`, `value?: any`, `error?: string` | Result of an Action invocation. |
-| `pong` | `ts: number` | Response to `ping`. |
-| `error` | `message: string` | Protocol-level error frame (e.g. malformed JSON). |
+| Frame | Binary Tag | Fields | Description |
+| --- | --- | --- | --- |
+| `auth_result` | `0x81` | `ok: boolean`, `identity?: AuthIdentity`, `error?: string` | Result of `authenticate`. |
+| `transition` | `0x83` | `to_ts: number`, `updates: QueryUpdate[]` | Consistent snapshot batch advancing all affected subscriptions for this client atomically to `to_ts`. |
+| `mutation_result` | `0x84` | `req_id: string`, `ok: boolean`, `value?: any`, `error?: string`, `commit_ts?: number` | Result of a mutation, including the authoritative `commit_ts` used by clients to reconcile optimistic updates. |
+| `action_result` | `0x85` | `req_id: string`, `ok: boolean`, `value?: any`, `error?: string` | Result of an Action invocation. |
+| `pong` | `0x86` | `ts: number` | Response to `ping`. |
+| `query_result` | `0x87` | `req_id: string`, `ok: boolean`, `value?: any`, `error?: string` | Result of a one-shot `query` call over WebSocket. |
+| `error` | `0x8F` | `message: string` | Protocol-level error frame (e.g. malformed JSON or unknown binary opcode). |
 
 On graceful server shutdown (`SIGTERM`/`SIGINT`), Concave sends an RFC 6455 WebSocket `Close` frame (`opcode 0x08`) to every connected client before exiting cleanly.
 

@@ -178,9 +178,83 @@ fn parseWireBound(alloc: Allocator, val: std.json.Value) !readset_mod.KeyBound {
     return error.InvalidKey;
 }
 
+const WireCursor = struct {
+    buf: []const u8,
+    pos: usize = 0,
+
+    fn readByte(self: *WireCursor) !u8 {
+        if (self.pos >= self.buf.len) return error.InvalidWire;
+        const b = self.buf[self.pos];
+        self.pos += 1;
+        return b;
+    }
+
+    fn readUntilColon(self: *WireCursor) ![]const u8 {
+        const start = self.pos;
+        const colon = std.mem.indexOfScalarPos(u8, self.buf, start, ':') orelse return error.InvalidWire;
+        self.pos = colon + 1;
+        return self.buf[start..colon];
+    }
+
+    fn readUsize(self: *WireCursor) !usize {
+        const digits = try self.readUntilColon();
+        return std.fmt.parseInt(usize, digits, 10) catch return error.InvalidWire;
+    }
+
+    fn readLenStr(self: *WireCursor) ![]const u8 {
+        const len = try self.readUsize();
+        if (self.pos + len > self.buf.len) return error.InvalidWire;
+        const slice = self.buf[self.pos .. self.pos + len];
+        self.pos += len;
+        return slice;
+    }
+
+    fn readBound(self: *WireCursor, alloc: Allocator) !readset_mod.KeyBound {
+        const kind = try self.readByte();
+        if (kind == 'U') return .unbounded;
+        const count = try self.readUsize();
+        var vals_stack: [16]key_mod.IndexValue = undefined;
+        var vals_heap: std.ArrayList(key_mod.IndexValue) = .empty;
+        for (0..count) |i| {
+            const tag = try self.readByte();
+            const iv: key_mod.IndexValue = switch (tag) {
+                'n' => .null_val,
+                'T' => .{ .bool_val = true },
+                'F' => .{ .bool_val = false },
+                'i' => .{ .int_val = std.fmt.parseInt(i64, try self.readUntilColon(), 10) catch return error.InvalidWire },
+                'f' => .{ .float_val = std.fmt.parseFloat(f64, try self.readUntilColon()) catch return error.InvalidWire },
+                's' => .{ .str_val = try self.readLenStr() },
+                'd' => .{ .id_val = try self.readLenStr() },
+                else => return error.InvalidWire,
+            };
+            if (vals_heap.items.len == 0 and i < vals_stack.len) {
+                vals_stack[i] = iv;
+            } else {
+                if (vals_heap.items.len == 0) try vals_heap.appendSlice(alloc, vals_stack[0..i]);
+                try vals_heap.append(alloc, iv);
+            }
+        }
+        const slice = if (vals_heap.items.len > 0) vals_heap.items else vals_stack[0..count];
+        return switch (kind) {
+            'I' => .{ .included = try key_mod.encodeKey(alloc, slice) },
+            'E' => .{ .excluded = try key_mod.encodeKey(alloc, slice) },
+            'P' => .{ .excluded = try key_mod.encodePrefixUpperBound(alloc, slice) },
+            else => error.InvalidWire,
+        };
+    }
+
+    fn readOrder(self: *WireCursor) !storage_mod.QueryOrder {
+        return switch (try self.readByte()) {
+            'A' => .asc,
+            'D' => .desc,
+            else => error.InvalidWire,
+        };
+    }
+};
+
 export fn roc_host_db_query(req_raw: RocStr) callconv(.c) RocStr {
     defer req_raw.decref(&g_roc_host);
-    const req_json = req_raw.asSlice();
+    const req_slice = req_raw.asSlice();
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
 
@@ -188,33 +262,55 @@ export fn roc_host_db_query(req_raw: RocStr) callconv(.c) RocStr {
     defer _ = arena.reset(.retain_capacity);
     const a = arena.allocator();
 
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, req_json, .{}) catch
-        return wireErr("invalid query JSON");
-    if (parsed != .object) return wireErr("invalid query JSON object");
-    const obj = parsed.object;
-
-    const ns_v = obj.get("namespace") orelse return wireErr("missing namespace");
-    const table_v = obj.get("table") orelse return wireErr("missing table");
-    const index_v = obj.get("index_name") orelse return wireErr("missing index_name");
-    if (ns_v != .string or table_v != .string or index_v != .string) return wireErr("invalid string field");
-    const ns = ns_v.string;
-    const table = table_v.string;
-    const index_name = index_v.string;
-    const start = parseWireBound(a, obj.get("start") orelse return wireErr("missing start")) catch
-        return wireErr("invalid start bound");
-    const end = parseWireBound(a, obj.get("end") orelse return wireErr("missing end")) catch
-        return wireErr("invalid end bound");
-
+    var ns: []const u8 = "";
+    var table: []const u8 = "";
+    var index_name: []const u8 = "";
+    var start: readset_mod.KeyBound = .unbounded;
+    var end: readset_mod.KeyBound = .unbounded;
     var order: storage_mod.QueryOrder = .asc;
-    if (obj.get("order")) |ov| {
-        if (ov == .string and std.mem.eql(u8, ov.string, "desc")) order = .desc;
-    }
     var limit: ?usize = null;
-    if (obj.get("limit")) |lv| {
-        if (lv == .integer and lv.integer >= 0) limit = @intCast(lv.integer);
+
+    if (std.mem.startsWith(u8, req_slice, "!1:")) {
+        var cur = WireCursor{ .buf = req_slice, .pos = 3 };
+        ns = cur.readLenStr() catch return wireErr("invalid wire namespace");
+        table = cur.readLenStr() catch return wireErr("invalid wire table");
+        index_name = cur.readLenStr() catch return wireErr("invalid wire index_name");
+        start = cur.readBound(a) catch return wireErr("invalid wire start bound");
+        end = cur.readBound(a) catch return wireErr("invalid wire end bound");
+        order = cur.readOrder() catch return wireErr("invalid wire order");
+        const lim_tag = cur.readByte() catch return wireErr("invalid wire limit");
+        if (lim_tag == 'L') {
+            limit = cur.readUsize() catch return wireErr("invalid wire limit value");
+        } else if (lim_tag != 'N') {
+            return wireErr("invalid wire limit tag");
+        }
+    } else {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, req_slice, .{}) catch
+            return wireErr("invalid query JSON");
+        if (parsed != .object) return wireErr("invalid query JSON object");
+        const obj = parsed.object;
+
+        const ns_v = obj.get("namespace") orelse return wireErr("missing namespace");
+        const table_v = obj.get("table") orelse return wireErr("missing table");
+        const index_v = obj.get("index_name") orelse return wireErr("missing index_name");
+        if (ns_v != .string or table_v != .string or index_v != .string) return wireErr("invalid string field");
+        ns = ns_v.string;
+        table = table_v.string;
+        index_name = index_v.string;
+        start = parseWireBound(a, obj.get("start") orelse return wireErr("missing start")) catch
+            return wireErr("invalid start bound");
+        end = parseWireBound(a, obj.get("end") orelse return wireErr("missing end")) catch
+            return wireErr("invalid end bound");
+        if (obj.get("order")) |ov| {
+            if (ov == .string and std.mem.eql(u8, ov.string, "desc")) order = .desc;
+        }
+        if (obj.get("limit")) |lv| {
+            if (lv == .integer and lv.integer >= 0) limit = @intCast(lv.integer);
+        }
     }
 
-    const docs = env.dbQuery(a, &.{
+    var out: std.Io.Writer.Allocating = .init(a);
+    env.dbQueryToWireJson(a, &.{
         .namespace = ns,
         .table = table,
         .index_name = index_name,
@@ -222,71 +318,81 @@ export fn roc_host_db_query(req_raw: RocStr) callconv(.c) RocStr {
         .end = end,
         .order = order,
         .limit = limit,
-    }) catch |err| return wireErr(@errorName(err));
-
-    var out: std.Io.Writer.Allocating = .init(a);
-    out.writer.writeByte('[') catch return wireErr("oom");
-    for (docs, 0..) |*d, i| {
-        if (i > 0) out.writer.writeByte(',') catch return wireErr("oom");
-        d.writeWireJson(&out.writer) catch return wireErr("oom");
-    }
-    out.writer.writeByte(']') catch return wireErr("oom");
+    }, &out.writer) catch |err| return wireErr(@errorName(err));
     return wireOk(out.written());
 }
 
 export fn roc_host_db_paginate(req_raw: RocStr) callconv(.c) RocStr {
-    const req_json = takeRocStr(g_alloc, req_raw) catch return wireErr("oom");
-    defer g_alloc.free(req_json);
+    defer req_raw.decref(&g_roc_host);
+    const req_slice = req_raw.asSlice();
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
 
-    var arena = std.heap.ArenaAllocator.init(g_alloc);
-    defer arena.deinit();
+    const arena = getThreadArena();
+    defer _ = arena.reset(.retain_capacity);
     const a = arena.allocator();
 
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, req_json, .{}) catch
-        return wireErr("invalid paginate JSON");
-    if (parsed != .object) return wireErr("invalid paginate JSON object");
-    const obj = parsed.object;
-
-    const ns_v = obj.get("namespace") orelse return wireErr("missing namespace");
-    const table_v = obj.get("table") orelse return wireErr("missing table");
-    const index_v = obj.get("index_name") orelse return wireErr("missing index_name");
-    if (ns_v != .string or table_v != .string or index_v != .string) return wireErr("invalid string field");
-    const start = parseWireBound(a, obj.get("start") orelse return wireErr("missing start")) catch
-        return wireErr("invalid start bound");
-    const end = parseWireBound(a, obj.get("end") orelse return wireErr("missing end")) catch
-        return wireErr("invalid end bound");
-
+    var ns: []const u8 = "";
+    var table: []const u8 = "";
+    var index_name: []const u8 = "";
+    var start: readset_mod.KeyBound = .unbounded;
+    var end: readset_mod.KeyBound = .unbounded;
     var order: storage_mod.QueryOrder = .asc;
-    if (obj.get("order")) |ov| {
-        if (ov == .string and std.mem.eql(u8, ov.string, "desc")) order = .desc;
-    }
-    const cursor: []const u8 = if (obj.get("cursor")) |cv| (if (cv == .string) cv.string else "") else "";
-    const page_size: usize = if (obj.get("page_size")) |pv|
-        (if (pv == .integer and pv.integer > 0) @intCast(pv.integer) else 25)
-    else
-        25;
+    var cursor: []const u8 = "";
+    var page_size: usize = 25;
 
-    const page_res = env.dbPaginate(g_alloc, &.{
-        .namespace = ns_v.string,
-        .table = table_v.string,
-        .index_name = index_v.string,
+    if (std.mem.startsWith(u8, req_slice, "!1:")) {
+        var cur = WireCursor{ .buf = req_slice, .pos = 3 };
+        ns = cur.readLenStr() catch return wireErr("invalid wire namespace");
+        table = cur.readLenStr() catch return wireErr("invalid wire table");
+        index_name = cur.readLenStr() catch return wireErr("invalid wire index_name");
+        start = cur.readBound(a) catch return wireErr("invalid wire start bound");
+        end = cur.readBound(a) catch return wireErr("invalid wire end bound");
+        order = cur.readOrder() catch return wireErr("invalid wire order");
+        cursor = cur.readLenStr() catch return wireErr("invalid wire cursor");
+        const ps = cur.readUsize() catch return wireErr("invalid wire page_size");
+        page_size = if (ps > 0) ps else 25;
+    } else {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, req_slice, .{}) catch
+            return wireErr("invalid paginate JSON");
+        if (parsed != .object) return wireErr("invalid paginate JSON object");
+        const obj = parsed.object;
+
+        const ns_v = obj.get("namespace") orelse return wireErr("missing namespace");
+        const table_v = obj.get("table") orelse return wireErr("missing table");
+        const index_v = obj.get("index_name") orelse return wireErr("missing index_name");
+        if (ns_v != .string or table_v != .string or index_v != .string) return wireErr("invalid string field");
+        ns = ns_v.string;
+        table = table_v.string;
+        index_name = index_v.string;
+        start = parseWireBound(a, obj.get("start") orelse return wireErr("missing start")) catch
+            return wireErr("invalid start bound");
+        end = parseWireBound(a, obj.get("end") orelse return wireErr("missing end")) catch
+            return wireErr("invalid end bound");
+        if (obj.get("order")) |ov| {
+            if (ov == .string and std.mem.eql(u8, ov.string, "desc")) order = .desc;
+        }
+        cursor = if (obj.get("cursor")) |cv| (if (cv == .string) cv.string else "") else "";
+        if (obj.get("page_size")) |pv| {
+            if (pv == .integer and pv.integer > 0) page_size = @intCast(pv.integer);
+        }
+    }
+
+    const page_res = env.dbPaginate(a, &.{
+        .namespace = ns,
+        .table = table,
+        .index_name = index_name,
         .start = start,
         .end = end,
         .order = order,
         .limit = null,
     }, cursor, page_size) catch |err| return wireErr(@errorName(err));
-    defer page_res.deinit(g_alloc);
 
-    var out: std.Io.Writer.Allocating = .init(g_alloc);
-    defer out.deinit();
+    var out: std.Io.Writer.Allocating = .init(a);
     out.writer.writeAll("{\"page\":[") catch return wireErr("oom");
     for (page_res.docs, 0..) |*d, i| {
         if (i > 0) out.writer.writeByte(',') catch return wireErr("oom");
-        const wj = d.toWireJson(g_alloc) catch return wireErr("oom");
-        defer g_alloc.free(wj);
-        out.writer.writeAll(wj) catch return wireErr("oom");
+        d.writeWireJson(&out.writer) catch return wireErr("oom");
     }
     out.writer.writeAll("],\"next_cursor\":") catch return wireErr("oom");
     storage_mod.writeJsonString(&out.writer, page_res.next_cursor) catch return wireErr("oom");
@@ -295,47 +401,59 @@ export fn roc_host_db_paginate(req_raw: RocStr) callconv(.c) RocStr {
 }
 
 export fn roc_host_db_search(req_raw: RocStr) callconv(.c) RocStr {
-    const req_json = takeRocStr(g_alloc, req_raw) catch return wireErr("oom");
-    defer g_alloc.free(req_json);
+    defer req_raw.decref(&g_roc_host);
+    const req_slice = req_raw.asSlice();
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
 
-    var arena = std.heap.ArenaAllocator.init(g_alloc);
-    defer arena.deinit();
+    const arena = getThreadArena();
+    defer _ = arena.reset(.retain_capacity);
     const a = arena.allocator();
 
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, req_json, .{}) catch
-        return wireErr("invalid search JSON");
-    if (parsed != .object) return wireErr("invalid search JSON object");
-    const obj = parsed.object;
+    var ns: []const u8 = "";
+    var table: []const u8 = "";
+    var field: []const u8 = "";
+    var query_text: []const u8 = "";
+    var limit: usize = 50;
 
-    const ns_v = obj.get("namespace") orelse return wireErr("missing namespace");
-    const table_v = obj.get("table") orelse return wireErr("missing table");
-    const field_v = obj.get("field") orelse return wireErr("missing field");
-    const query_v = obj.get("query") orelse return wireErr("missing query");
-    if (ns_v != .string or table_v != .string or field_v != .string or query_v != .string) {
-        return wireErr("invalid search string field");
+    if (std.mem.startsWith(u8, req_slice, "!1:")) {
+        var cur = WireCursor{ .buf = req_slice, .pos = 3 };
+        ns = cur.readLenStr() catch return wireErr("invalid wire namespace");
+        table = cur.readLenStr() catch return wireErr("invalid wire table");
+        field = cur.readLenStr() catch return wireErr("invalid wire field");
+        query_text = cur.readLenStr() catch return wireErr("invalid wire query");
+        const lim = cur.readUsize() catch return wireErr("invalid wire limit");
+        limit = if (lim > 0) lim else 50;
+    } else {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, req_slice, .{}) catch
+            return wireErr("invalid search JSON");
+        if (parsed != .object) return wireErr("invalid search JSON object");
+        const obj = parsed.object;
+
+        const ns_v = obj.get("namespace") orelse return wireErr("missing namespace");
+        const table_v = obj.get("table") orelse return wireErr("missing table");
+        const field_v = obj.get("field") orelse return wireErr("missing field");
+        const query_v = obj.get("query") orelse return wireErr("missing query");
+        if (ns_v != .string or table_v != .string or field_v != .string or query_v != .string) {
+            return wireErr("invalid search string field");
+        }
+        ns = ns_v.string;
+        table = table_v.string;
+        field = field_v.string;
+        query_text = query_v.string;
+        if (obj.get("limit")) |lv| {
+            if (lv == .integer and lv.integer > 0) limit = @intCast(lv.integer);
+        }
     }
-    const limit: usize = if (obj.get("limit")) |lv|
-        (if (lv == .integer and lv.integer > 0) @intCast(lv.integer) else 50)
-    else
-        50;
 
-    const docs = env.dbSearch(g_alloc, ns_v.string, table_v.string, field_v.string, query_v.string, limit) catch |err|
+    const docs = env.dbSearch(a, ns, table, field, query_text, limit) catch |err|
         return wireErr(@errorName(err));
-    defer {
-        for (docs) |*d| d.deinit(g_alloc);
-        g_alloc.free(docs);
-    }
 
-    var out: std.Io.Writer.Allocating = .init(g_alloc);
-    defer out.deinit();
+    var out: std.Io.Writer.Allocating = .init(a);
     out.writer.writeByte('[') catch return wireErr("oom");
     for (docs, 0..) |*d, i| {
         if (i > 0) out.writer.writeByte(',') catch return wireErr("oom");
-        const wj = d.toWireJson(g_alloc) catch return wireErr("oom");
-        defer g_alloc.free(wj);
-        out.writer.writeAll(wj) catch return wireErr("oom");
+        d.writeWireJson(&out.writer) catch return wireErr("oom");
     }
     out.writer.writeByte(']') catch return wireErr("oom");
     return wireOk(out.written());

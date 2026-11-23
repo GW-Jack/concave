@@ -92,7 +92,7 @@ test('HTTP/2 h2c + HTTP/1.1 Keep-Alive + Bundled/Minified/Pre-Gzipped Assets + E
   assert.equal(gzIdx.status, 200);
   assert.equal(gzIdx.headers['content-encoding'], 'gzip');
   assert.equal(gzIdx.headers['connection'], 'keep-alive');
-  assert.ok(gzIdx.body.length < 5200, `expected core bundle gzip < 5.2 KB, got ${gzIdx.body.length} B`);
+  assert.ok(gzIdx.body.length < 6500, `expected core bundle gzip < 6.5 KB, got ${gzIdx.body.length} B`);
   assert.deepEqual(zlib.gunzipSync(gzIdx.body), rawIdx.body);
 
   // 304 Not Modified on matching ETag

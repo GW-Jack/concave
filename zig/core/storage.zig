@@ -198,6 +198,25 @@ pub const Storage = union(enum) {
         };
     }
 
+    pub fn scanIndexToWireJson(self: Storage, allocator: Allocator, query: *const IndexQuery, w: *std.Io.Writer) !void {
+        switch (self) {
+            .wal => |wal| try wal.scanIndexToWireJson(query, w),
+            .pg => |pg| {
+                const docs = try pg.scanIndex(allocator, query);
+                defer {
+                    for (docs) |*d| d.deinit(allocator);
+                    allocator.free(docs);
+                }
+                try w.writeByte('[');
+                for (docs, 0..) |*d, i| {
+                    if (i > 0) try w.writeByte(',');
+                    try d.writeWireJson(w);
+                }
+                try w.writeByte(']');
+            },
+        }
+    }
+
     pub fn commitTx(
         self: Storage,
         allocator: Allocator,
@@ -280,8 +299,98 @@ pub fn stringifyJsonValue(allocator: Allocator, value: std.json.Value) ![]u8 {
     return try out.toOwnedSlice();
 }
 
+/// Zero-allocation check: validates `body_json` is valid JSON and reports whether it is an object
+/// containing any protected system key (`id`, `created_at`, `_id`, `_creationTime`) at top level.
+fn jsonHasSystemField(body_json: []const u8) !bool {
+    var scanner = std.json.Scanner.initCompleteInput(std.heap.page_allocator, body_json);
+    defer scanner.deinit();
+
+    const first = scanner.next() catch return error.InvalidJson;
+    if (first != .object_begin) {
+        // Validate non-object JSON value (e.g. array/primitive) cleanly.
+        if (first == .array_begin) {
+            var depth: usize = 1;
+            while (depth > 0) {
+                const tok = scanner.next() catch return error.InvalidJson;
+                switch (tok) {
+                    .object_begin, .array_begin => depth += 1,
+                    .object_end, .array_end => depth -= 1,
+                    .end_of_document => return error.InvalidJson,
+                    else => {},
+                }
+            }
+        } else if (first == .end_of_document or first == .object_end or first == .array_end) {
+            return error.InvalidJson;
+        }
+        const eof = scanner.next() catch return error.InvalidJson;
+        if (eof != .end_of_document) return error.InvalidJson;
+        return false;
+    }
+
+    var has_sys = false;
+    var depth: usize = 1;
+    var expect_key = true;
+    while (depth > 0) {
+        const tok = scanner.next() catch return error.InvalidJson;
+        switch (tok) {
+            .object_begin => {
+                depth += 1;
+                expect_key = true;
+            },
+            .array_begin => {
+                depth += 1;
+                expect_key = false;
+            },
+            .object_end => {
+                depth -= 1;
+                if (depth == 1) expect_key = true;
+            },
+            .array_end => {
+                depth -= 1;
+                if (depth == 1) expect_key = true;
+            },
+            .string => |s| {
+                if (depth == 1 and expect_key) {
+                    if (std.mem.eql(u8, s, "id") or
+                        std.mem.eql(u8, s, "created_at") or
+                        std.mem.eql(u8, s, "_id") or
+                        std.mem.eql(u8, s, "_creationTime"))
+                    {
+                        has_sys = true;
+                    }
+                    expect_key = false;
+                } else if (depth == 1) {
+                    expect_key = true;
+                }
+            },
+            .partial_string, .partial_string_escaped_1, .partial_string_escaped_2, .partial_string_escaped_3, .partial_string_escaped_4 => {
+                if (depth == 1 and expect_key) has_sys = true;
+            },
+            .number => |num| {
+                // Roc's untyped numeric literals default to `Dec` (`1.0`); fall back so
+                // `std.json.Stringify` normalizes integral floats (`1.0` -> `1`) for `I64` decoders.
+                if (std.mem.indexOfScalar(u8, num, '.') != null) has_sys = true;
+                if (depth == 1) expect_key = true;
+            },
+            .true, .false, .null => {
+                if (depth == 1) expect_key = true;
+            },
+            .partial_number => {},
+            .end_of_document => return error.InvalidJson,
+            else => {},
+        }
+    }
+    const eof = scanner.next() catch return error.InvalidJson;
+    if (eof != .end_of_document) return error.InvalidJson;
+    return has_sys;
+}
+
 /// Remove system fields (`id`, `created_at`, `_id`, `_creationTime`) from a JSON object string.
 pub fn stripSystemFields(allocator: Allocator, body_json: []const u8) ![]u8 {
+    if (!(try jsonHasSystemField(body_json))) {
+        return try allocator.dupe(u8, std.mem.trim(u8, body_json, " \t\r\n"));
+    }
+
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -347,34 +456,60 @@ pub fn computeIndexEntries(
     try out.append(allocator, .{ .index_name = ct_name, .encoded_key = ct_key });
 
     if (manifest.findTable(namespace, table)) |table_spec| {
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        const a = arena.allocator();
-        const body_val = std.json.parseFromSliceLeaky(std.json.Value, a, doc.body_json, .{}) catch
-            return error.InvalidJson;
-
+        var has_custom = false;
         for (table_spec.indexes) |idx| {
-            if (std.mem.eql(u8, idx.name, BY_CREATION_TIME_INDEX)) continue;
-            var vals: std.ArrayList(key_mod.IndexValue) = .empty;
-            var has_ct = false;
-            for (idx.fields) |field| {
-                if (std.mem.eql(u8, field, "id") or std.mem.eql(u8, field, "_id")) {
-                    try vals.append(a, .{ .id_val = doc.id });
-                } else if (std.mem.eql(u8, field, "created_at") or std.mem.eql(u8, field, "_creationTime")) {
-                    has_ct = true;
-                    try vals.append(a, .{ .int_val = doc.creation_time_ms });
-                } else {
-                    const extracted = extractJsonPath(body_val, field);
-                    try vals.append(a, try key_mod.IndexValue.fromJsonValue(extracted));
+            if (!std.mem.eql(u8, idx.name, BY_CREATION_TIME_INDEX)) {
+                has_custom = true;
+                break;
+            }
+        }
+        if (has_custom) {
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const body_val = std.json.parseFromSliceLeaky(std.json.Value, a, doc.body_json, .{}) catch
+                return error.InvalidJson;
+
+            for (table_spec.indexes) |idx| {
+                if (std.mem.eql(u8, idx.name, BY_CREATION_TIME_INDEX)) continue;
+                var vals_buf: [16]key_mod.IndexValue = undefined;
+                var vals_len: usize = 0;
+                var vals_heap: std.ArrayList(key_mod.IndexValue) = .empty;
+                var has_ct = false;
+                for (idx.fields) |field| {
+                    const iv: key_mod.IndexValue = if (std.mem.eql(u8, field, "id") or std.mem.eql(u8, field, "_id"))
+                        .{ .id_val = doc.id }
+                    else if (std.mem.eql(u8, field, "created_at") or std.mem.eql(u8, field, "_creationTime")) blk: {
+                        has_ct = true;
+                        break :blk .{ .int_val = doc.creation_time_ms };
+                    } else blk: {
+                        const extracted = extractJsonPath(body_val, field);
+                        break :blk try key_mod.IndexValue.fromJsonValue(extracted);
+                    };
+                    if (vals_heap.items.len == 0 and vals_len < vals_buf.len) {
+                        vals_buf[vals_len] = iv;
+                        vals_len += 1;
+                    } else {
+                        if (vals_heap.items.len == 0) try vals_heap.appendSlice(a, vals_buf[0..vals_len]);
+                        try vals_heap.append(a, iv);
+                    }
                 }
+                if (!has_ct) {
+                    const ct_iv = key_mod.IndexValue{ .int_val = doc.creation_time_ms };
+                    if (vals_heap.items.len == 0 and vals_len < vals_buf.len) {
+                        vals_buf[vals_len] = ct_iv;
+                        vals_len += 1;
+                    } else {
+                        if (vals_heap.items.len == 0) try vals_heap.appendSlice(a, vals_buf[0..vals_len]);
+                        try vals_heap.append(a, ct_iv);
+                    }
+                }
+                const vals_slice = if (vals_heap.items.len > 0) vals_heap.items else vals_buf[0..vals_len];
+                const name_copy = try allocator.dupe(u8, idx.name);
+                errdefer allocator.free(name_copy);
+                const encoded = try key_mod.encodeKey(allocator, vals_slice);
+                try out.append(allocator, .{ .index_name = name_copy, .encoded_key = encoded });
             }
-            if (!has_ct) {
-                try vals.append(a, .{ .int_val = doc.creation_time_ms });
-            }
-            const name_copy = try allocator.dupe(u8, idx.name);
-            errdefer allocator.free(name_copy);
-            const encoded = try key_mod.encodeKey(allocator, vals.items);
-            try out.append(allocator, .{ .index_name = name_copy, .encoded_key = encoded });
         }
     }
 

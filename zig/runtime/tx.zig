@@ -67,6 +67,55 @@ pub const TxContext = struct {
         return try self.storage.getDoc(allocator, ns, table, doc_id);
     }
 
+    /// Zero-clone fast path: streams index scan results directly as a JSON array into `w`.
+    pub fn scanIndexToWireJson(self: *TxContext, allocator: Allocator, query: *const IndexQuery, w: *std.Io.Writer) !void {
+        if (self.track_reads) {
+            try self.read_set.recordIndexRange(
+                self.allocator,
+                query.namespace,
+                query.table,
+                query.index_name,
+                query.start,
+                query.end,
+            );
+        }
+
+        if (self.pending_docs.count() == 0) {
+            return try self.storage.scanIndexToWireJson(allocator, query, w);
+        }
+
+        const prefix = try std.fmt.allocPrint(self.allocator, "{s}\x1f{s}\x1f", .{ query.namespace, query.table });
+        defer self.allocator.free(prefix);
+
+        var has_pending = false;
+        var pit = self.pending_docs.keyIterator();
+        while (pit.next()) |k| {
+            if (std.mem.startsWith(u8, k.*, prefix)) {
+                has_pending = true;
+                break;
+            }
+        }
+        if (!has_pending) {
+            return try self.storage.scanIndexToWireJson(allocator, query, w);
+        }
+
+        // Fall back to full RYOW merge (already recorded ReadSet above).
+        const prev_track = self.track_reads;
+        self.track_reads = false;
+        defer self.track_reads = prev_track;
+        const docs = try self.scanIndex(allocator, query);
+        defer {
+            for (docs) |*d| d.deinit(allocator);
+            allocator.free(docs);
+        }
+        try w.writeByte('[');
+        for (docs, 0..) |*d, i| {
+            if (i > 0) try w.writeByte(',');
+            try d.writeWireJson(w);
+        }
+        try w.writeByte(']');
+    }
+
     pub fn scanIndex(self: *TxContext, allocator: Allocator, query: *const IndexQuery) ![]Document {
         if (self.track_reads) {
             try self.read_set.recordIndexRange(

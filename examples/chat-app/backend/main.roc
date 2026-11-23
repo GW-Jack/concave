@@ -36,21 +36,21 @@ chat_analytics = Analytics.mount("analytics")
 chat_monitor : Monitor.Mount
 chat_monitor = Monitor.mount("monitor")
 
-## Queries
+## Queries (zero-parse pass-through via `Db.collect_raw!` + `App.query_raw`)
 
-list_rooms! : Ctx.QueryCtx, {} => Try(List(Room.Doc), Str)
+list_rooms! : Ctx.QueryCtx, {} => Try(Str, Str)
 list_rooms! = |ctx, _|
     Db.query(Room.table)
     |> Db.asc()
-    |> Db.collect!(ctx.db)
+    |> Db.collect_raw!(ctx.db)
 
-list_messages! : Ctx.QueryCtx, Message.ListArgs => Try(List(Message.Doc), Str)
+list_messages! : Ctx.QueryCtx, Message.ListArgs => Try(Str, Str)
 list_messages! = |ctx, args|
     Db.from_index(Message.by_room)
     |> Db.eq([Key.str(args.room_id)])
     |> Db.asc()
     |> Db.take(100)
-    |> Db.collect!(ctx.db)
+    |> Db.collect_raw!(ctx.db)
 
 ## Mutations
 
@@ -321,8 +321,8 @@ concave_app = ||
     |> RateLimiter.attach(send_limiter)
     |> Analytics.attach(chat_analytics)
     |> Monitor.attach_with_cron(chat_monitor, 60000, 3600000)
-    |> App.query("rooms.list", Schema.record([]), Schema.list(Room.doc_schema), list_rooms!)
-    |> App.query("messages.list", Message.list_args_schema, Schema.list(Message.doc_schema), list_messages!)
+    |> App.query_raw("rooms.list", Schema.record([]), Schema.list(Room.doc_schema), list_rooms!)
+    |> App.query_raw("messages.list", Message.list_args_schema, Schema.list(Message.doc_schema), list_messages!)
     |> App.mutation("rooms.ensureDefaults", Schema.record([]), Schema.list(Room.doc_schema), ensure_defaults!)
     |> App.mutation("rooms.create", Room.create_args_schema, Schema.id("rooms"), create_room!)
     |> App.mutation("messages.send", Message.send_args_schema, Schema.id("messages"), send_message!)

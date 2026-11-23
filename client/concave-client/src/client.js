@@ -1,5 +1,122 @@
 import { batch, effect, onCleanup, signal } from "./signals.js";
 
+const _te = new TextEncoder();
+const _td = new TextDecoder();
+
+function _readI64(dv, off) {
+  return dv.getInt32(off, false) * 4294967296 + dv.getUint32(off + 4, false);
+}
+
+function _writeI64(dv, off, val) {
+  const hi = Math.floor(val / 4294967296);
+  const lo = val >>> 0;
+  dv.setInt32(off, hi, false);
+  dv.setUint32(off + 4, lo, false);
+}
+
+function encodeBinaryFrame(msg) {
+  if (msg.type === "authenticate") {
+    if (msg.token === null || msg.token === undefined) {
+      return new Uint8Array([0x01, 0]);
+    }
+    const tb = _te.encode(msg.token);
+    const out = new Uint8Array(4 + tb.length);
+    out[0] = 0x01;
+    out[1] = 1;
+    new DataView(out.buffer).setUint16(2, tb.length, false);
+    out.set(tb, 4);
+    return out;
+  }
+  if (msg.type === "unsubscribe") {
+    const sb = _te.encode(msg.sub_id);
+    const out = new Uint8Array(3 + sb.length);
+    out[0] = 0x03;
+    new DataView(out.buffer).setUint16(1, sb.length, false);
+    out.set(sb, 3);
+    return out;
+  }
+  if (msg.type === "ping") {
+    const out = new Uint8Array(9);
+    out[0] = 0x06;
+    _writeI64(new DataView(out.buffer), 1, msg.ts ?? 0);
+    return out;
+  }
+  const tag =
+    msg.type === "subscribe" ? 0x02 :
+    msg.type === "mutation" ? 0x04 :
+    msg.type === "action" ? 0x05 :
+    msg.type === "query" ? 0x07 : 0;
+  const idStr = msg.type === "subscribe" ? msg.sub_id : msg.req_id;
+  const idB = _te.encode(idStr);
+  const nameB = _te.encode(msg.name);
+  const argsB = _te.encode(JSON.stringify(msg.args ?? {}));
+  const out = new Uint8Array(1 + 2 + idB.length + 2 + nameB.length + 4 + argsB.length);
+  const dv = new DataView(out.buffer);
+  let p = 0;
+  out[p++] = tag;
+  dv.setUint16(p, idB.length, false); p += 2;
+  out.set(idB, p); p += idB.length;
+  dv.setUint16(p, nameB.length, false); p += 2;
+  out.set(nameB, p); p += nameB.length;
+  dv.setUint32(p, argsB.length, false); p += 4;
+  out.set(argsB, p);
+  return out;
+}
+
+function decodeBinaryFrame(buf) {
+  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let p = 0;
+  const tag = bytes[p++];
+  if (tag === 0x81) {
+    const ok = bytes[p++] !== 0;
+    const len = dv.getUint32(p, false); p += 4;
+    const txt = len > 0 ? _td.decode(bytes.subarray(p, p + len)) : "";
+    return ok
+      ? { type: "auth_result", ok: true, identity: txt ? JSON.parse(txt) : null }
+      : { type: "auth_result", ok: false, error: txt };
+  }
+  if (tag === 0x83) {
+    const toTs = _readI64(dv, p); p += 8;
+    const count = dv.getUint16(p, false); p += 2;
+    const updates = [];
+    for (let i = 0; i < count; i++) {
+      const sLen = dv.getUint16(p, false); p += 2;
+      const subId = _td.decode(bytes.subarray(p, p + sLen)); p += sLen;
+      const ok = bytes[p++] !== 0;
+      const pLen = dv.getUint32(p, false); p += 4;
+      const payload = _td.decode(bytes.subarray(p, p + pLen)); p += pLen;
+      updates.push(
+        ok
+          ? { sub_id: subId, ok: true, value: JSON.parse(payload) }
+          : { sub_id: subId, ok: false, error: payload },
+      );
+    }
+    return { type: "transition", to_ts: toTs, updates };
+  }
+  if (tag === 0x84 || tag === 0x85 || tag === 0x87) {
+    const rLen = dv.getUint16(p, false); p += 2;
+    const reqId = _td.decode(bytes.subarray(p, p + rLen)); p += rLen;
+    const ok = bytes[p++] !== 0;
+    const commitTs = tag === 0x84 ? _readI64(dv, p) : undefined;
+    if (tag === 0x84) p += 8;
+    const pLen = dv.getUint32(p, false); p += 4;
+    const payload = _td.decode(bytes.subarray(p, p + pLen));
+    const type = tag === 0x84 ? "mutation_result" : tag === 0x85 ? "action_result" : "query_result";
+    return ok
+      ? { type, req_id: reqId, ok: true, value: JSON.parse(payload), commit_ts: commitTs }
+      : { type, req_id: reqId, ok: false, error: payload };
+  }
+  if (tag === 0x86) {
+    return { type: "pong", ts: _readI64(dv, p) };
+  }
+  if (tag === 0x8f) {
+    const mLen = dv.getUint32(p, false); p += 4;
+    return { type: "error", message: _td.decode(bytes.subarray(p, p + mLen)) };
+  }
+  return { type: "error", message: `unknown binary tag ${tag}` };
+}
+
 function stableStringify(val) {
   if (val === null || typeof val !== "object") {
     return JSON.stringify(val);
@@ -21,7 +138,8 @@ export class ConcaveClient {
     this.commitTs = signal(0);
     this.identity = signal(null);
 
-    this._wsUrl = normalizeWsUrl(url);
+    this._binary = options.protocol ? options.protocol === "binary" : !options.webSocketImpl;
+    this._wsUrl = normalizeWsUrl(url, this._binary);
     this._WsCtor = options.webSocketImpl ?? globalThis.WebSocket;
     this._ws = null;
     this._closed = false;
@@ -34,8 +152,10 @@ export class ConcaveClient {
     this._subsById = new Map();
     this._pendingMutations = new Map();
     this._pendingActions = new Map();
+    this._pendingQueries = new Map();
     this._inFlightMutations = new Set();
     this._inFlightActions = new Set();
+    this._inFlightQueries = new Set();
     this._optimisticQueue = [];
     this._outboundQueue = [];
 
@@ -47,6 +167,9 @@ export class ConcaveClient {
     this.status.set(this._reconnectAttempt > 0 ? "reconnecting" : "connecting");
 
     const ws = new this._WsCtor(this._wsUrl);
+    if (this._binary) {
+      ws.binaryType = "arraybuffer";
+    }
     this._ws = ws;
 
     ws.addEventListener("open", () => {
@@ -73,16 +196,26 @@ export class ConcaveClient {
           this._inFlightMutations.add(frame.req_id);
         } else if (frame.type === "action") {
           this._inFlightActions.add(frame.req_id);
+        } else if (frame.type === "query") {
+          this._inFlightQueries.add(frame.req_id);
         }
-        ws.send(JSON.stringify(frame));
+        ws.send(this._binary ? encodeBinaryFrame(frame) : JSON.stringify(frame));
       }
     });
 
     ws.addEventListener("message", (event) => {
       if (this._ws !== ws) return;
       try {
-        const raw = typeof event.data === "string" ? event.data : String(event.data);
-        this._handleServerFrame(JSON.parse(raw));
+        if (event.data instanceof ArrayBuffer || ArrayBuffer.isView(event.data)) {
+          this._handleServerFrame(decodeBinaryFrame(event.data));
+        } else if (typeof Blob !== "undefined" && event.data instanceof Blob) {
+          event.data.arrayBuffer().then((ab) => {
+            if (this._ws === ws) this._handleServerFrame(decodeBinaryFrame(ab));
+          });
+        } else {
+          const raw = typeof event.data === "string" ? event.data : String(event.data);
+          this._handleServerFrame(JSON.parse(raw));
+        }
       } catch (err) {
         console.error("[concave-client] malformed server frame:", err);
       }
@@ -111,7 +244,11 @@ export class ConcaveClient {
   }
 
   _failInFlightOnDisconnect() {
-    if (this._inFlightMutations.size === 0 && this._inFlightActions.size === 0) {
+    if (
+      this._inFlightMutations.size === 0 &&
+      this._inFlightActions.size === 0 &&
+      this._inFlightQueries.size === 0
+    ) {
       return;
     }
     const err = new Error("WebSocket disconnected");
@@ -135,21 +272,29 @@ export class ConcaveClient {
     }
     this._inFlightActions.clear();
 
+    for (const reqId of this._inFlightQueries) {
+      const pending = this._pendingQueries.get(reqId);
+      this._pendingQueries.delete(reqId);
+      pending?.reject(err);
+    }
+    this._inFlightQueries.clear();
+
     if (removedAnyOpt) {
       this._recomputeOptimisticSignals();
     }
   }
 
   _sendRaw(payload) {
-    const encoded = JSON.stringify(payload);
     if (this._ws && this._ws.readyState === this._WsCtor.OPEN) {
       if (payload.type === "mutation") {
         this._inFlightMutations.add(payload.req_id);
       } else if (payload.type === "action") {
         this._inFlightActions.add(payload.req_id);
+      } else if (payload.type === "query") {
+        this._inFlightQueries.add(payload.req_id);
       }
-      this._ws.send(encoded);
-    } else if (payload.type === "mutation" || payload.type === "action") {
+      this._ws.send(this._binary ? encodeBinaryFrame(payload) : JSON.stringify(payload));
+    } else if (payload.type === "mutation" || payload.type === "action" || payload.type === "query") {
       // Only queue RPCs; `authenticate` and active `subscribe` frames are re-emitted cleanly on `open`
       // without duplicating subscriptions or sending stale auth frames.
       this._outboundQueue.push(payload);
@@ -208,6 +353,17 @@ export class ConcaveClient {
           pending?.resolve(frame.value);
         } else {
           pending?.reject(new Error(frame.error ?? "action failed"));
+        }
+        break;
+      }
+      case "query_result": {
+        this._inFlightQueries.delete(frame.req_id);
+        const pending = this._pendingQueries.get(frame.req_id);
+        this._pendingQueries.delete(frame.req_id);
+        if (frame.ok) {
+          pending?.resolve(frame.value);
+        } else {
+          pending?.reject(new Error(frame.error ?? "query failed"));
         }
         break;
       }
@@ -386,6 +542,19 @@ export class ConcaveClient {
     });
   }
 
+  queryOnce(ref, args) {
+    const reqId = `qry_${this._nextId++}`;
+    return new Promise((resolve, reject) => {
+      this._pendingQueries.set(reqId, { resolve, reject });
+      this._sendRaw({
+        type: "query",
+        req_id: reqId,
+        name: ref.name,
+        args,
+      });
+    });
+  }
+
   close() {
     this._closed = true;
     if (this._reconnectTimer !== null) {
@@ -398,14 +567,17 @@ export class ConcaveClient {
   }
 }
 
-function normalizeWsUrl(url) {
+function normalizeWsUrl(url, binary) {
+  let base;
   if (url.startsWith("ws://") || url.startsWith("wss://")) {
-    return url.endsWith("/ws") ? url : `${url.replace(/\/$/, "")}/ws`;
+    base = url.endsWith("/ws") ? url : `${url.replace(/\/$/, "")}/ws`;
+  } else {
+    const converted = url
+      .replace(/^http:\/\//, "ws://")
+      .replace(/^https:\/\//, "wss://");
+    base = converted.endsWith("/ws")
+      ? converted
+      : `${converted.replace(/\/$/, "")}/ws`;
   }
-  const converted = url
-    .replace(/^http:\/\//, "ws://")
-    .replace(/^https:\/\//, "wss://");
-  return converted.endsWith("/ws")
-    ? converted
-    : `${converted.replace(/\/$/, "")}/ws`;
+  return binary && !base.includes("proto=") ? `${base}${base.includes("?") ? "&" : "?"}proto=bin` : base;
 }

@@ -185,18 +185,29 @@ Db := [Db].{
             limit: Some(n),
         }
 
+    encode_query_wire : Str, QueryBuilder(doc) -> Str
+    encode_query_wire = |ns, q| {
+        limit_wire = match q.limit {
+            None => "N"
+            Some(n) => "L${n.to_str()}:"
+        }
+        "!1:${Key.len_str(ns)}${Key.len_str(q.table_name)}${Key.len_str(q.index_name)}${Key.bound_to_wire(q.start)}${Key.bound_to_wire(q.end)}${Key.order_to_wire(q.order)}${limit_wire}"
+    }
+
+    ## Execute the query against `db` and return the host-serialized JSON array directly
+    ## (zero Roc JSON parse/re-encode overhead for pass-through queries).
+    collect_raw! : QueryBuilder(doc), Ctx.DbReader => Try(Str, Str)
+    collect_raw! = |q, db| {
+        req_wire = encode_query_wire(db.namespace, q)
+        query_raw! = db.query_raw!
+        query_raw!(req_wire)
+    }
+
     ## Execute the query against `db` and decode the matching documents into `List(doc)`.
     collect! : QueryBuilder(doc), Ctx.DbReader => Try(List(doc), Str)
         where [doc.Json.Parseable([InvalidJson(Str)])]
     collect! = |q, db| {
-        limit_json = match q.limit {
-            None => "null"
-            Some(n) => n.to_str()
-        }
-        req_json =
-            "{\"namespace\":${Json.to_str(db.namespace)},\"table\":${Json.to_str(q.table_name)},\"index_name\":${Json.to_str(q.index_name)},\"start\":${Key.bound_to_json(q.start)},\"end\":${Key.bound_to_json(q.end)},\"order\":${Key.order_to_json(q.order)},\"limit\":${limit_json}}"
-        query_raw! = db.query_raw!
-        raw = query_raw!(req_json)?
+        raw = collect_raw!(q, db)?
         match Json.parse(raw) {
             Ok(docs) => Ok(docs)
             Err(InvalidJson(msg)) => Err("failed to decode query results: ${msg}")
@@ -225,10 +236,10 @@ Db := [Db].{
     paginate! : QueryBuilder(doc), Ctx.DbReader, Str, U64 => Try(Page(doc), Str)
         where [doc.Json.Parseable([InvalidJson(Str)])]
     paginate! = |q, db, cursor, page_size| {
-        req_json =
-            "{\"namespace\":${Json.to_str(db.namespace)},\"table\":${Json.to_str(q.table_name)},\"index_name\":${Json.to_str(q.index_name)},\"start\":${Key.bound_to_json(q.start)},\"end\":${Key.bound_to_json(q.end)},\"order\":${Key.order_to_json(q.order)},\"cursor\":${Json.to_str(cursor)},\"page_size\":${page_size.to_str()}}"
+        req_wire =
+            "!1:${Key.len_str(db.namespace)}${Key.len_str(q.table_name)}${Key.len_str(q.index_name)}${Key.bound_to_wire(q.start)}${Key.bound_to_wire(q.end)}${Key.order_to_wire(q.order)}${Key.len_str(cursor)}${page_size.to_str()}:"
         paginate_raw! = db.paginate_raw!
-        raw = paginate_raw!(req_json)?
+        raw = paginate_raw!(req_wire)?
         match Json.parse(raw) {
             Ok(res) => Ok(res)
             Err(InvalidJson(msg)) => Err("failed to decode page result: ${msg}")
@@ -239,10 +250,10 @@ Db := [Db].{
     search! : Ctx.DbReader, Table(doc), Str, Str, U64 => Try(List(doc), Str)
         where [doc.Json.Parseable([InvalidJson(Str)])]
     search! = |db, table, field, query_text, limit| {
-        req_json =
-            "{\"namespace\":${Json.to_str(db.namespace)},\"table\":${Json.to_str(Table.table_name(table))},\"field\":${Json.to_str(field)},\"query\":${Json.to_str(query_text)},\"limit\":${limit.to_str()}}"
+        req_wire =
+            "!1:${Key.len_str(db.namespace)}${Key.len_str(Table.table_name(table))}${Key.len_str(field)}${Key.len_str(query_text)}${limit.to_str()}:"
         search_raw! = db.search_raw!
-        raw = search_raw!(req_json)?
+        raw = search_raw!(req_wire)?
         match Json.parse(raw) {
             Ok(docs) => Ok(docs)
             Err(InvalidJson(msg)) => Err("failed to decode search results: ${msg}")

@@ -71,20 +71,47 @@ fn upperBoundKeyOnly(items: []const SortedIndexRow, key: []const u8, inclusive: 
     return lo;
 }
 
-/// Zero-dependency embedded ACID WAL + partitioned $O(\log N)$ ordered index store.
+const CommitWaiter = struct {
+    allocator: Allocator,
+    manifest: *const manifest_mod.AppManifest,
+    snapshot_ts: i64,
+    read_set: *const readset_mod.ReadSet,
+    writes: []const WriteOp,
+    done: bool = false,
+    result: anyerror!CommitResult = undefined,
+    next: ?*CommitWaiter = null,
+};
+
+/// Zero-dependency embedded ACID WAL + partitioned $O(\log N)$ ordered index store with Leader-Follower Group Commit.
 ///
+/// - Uses an `RwLock` for parallel concurrent reads (`getDoc`, `scanIndex`, `scanIndexToWireJson`).
+/// - Batches concurrent durable commits into a single `write()` + `fsync()` call via Leader-Follower
+///   Group Commit while preserving strict OCC serializability, linearizability, and zero dirty reads.
 /// - Persists every committed mutation as an append-only CRC32-framed JSON record in `wal_path`
 ///   using a persistent open file handle, with atomic snapshot compaction.
-/// - Enforces serializable OCC conflict checks against `commit_log` and maintains both pre-image
-///   and post-image index keys in every `WriteSet`.
 pub const WalStore = struct {
     allocator: Allocator,
     io: std.Io,
-    mutex: std.Io.Mutex = .init,
+    rwlock: std.Io.RwLock = .init,
+    /// Protects `wal_file` I/O (`writePositionalAll`, `sync`, and `compactLocked` close/rename)
+    /// so `file.sync()` runs outside `rwlock` without blocking concurrent readers or Roc mutations.
+    /// Strict lock order: `rwlock` -> `wal_io_mutex` (never reversed).
+    wal_io_mutex: std.Io.Mutex = .init,
+    /// Group-commit waiter queue (separate lock so arriving writers enqueue while leader fsyncs).
+    queue_mutex: std.Io.Mutex = .init,
+    queue_cond: std.Io.Condition = .init,
+    queue_head: ?*CommitWaiter = null,
+    queue_tail: ?*CommitWaiter = null,
+    leader_active: bool = false,
     wal_path: ?[]u8,
     wal_file: ?std.Io.File = null,
     wal_file_size: u64 = 0,
+    /// Reusable batch buffer for zero-alloc WAL serialization & in-place CRC32 framing.
+    wal_batch: std.Io.Writer.Allocating,
+    wal_fsync_count: std.atomic.Value(u64) = .init(0),
+    wal_group_batches: std.atomic.Value(u64) = .init(0),
     latest_ts: i64 = 0,
+    latest_ts_atomic: std.atomic.Value(i64) = .init(0),
     /// Keyed by `"<namespace>\x1f<table>\x1f<doc_id>"` -> owned Document.
     docs: std.StringHashMapUnmanaged(Document) = .empty,
     /// Partitioned secondary indexes keyed by `"<ns>\x1f<table>\x1f<index_name>"` -> sorted rows.
@@ -102,6 +129,7 @@ pub const WalStore = struct {
             .allocator = allocator,
             .io = io,
             .wal_path = null,
+            .wal_batch = .init(allocator),
         };
         return self;
     }
@@ -116,6 +144,7 @@ pub const WalStore = struct {
             .allocator = allocator,
             .io = io,
             .wal_path = path_copy,
+            .wal_batch = .init(allocator),
         };
 
         // Ensure parent directory exists if a relative/nested path was given.
@@ -129,6 +158,7 @@ pub const WalStore = struct {
 
     pub fn deinit(self: *WalStore) void {
         if (self.wal_file) |f| f.close(self.io);
+        self.wal_batch.deinit();
         if (self.wal_path) |p| self.allocator.free(p);
         var it = self.docs.iterator();
         while (it.next()) |entry| {
@@ -149,8 +179,8 @@ pub const WalStore = struct {
     }
 
     pub fn initSchema(self: *WalStore, manifest: *const manifest_mod.AppManifest) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.rwlock.lockUncancelable(self.io);
+        defer self.rwlock.unlock(self.io);
 
         // Replay durable WAL if present and not yet loaded.
         if (self.wal_path) |path| {
@@ -164,14 +194,12 @@ pub const WalStore = struct {
     }
 
     pub fn latestCommitTs(self: *WalStore) !i64 {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        return self.latest_ts;
+        return self.latest_ts_atomic.load(.acquire);
     }
 
     pub fn getDoc(self: *WalStore, allocator: Allocator, ns: []const u8, table: []const u8, doc_id: []const u8) !?Document {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.rwlock.lockSharedUncancelable(self.io);
+        defer self.rwlock.unlockShared(self.io);
 
         var stack_buf: [256]u8 = undefined;
         const k = try formatKey3Buf(&stack_buf, self.allocator, ns, table, doc_id);
@@ -183,8 +211,8 @@ pub const WalStore = struct {
     }
 
     pub fn scanIndex(self: *WalStore, allocator: Allocator, query: *const IndexQuery) ![]Document {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.rwlock.lockSharedUncancelable(self.io);
+        defer self.rwlock.unlockShared(self.io);
 
         var bucket_buf: [256]u8 = undefined;
         const bk = try formatKey3Buf(&bucket_buf, self.allocator, query.namespace, query.table, query.index_name);
@@ -234,6 +262,55 @@ pub const WalStore = struct {
         return out;
     }
 
+    /// Zero-clone fast path: streams matching documents directly as a JSON array into `w` under a shared lock.
+    pub fn scanIndexToWireJson(self: *WalStore, query: *const IndexQuery, w: *std.Io.Writer) !void {
+        self.rwlock.lockSharedUncancelable(self.io);
+        defer self.rwlock.unlockShared(self.io);
+
+        try w.writeByte('[');
+
+        var bucket_buf: [256]u8 = undefined;
+        const bk = try formatKey3Buf(&bucket_buf, self.allocator, query.namespace, query.table, query.index_name);
+        defer if (bk.owned) self.allocator.free(bk.slice);
+
+        if (self.index_buckets.getPtr(bk.slice)) |bucket| {
+            const rows = bucket.items;
+            if (rows.len > 0) {
+                const lo: usize = switch (query.start) {
+                    .unbounded => 0,
+                    .included => |k| lowerBoundKeyOnly(rows, k, true),
+                    .excluded => |k| lowerBoundKeyOnly(rows, k, false),
+                };
+                const hi: usize = switch (query.end) {
+                    .unbounded => rows.len,
+                    .included => |k| upperBoundKeyOnly(rows, k, true),
+                    .excluded => |k| upperBoundKeyOnly(rows, k, false),
+                };
+                if (lo < hi) {
+                    const span = rows[lo..hi];
+                    const count = if (query.limit) |lim| @min(lim, span.len) else span.len;
+                    var doc_buf: [256]u8 = undefined;
+                    var written: usize = 0;
+                    for (0..count) |i| {
+                        const row = switch (query.order) {
+                            .asc => &span[i],
+                            .desc => &span[span.len - 1 - i],
+                        };
+                        const dk = try formatKey3Buf(&doc_buf, self.allocator, query.namespace, query.table, row.doc_id);
+                        defer if (dk.owned) self.allocator.free(dk.slice);
+                        if (self.docs.getPtr(dk.slice)) |doc_ptr| {
+                            if (written > 0) try w.writeByte(',');
+                            try doc_ptr.writeWireJson(w);
+                            written += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        try w.writeByte(']');
+    }
+
     pub fn commitTx(
         self: *WalStore,
         allocator: Allocator,
@@ -242,9 +319,144 @@ pub const WalStore = struct {
         read_set: *const readset_mod.ReadSet,
         writes: []const WriteOp,
     ) !CommitResult {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        // Fast path 1: read-only commits validate OCC under a shared lock with zero disk I/O.
+        if (writes.len == 0) {
+            self.rwlock.lockSharedUncancelable(self.io);
+            defer self.rwlock.unlockShared(self.io);
+            if (self.latest_ts > snapshot_ts) {
+                for (self.commit_log.items) |*entry| {
+                    if (entry.commit_ts > snapshot_ts and read_set.intersects(&entry.write_set)) {
+                        return storage_mod.StorageError.Conflict;
+                    }
+                }
+            }
+            return .{ .commit_ts = self.latest_ts, .write_set = .{} };
+        }
 
+        // Fast path 2: in-memory store needs no fsync batching.
+        if (self.wal_path == null) {
+            self.rwlock.lockUncancelable(self.io);
+            defer self.rwlock.unlock(self.io);
+            return self.commitSingleLocked(allocator, manifest, snapshot_ts, read_set, writes, false);
+        }
+
+        // Durable WAL path: Leader-Follower Group Commit.
+        // Stack-allocated waiter avoids per-commit heap allocation; callers arriving while a leader
+        // is inside `fsync()` batch together and commit in a single `write()` + `fsync()`.
+        var waiter = CommitWaiter{
+            .allocator = allocator,
+            .manifest = manifest,
+            .snapshot_ts = snapshot_ts,
+            .read_set = read_set,
+            .writes = writes,
+        };
+
+        self.queue_mutex.lockUncancelable(self.io);
+        if (self.queue_tail) |tail| {
+            tail.next = &waiter;
+            self.queue_tail = &waiter;
+        } else {
+            self.queue_head = &waiter;
+            self.queue_tail = &waiter;
+        }
+
+        while (self.leader_active and !waiter.done) {
+            self.queue_cond.waitUncancelable(self.io, &self.queue_mutex);
+        }
+
+        if (waiter.done) {
+            self.queue_mutex.unlock(self.io);
+            return waiter.result;
+        }
+
+        // We are now the Group Leader: drain all currently queued commits and flush in one batch.
+        self.leader_active = true;
+        const batch_head = self.queue_head;
+        self.queue_head = null;
+        self.queue_tail = null;
+        self.queue_mutex.unlock(self.io);
+
+        var wal_file_to_sync: ?std.Io.File = null;
+        var should_compact = false;
+        var batch_commits: usize = 0;
+
+        {
+            self.rwlock.lockUncancelable(self.io);
+            defer self.rwlock.unlock(self.io);
+
+            self.wal_batch.writer.end = 0;
+            var cur = batch_head;
+            while (cur) |w| : (cur = w.next) {
+                w.result = self.commitSingleLocked(w.allocator, w.manifest, w.snapshot_ts, w.read_set, w.writes, true);
+                if (w.result) |_| {
+                    batch_commits += 1;
+                } else |_| {}
+            }
+
+            const batch_bytes = self.wal_batch.written();
+            if (batch_commits > 0 and batch_bytes.len > 0) {
+                self.wal_io_mutex.lockUncancelable(self.io);
+                const write_res = self.writeWalBatchLocked(self.wal_path.?, batch_bytes);
+                if (write_res) |f| {
+                    wal_file_to_sync = f;
+                    self.wal_records_since_compact += batch_commits;
+                    if (self.compact_threshold > 0 and self.wal_records_since_compact >= self.compact_threshold) {
+                        should_compact = true;
+                    }
+                    // Keep `wal_io_mutex` held across `file.sync()` after `rwlock` is released!
+                } else |err| {
+                    self.wal_io_mutex.unlock(self.io);
+                    var ec = batch_head;
+                    while (ec) |w| : (ec = w.next) {
+                        if (w.result) |*ok_res| {
+                            ok_res.deinit(w.allocator);
+                            w.result = err;
+                        } else |_| {}
+                    }
+                }
+            }
+        }
+
+        // Perform the durable SSD `fsync()` OUTSIDE `rwlock` so concurrent readers and arriving
+        // mutations run at full speed and batch together into the next group commit!
+        if (wal_file_to_sync) |file| {
+            defer self.wal_io_mutex.unlock(self.io);
+            file.sync(self.io) catch {};
+            _ = self.wal_fsync_count.fetchAdd(1, .monotonic);
+            _ = self.wal_group_batches.fetchAdd(1, .monotonic);
+        }
+
+        if (should_compact) {
+            self.rwlock.lockUncancelable(self.io);
+            defer self.rwlock.unlock(self.io);
+            self.wal_io_mutex.lockUncancelable(self.io);
+            defer self.wal_io_mutex.unlock(self.io);
+            self.compactLocked(self.wal_path.?) catch {};
+        }
+
+        self.queue_mutex.lockUncancelable(self.io);
+        var done_cur = batch_head;
+        while (done_cur) |w| {
+            const nxt = w.next;
+            w.done = true;
+            done_cur = nxt;
+        }
+        self.leader_active = false;
+        self.queue_cond.broadcast(self.io);
+        self.queue_mutex.unlock(self.io);
+
+        return waiter.result;
+    }
+
+    fn commitSingleLocked(
+        self: *WalStore,
+        allocator: Allocator,
+        manifest: *const manifest_mod.AppManifest,
+        snapshot_ts: i64,
+        read_set: *const readset_mod.ReadSet,
+        writes: []const WriteOp,
+        encode_wal: bool,
+    ) !CommitResult {
         // 1. OCC conflict check against every commit strictly after `snapshot_ts`.
         if (self.latest_ts > snapshot_ts) {
             for (self.commit_log.items) |*entry| {
@@ -263,9 +475,15 @@ pub const WalStore = struct {
             };
         }
 
-        // 2. Validate that target docs exist for Replace/Patch against intra-tx virtual existence state
-        //    so `[insert(x), patch(x)]` succeeds and `[delete(x), patch(x)]` fails atomically.
-        {
+        // 2. Validate target doc existence only if any Replace/Patch ops exist in `writes`.
+        var needs_existence_check = false;
+        for (writes) |op| {
+            if (op == .replace or op == .patch) {
+                needs_existence_check = true;
+                break;
+            }
+        }
+        if (needs_existence_check) {
             var v_exists: std.StringHashMapUnmanaged(bool) = .empty;
             defer {
                 var vit = v_exists.keyIterator();
@@ -284,15 +502,17 @@ pub const WalStore = struct {
                         }
                     },
                     .replace => |r| {
-                        const k = try makeDocKey(self.allocator, r.namespace, r.table, r.doc_id);
-                        defer self.allocator.free(k);
-                        const exists = v_exists.get(k) orelse self.docs.contains(k);
+                        var kbuf: [256]u8 = undefined;
+                        const k = try formatKey3Buf(&kbuf, self.allocator, r.namespace, r.table, r.doc_id);
+                        defer if (k.owned) self.allocator.free(k.slice);
+                        const exists = v_exists.get(k.slice) orelse self.docs.contains(k.slice);
                         if (!exists) return storage_mod.StorageError.NotFound;
                     },
                     .patch => |p| {
-                        const k = try makeDocKey(self.allocator, p.namespace, p.table, p.doc_id);
-                        defer self.allocator.free(k);
-                        const exists = v_exists.get(k) orelse self.docs.contains(k);
+                        var kbuf: [256]u8 = undefined;
+                        const k = try formatKey3Buf(&kbuf, self.allocator, p.namespace, p.table, p.doc_id);
+                        defer if (k.owned) self.allocator.free(k.slice);
+                        const exists = v_exists.get(k.slice) orelse self.docs.contains(k.slice);
                         if (!exists) return storage_mod.StorageError.NotFound;
                     },
                     .delete => |d| {
@@ -318,12 +538,13 @@ pub const WalStore = struct {
 
         const next_ts = self.latest_ts + 1;
 
-        // 4. Persist to append-only WAL file before acknowledging commit.
-        if (self.wal_path) |path| {
-            try self.appendWalLocked(path, next_ts, writes);
+        // 4. Append CRC32-framed WAL record directly into reusable batch buffer.
+        if (encode_wal) {
+            try self.encodeWalRecordToBatchLocked(next_ts, writes);
         }
 
         self.latest_ts = next_ts;
+        self.latest_ts_atomic.store(next_ts, .release);
 
         // Store a copy in commit_log and return a copy to caller.
         const caller_ws = try write_set.clone(allocator);
@@ -340,14 +561,6 @@ pub const WalStore = struct {
             self.commit_log.shrinkRetainingCapacity(2048);
         }
 
-        // Trigger atomic WAL compaction when threshold is reached.
-        if (self.wal_path) |path| {
-            self.wal_records_since_compact += 1;
-            if (self.compact_threshold > 0 and self.wal_records_since_compact >= self.compact_threshold) {
-                self.compactLocked(path) catch {};
-            }
-        }
-
         return .{
             .commit_ts = next_ts,
             .write_set = caller_ws,
@@ -356,8 +569,10 @@ pub const WalStore = struct {
 
     /// Atomically compact the on-disk WAL into a minimal CRC32-protected snapshot of live documents.
     pub fn compact(self: *WalStore) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.rwlock.lockUncancelable(self.io);
+        defer self.rwlock.unlock(self.io);
+        self.wal_io_mutex.lockUncancelable(self.io);
+        defer self.wal_io_mutex.unlock(self.io);
         const path = self.wal_path orelse return;
         try self.compactLocked(path);
     }
@@ -418,8 +633,8 @@ pub const WalStore = struct {
     }
 
     pub fn commitsSince(self: *WalStore, allocator: Allocator, since_ts: i64) ![]CommitEntry {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.rwlock.lockSharedUncancelable(self.io);
+        defer self.rwlock.unlockShared(self.io);
 
         var out: std.ArrayList(CommitEntry) = .empty;
         errdefer {
@@ -587,10 +802,12 @@ pub const WalStore = struct {
         }
     }
 
-    fn appendWalLocked(self: *WalStore, path: []const u8, commit_ts: i64, writes: []const WriteOp) !void {
-        var payload: std.Io.Writer.Allocating = .init(self.allocator);
-        defer payload.deinit();
-        const w = &payload.writer;
+    fn encodeWalRecordToBatchLocked(self: *WalStore, commit_ts: i64, writes: []const WriteOp) !void {
+        const w = &self.wal_batch.writer;
+        const header_start = w.end;
+        // Reserve 9 bytes for `<8-hex-crc>|` and patch the CRC32 in-place after writing payload.
+        try w.writeAll("00000000|");
+        const payload_start = w.end;
 
         try w.print("{{\"ts\":{d},\"ops\":[", .{commit_ts});
         for (writes, 0..) |op, idx| {
@@ -642,11 +859,17 @@ pub const WalStore = struct {
         }
         try w.writeAll("]}");
 
-        const crc = std.hash.Crc32.hash(payload.written());
-        var line: std.Io.Writer.Allocating = .init(self.allocator);
-        defer line.deinit();
-        try line.writer.print("{x:0>8}|{s}\n", .{ crc, payload.written() });
+        const payload_end = w.end;
+        const crc = std.hash.Crc32.hash(w.buffer[payload_start..payload_end]);
+        const hex = "0123456789abcdef";
+        inline for (0..8) |i| {
+            const shift: u5 = @intCast(28 - i * 4);
+            w.buffer[header_start + i] = hex[@as(usize, @intCast((crc >> shift) & 0xF))];
+        }
+        try w.writeByte('\n');
+    }
 
+    fn writeWalBatchLocked(self: *WalStore, path: []const u8, batch_bytes: []const u8) !std.Io.File {
         if (self.wal_file == null) {
             const f = std.Io.Dir.cwd().createFile(self.io, path, .{
                 .truncate = false,
@@ -660,10 +883,10 @@ pub const WalStore = struct {
             self.wal_file_size = st.size;
         }
         const file = self.wal_file.?;
-        file.writePositionalAll(self.io, line.written(), self.wal_file_size) catch
+        file.writePositionalAll(self.io, batch_bytes, self.wal_file_size) catch
             return storage_mod.StorageError.StorageFailure;
-        self.wal_file_size += line.written().len;
-        file.sync(self.io) catch {};
+        self.wal_file_size += batch_bytes.len;
+        return file;
     }
 
     fn replayWalLocked(self: *WalStore, path: []const u8, manifest: *const manifest_mod.AppManifest) !void {
@@ -678,8 +901,8 @@ pub const WalStore = struct {
     /// - CRC32-framed lines (`<8-hex-crc>|<json>`) reject any bit-flip corruption atomically.
     /// - Every op in a line is fully validated before any state is mutated.
     pub fn replayWalBytes(self: *WalStore, bytes: []const u8, manifest: *const manifest_mod.AppManifest) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.rwlock.lockUncancelable(self.io);
+        defer self.rwlock.unlock(self.io);
         try self.replayWalBytesLocked(bytes, manifest);
         try self.rebuildIndexesLocked(manifest);
     }
@@ -834,14 +1057,15 @@ pub const WalStore = struct {
             }
             if (ts_v.integer > self.latest_ts) {
                 self.latest_ts = ts_v.integer;
+                self.latest_ts_atomic.store(ts_v.integer, .release);
             }
         }
     }
 
     /// Assert that `self.indexes` matches `computeIndexEntries` across every live document (no orphan or missing rows).
     pub fn verifyIndexIntegrity(self: *WalStore, allocator: Allocator, manifest: *const manifest_mod.AppManifest) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.rwlock.lockSharedUncancelable(self.io);
+        defer self.rwlock.unlockShared(self.io);
 
         var expected: std.StringHashMapUnmanaged(usize) = .empty;
         defer {
@@ -1096,4 +1320,99 @@ test "wal store atomic compaction shrinks log and recovers exact live state + co
     try std.testing.expect(std.mem.indexOf(u8, d1.body_json, "60") != null);
     try std.testing.expect((try reopened.getDoc(allocator, "", "items", "d2")) == null);
     try reopened.verifyIndexIntegrity(allocator, &manifest);
+}
+
+test "wal store leader-follower group commit batches concurrent fsyncs and preserves durability" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const wal_path = ".zig-cache/test-group-commit.wal";
+    std.Io.Dir.cwd().deleteFile(io, wal_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, wal_path) catch {};
+
+    const manifest_json =
+        \\{"app_name":"gc","tables":[{"name":"events","document_schema":{"kind":"any"},"indexes":[{"name":"by_worker","fields":["worker"]}]}],"components":[],"functions":[]}
+    ;
+    var manifest = try manifest_mod.AppManifest.parseJson(allocator, manifest_json);
+    defer manifest.deinit();
+
+    var store = try WalStore.openFile(allocator, io, wal_path);
+    var store_open = true;
+    errdefer if (store_open) store.deinit();
+    store.compact_threshold = 0;
+    try store.initSchema(&manifest);
+
+    const NUM_THREADS = 12;
+    const PER_THREAD = 15;
+    const WorkerCtx = struct {
+        store: *WalStore,
+        manifest: *const manifest_mod.AppManifest,
+        worker_id: usize,
+        ok_count: std.atomic.Value(usize) = .init(0),
+
+        fn run(ctx: *@This()) void {
+            const alloc = std.heap.smp_allocator;
+            var empty_rs: readset_mod.ReadSet = .{};
+            for (0..PER_THREAD) |j| {
+                var id_buf: [32]u8 = undefined;
+                const doc_id = std.fmt.bufPrint(&id_buf, "w{d}_i{d}", .{ ctx.worker_id, j }) catch return;
+                var body_buf: [64]u8 = undefined;
+                const body = std.fmt.bufPrint(&body_buf, "{{\"worker\":{d},\"seq\":{d}}}", .{ ctx.worker_id, j }) catch return;
+                const ops = [_]WriteOp{.{ .insert = .{
+                    .namespace = @constCast(""),
+                    .table = @constCast("events"),
+                    .doc_id = @constCast(doc_id),
+                    .creation_time_ms = @intCast(1000 + ctx.worker_id * 100 + j),
+                    .body_json = @constCast(body),
+                } }};
+                const snap = ctx.store.latestCommitTs() catch 0;
+                var res = ctx.store.commitTx(alloc, ctx.manifest, snap, &empty_rs, &ops) catch return;
+                res.deinit(alloc);
+                _ = ctx.ok_count.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+
+    var ctxs: [NUM_THREADS]WorkerCtx = undefined;
+    var threads: [NUM_THREADS]std.Thread = undefined;
+    for (0..NUM_THREADS) |t| {
+        ctxs[t] = .{ .store = store, .manifest = &manifest, .worker_id = t };
+        threads[t] = try std.Thread.spawn(.{}, WorkerCtx.run, .{&ctxs[t]});
+    }
+    var total_ok: usize = 0;
+    for (0..NUM_THREADS) |t| {
+        threads[t].join();
+        total_ok += ctxs[t].ok_count.load(.acquire);
+    }
+
+    const total_expected = NUM_THREADS * PER_THREAD;
+    try std.testing.expectEqual(total_expected, total_ok);
+    try std.testing.expectEqual(@as(i64, @intCast(total_expected)), try store.latestCommitTs());
+    // Group commit must coalesce concurrent writers into strictly fewer fsyncs than total commits.
+    const fsyncs = store.wal_fsync_count.load(.acquire);
+    try std.testing.expect(fsyncs > 0 and fsyncs < total_expected);
+    store.deinit();
+    store_open = false;
+
+    // Crash/restart recovery: replay WAL from disk and assert every single committed doc & index survives!
+    var reopened = try WalStore.openFile(allocator, io, wal_path);
+    defer reopened.deinit();
+    try reopened.initSchema(&manifest);
+    try std.testing.expectEqual(@as(i64, @intCast(total_expected)), try reopened.latestCommitTs());
+    try reopened.verifyIndexIntegrity(allocator, &manifest);
+
+    // Also test zero-clone scanIndexToWireJson matches exact doc count.
+    var wire: std.Io.Writer.Allocating = .init(allocator);
+    defer wire.deinit();
+    try reopened.scanIndexToWireJson(&.{
+        .namespace = "",
+        .table = "events",
+        .index_name = "by_creation_time",
+        .start = .unbounded,
+        .end = .unbounded,
+        .order = .asc,
+        .limit = null,
+    }, &wire.writer);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, wire.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(total_expected, parsed.value.array.items.len);
 }

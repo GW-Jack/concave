@@ -348,7 +348,8 @@ fn handleConnection(
             ) catch return;
             sw.interface.flush() catch return;
 
-            handleWebSocket(allocator, io, engine, stream, &sr.interface);
+            const initial_binary = std.mem.indexOf(u8, req.query, "proto=bin") != null;
+            handleWebSocket(allocator, io, engine, stream, &sr.interface, initial_binary);
             return;
         }
 
@@ -931,9 +932,14 @@ fn handleWebSocket(
     engine: *engine_mod.ConcaveEngine,
     stream: std.Io.net.Stream,
     reader: *std.Io.Reader,
+    initial_binary: bool,
 ) void {
     var sender = ws_mod.WsSender.init(io, stream);
     const client_id = engine.registerClient(engine_mod.ClientSink.fromWsSender(&sender)) catch return;
+    var binary_enabled = initial_binary;
+    if (binary_enabled) {
+        engine.setClientBinaryProtocol(client_id, true);
+    }
     defer {
         sender.markClosed();
         engine.unregisterClient(client_id);
@@ -956,7 +962,180 @@ fn handleWebSocket(
             .text => |text| {
                 handleWsText(wa, engine, client_id, &sender, text);
             },
+            .binary => |bin| {
+                if (!binary_enabled) {
+                    binary_enabled = true;
+                    engine.setClientBinaryProtocol(client_id, true);
+                }
+                handleWsBinary(wa, engine, client_id, &sender, bin);
+            },
         }
+    }
+}
+
+const BinReader = struct {
+    data: []const u8,
+    pos: usize = 0,
+
+    fn readU8(self: *BinReader) !u8 {
+        if (self.pos + 1 > self.data.len) return error.Truncated;
+        const v = self.data[self.pos];
+        self.pos += 1;
+        return v;
+    }
+
+    fn readU16(self: *BinReader) !u16 {
+        if (self.pos + 2 > self.data.len) return error.Truncated;
+        const v = std.mem.readInt(u16, self.data[self.pos..][0..2], .big);
+        self.pos += 2;
+        return v;
+    }
+
+    fn readU32(self: *BinReader) !u32 {
+        if (self.pos + 4 > self.data.len) return error.Truncated;
+        const v = std.mem.readInt(u32, self.data[self.pos..][0..4], .big);
+        self.pos += 4;
+        return v;
+    }
+
+    fn readI64(self: *BinReader) !i64 {
+        if (self.pos + 8 > self.data.len) return error.Truncated;
+        const v = std.mem.readInt(i64, self.data[self.pos..][0..8], .big);
+        self.pos += 8;
+        return v;
+    }
+
+    fn readStr16(self: *BinReader) ![]const u8 {
+        const len: usize = try self.readU16();
+        if (self.pos + len > self.data.len) return error.Truncated;
+        const s = self.data[self.pos .. self.pos + len];
+        self.pos += len;
+        return s;
+    }
+
+    fn readStr32(self: *BinReader) ![]const u8 {
+        const len: usize = try self.readU32();
+        if (self.pos + len > self.data.len) return error.Truncated;
+        const s = self.data[self.pos .. self.pos + len];
+        self.pos += len;
+        return s;
+    }
+};
+
+fn sendWsBinaryResult(
+    a: Allocator,
+    sender: *ws_mod.WsSender,
+    tag: u8,
+    req_id: []const u8,
+    res: engine_mod.ExecResult,
+    commit_ts: ?i64,
+) void {
+    const payload = switch (res) {
+        .ok => |v| v,
+        .err => |e| e,
+    };
+    const ok_byte: u8 = if (res == .ok) 1 else 0;
+    const ts_bytes: usize = if (commit_ts != null) 8 else 0;
+    const total = 1 + 2 + req_id.len + 1 + ts_bytes + 4 + payload.len;
+
+    var stack_buf: [8192]u8 = undefined;
+    const buf = if (total <= stack_buf.len) stack_buf[0..total] else (a.alloc(u8, total) catch return);
+
+    var p: usize = 0;
+    buf[p] = tag;
+    p += 1;
+    std.mem.writeInt(u16, buf[p..][0..2], @intCast(req_id.len), .big);
+    p += 2;
+    @memcpy(buf[p .. p + req_id.len], req_id);
+    p += req_id.len;
+    buf[p] = ok_byte;
+    p += 1;
+    if (commit_ts) |ts| {
+        std.mem.writeInt(i64, buf[p..][0..8], ts, .big);
+        p += 8;
+    }
+    std.mem.writeInt(u32, buf[p..][0..4], @intCast(payload.len), .big);
+    p += 4;
+    if (payload.len > 0) @memcpy(buf[p .. p + payload.len], payload);
+
+    sender.sendBinary(buf) catch {};
+}
+
+/// Zero-JSON-envelope binary WebSocket dispatcher (CBIN v1, RFC 6455 opcode 0x02).
+fn handleWsBinary(
+    a: Allocator,
+    engine: *engine_mod.ConcaveEngine,
+    client_id: u64,
+    sender: *ws_mod.WsSender,
+    data: []const u8,
+) void {
+    var r = BinReader{ .data = data };
+    const tag = r.readU8() catch return;
+
+    switch (tag) {
+        0x01 => { // authenticate: [u8 has_token]([u16 len][token])?
+            const has_tok = r.readU8() catch return;
+            const tok: ?[]const u8 = if (has_tok != 0) (r.readStr16() catch return) else null;
+            const resp = engine.authenticateClientBinary(client_id, tok) catch return;
+            defer engine.allocator.free(resp);
+            sender.sendBinary(resp) catch {};
+        },
+        0x02 => { // subscribe: [u16 sub_id][u16 name][u32 args_json]
+            const sub_id = r.readStr16() catch return;
+            const name = r.readStr16() catch return;
+            const args_raw = r.readStr32() catch return;
+            const args_json = if (args_raw.len > 0) args_raw else "{}";
+            engine.subscribe(client_id, sub_id, name, args_json) catch {};
+        },
+        0x03 => { // unsubscribe: [u16 sub_id]
+            const sub_id = r.readStr16() catch return;
+            engine.unsubscribe(client_id, sub_id);
+        },
+        0x04 => { // mutation: [u16 req_id][u16 name][u32 args_json] -> 0x84
+            const req_id = r.readStr16() catch return;
+            const name = r.readStr16() catch return;
+            const args_raw = r.readStr32() catch return;
+            const args_json = if (args_raw.len > 0) args_raw else "{}";
+
+            var auth_copy = engine.cloneClientAuth(a, client_id);
+            const mres = engine.executeMutation(a, name, args_json, if (auth_copy) |*ac| ac else null) catch return;
+            sendWsBinaryResult(a, sender, 0x84, req_id, mres.result, mres.commit_ts);
+        },
+        0x05 => { // action: [u16 req_id][u16 name][u32 args_json] -> 0x85
+            const req_id = r.readStr16() catch return;
+            const name = r.readStr16() catch return;
+            const args_raw = r.readStr32() catch return;
+            const args_json = if (args_raw.len > 0) args_raw else "{}";
+
+            var auth_copy = engine.cloneClientAuth(a, client_id);
+            const res = engine.executeAction(a, name, args_json, if (auth_copy) |*ac| ac else null) catch return;
+            sendWsBinaryResult(a, sender, 0x85, req_id, res, null);
+        },
+        0x06 => { // ping: [i64 ts] -> 0x86 [i64 ts]
+            const ts = r.readI64() catch return;
+            var pong: [9]u8 = undefined;
+            pong[0] = 0x86;
+            std.mem.writeInt(i64, pong[1..9], ts, .big);
+            sender.sendBinary(&pong) catch {};
+        },
+        0x07 => { // one-shot query: [u16 req_id][u16 name][u32 args_json] -> 0x87
+            const req_id = r.readStr16() catch return;
+            const name = r.readStr16() catch return;
+            const args_raw = r.readStr32() catch return;
+            const args_json = if (args_raw.len > 0) args_raw else "{}";
+
+            var auth_copy = engine.cloneClientAuth(a, client_id);
+            const res = engine.executeQuery(a, name, args_json, if (auth_copy) |*ac| ac else null) catch return;
+            sendWsBinaryResult(a, sender, 0x87, req_id, res, null);
+        },
+        else => {
+            const msg = "unknown binary opcode";
+            var err_buf: [5 + msg.len]u8 = undefined;
+            err_buf[0] = 0x8F;
+            std.mem.writeInt(u32, err_buf[1..5], msg.len, .big);
+            @memcpy(err_buf[5..], msg);
+            sender.sendBinary(&err_buf) catch {};
+        },
     }
 }
 
@@ -1034,6 +1213,34 @@ fn handleWsText(
         var out: std.Io.Writer.Allocating = .init(a);
         const w = &out.writer;
         w.writeAll("{\"type\":\"action_result\",\"req_id\":") catch return;
+        storage_mod.writeJsonString(w, req_id) catch return;
+        switch (res) {
+            .ok => |val| {
+                w.writeAll(",\"ok\":true,\"value\":") catch return;
+                w.writeAll(val) catch return;
+                w.writeByte('}') catch return;
+            },
+            .err => |msg| {
+                w.writeAll(",\"ok\":false,\"error\":") catch return;
+                storage_mod.writeJsonString(w, msg) catch return;
+                w.writeByte('}') catch return;
+            },
+        }
+        sender.sendText(out.written()) catch {};
+    } else if (std.mem.eql(u8, msg_type, "query")) {
+        const req_id = jsonStringField(parsed.object, "req_id") orelse return;
+        const name = jsonStringField(parsed.object, "name") orelse return;
+        const args_json = if (parsed.object.get("args")) |av|
+            storage_mod.stringifyJsonValue(a, av) catch "{}"
+        else
+            "{}";
+
+        var auth_copy = engine.cloneClientAuth(a, client_id);
+        const res = engine.executeQuery(a, name, args_json, if (auth_copy) |*ac| ac else null) catch return;
+
+        var out: std.Io.Writer.Allocating = .init(a);
+        const w = &out.writer;
+        w.writeAll("{\"type\":\"query_result\",\"req_id\":") catch return;
         storage_mod.writeJsonString(w, req_id) catch return;
         switch (res) {
             .ok => |val| {
