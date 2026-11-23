@@ -12,7 +12,11 @@ Building a modern web app usually means wiring together a REST/GraphQL server, a
 
 **Concave replaces that whole pile with one [Roc](https://www.roc-lang.org/) backend, a single ~2 MB native binary, a 5.8 KB gzipped browser runtime, and literally zero external dependencies.**
 
-Write ordinary, type-safe Roc functions. Concave keeps your database and every connected browser tab in sync automatically over WebSockets, serves bundled/minified/pre-gzipped assets over HTTP/1.1 Keep-Alive and HTTP/2 (`h2c`), runs on your laptop with zero setup, and scales out on Postgres when you're ready to launch.
+Write ordinary, type-safe Roc functions. Concave keeps your database and every connected browser tab in sync automatically over binary WebSockets, validates document schemas at runtime, serves bundled/minified/pre-gzipped assets over HTTP/1.1 Keep-Alive and HTTP/2 (`h2c`), runs on your laptop with zero setup, and scales out on Postgres when you're ready to launch.
+
+<p align="center">
+  <img src="docs/assets/hero.svg" alt="Concave live multi-tab reactivity and single-binary architecture" width="100%" />
+</p>
 
 ---
 
@@ -83,6 +87,16 @@ When a message is sent from another tab, a webhook, or a cron job:
 
 ## See it live in 30 seconds
 
+### Option A — Install prebuilt CLI (macOS arm64 / Linux x86_64 & arm64)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/GW-Jack/concave/main/scripts/install.sh | sh
+```
+
+*(Requires [Roc `0.1.0_RC1`](https://github.com/roc-lang/roc/releases/tag/0.1.0_RC1) to compile your app; no Zig toolchain needed when using a release binary.)*
+
+### Option B — Clone & run the live chat demo from source
+
 Requires [Roc `0.1.0_RC1`](https://github.com/roc-lang/roc/releases/tag/0.1.0_RC1) and [Zig `0.17.1`](https://ziglang.org/download/).
 
 ```sh
@@ -96,11 +110,13 @@ Open **http://127.0.0.1:3210** in two browser tabs side by side:
 2. Type `/preview https://example.com` to trigger an external HTTP Action that fetches metadata and writes back into the room.
 3. Visit **http://127.0.0.1:3210/_dashboard** to inspect every table, run any query or mutation, open live subscriptions, and watch scheduled jobs in real time.
 
-### Spin up your own app
+### Spin up your own app (3 starter templates)
+
+Choose `--template=minimal`, `--template=chat`, or `--template=kanban`:
 
 ```sh
 make host
-./zig-out/bin/concave init my-app \
+./zig-out/bin/concave init my-app --template=kanban \
   --platform ../../platform/main.roc \
   --sdk ../../packages/concave-sdk/main.roc
 ./zig-out/bin/concave dev \
@@ -110,6 +126,19 @@ make host
 ```
 
 Save any `.roc` file and Concave rebuilds, regenerates your typed client API, and reloads automatically.
+
+### Deploy in 1 minute (Fly.io or Cloud Run)
+
+- **Fly.io:** copy [fly.toml](fly.toml) and run `fly launch --no-deploy && fly deploy` (uses a persistent volume for `WalStore` out of the box, or set `DATABASE_URL` for Postgres).
+- **Google Cloud Run / Docker:** build the ~7.6 MB static-PIE image with [Dockerfile](Dockerfile) — see [Deploying to Production](docs/DEPLOY_CLOUD_RUN.md).
+
+---
+
+## Performance
+
+<p align="center">
+  <img src="docs/assets/benchmarks.svg" alt="Concave measured throughput benchmarks" width="100%" />
+</p>
 
 ---
 

@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: macos-arm64
+            zig_target: aarch64-macos
+            roc_target_dir: arm64mac
+          - os: ubuntu-24.04
+            target: linux-x86_64
+            zig_target: x86_64-linux-musl
+            roc_target_dir: x64musl
+          - os: ubuntu-24.04
+            target: linux-aarch64
+            zig_target: aarch64-linux-musl
+            roc_target_dir: arm64musl
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Zig 0.17.1
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+
+      - name: Build concave CLI and libhost.a (${{ matrix.target }})
+        run: |
+          zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.zig_target }}
+          TAG="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          fi
+          STAGE="dist/concave-${TAG}-${{ matrix.target }}"
+          mkdir -p "${STAGE}/bin" "${STAGE}/platform/targets/${{ matrix.roc_target_dir }}" "${STAGE}/packages"
+          cp zig-out/bin/concave "${STAGE}/bin/concave"
+          cp zig-out/lib/libhost.a "${STAGE}/platform/targets/${{ matrix.roc_target_dir }}/libhost.a"
+          cp platform/main.roc platform/Host.roc "${STAGE}/platform/"
+          cp -r packages/concave-sdk packages/presence packages/rate-limiter packages/analytics packages/monitor "${STAGE}/packages/"
+          cp LICENSE README.md "${STAGE}/"
+          mkdir -p artifacts
+          tar -C dist -czf "artifacts/concave-${TAG}-${{ matrix.target }}.tar.gz" "concave-${TAG}-${{ matrix.target }}"
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: artifacts/*.tar.gz
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        run: |
+          cd release-files
+          sha256sum *.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          fi
+          gh release create "${TAG}" release-files/* \
+            --title "Concave ${TAG}" \
+            --generate-notes

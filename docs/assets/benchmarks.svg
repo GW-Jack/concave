@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 300" width="960" height="300" role="img" aria-label="Concave measured throughput benchmarks: 116.6k light queries/s, 70.7k heavy 100-doc queries/s, 46.1k durable WAL fsync writes/s, 8.1k Postgres 16 queries/s">
+  <defs>
+    <linearGradient id="bbg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1020"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="bar1" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#0284c7"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
+    </linearGradient>
+    <linearGradient id="bar2" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#a5b4fc"/>
+    </linearGradient>
+    <linearGradient id="bar3" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#059669"/>
+      <stop offset="100%" stop-color="#34d399"/>
+    </linearGradient>
+    <linearGradient id="bar4" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#d97706"/>
+      <stop offset="100%" stop-color="#fbbf24"/>
+    </linearGradient>
+    <linearGradient id="bar5" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#475569"/>
+      <stop offset="100%" stop-color="#94a3b8"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="960" height="300" rx="16" fill="url(#bbg)" stroke="#1e293b" stroke-width="1.5"/>
+
+  <g font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">
+    <text x="32" y="38" fill="#f8fafc" font-size="18" font-weight="700">Measured Throughput (Compiled Roc + Zig, Local Apple Silicon)</text>
+    <text x="32" y="58" fill="#94a3b8" font-size="12">Multi-core Roc execution · CBIN v1 Binary WebSockets · WAL Group Commit · Zero external dependencies</text>
+
+    <!-- Row 1: Light Query -->
+    <text x="32" y="96" fill="#e2e8f0" font-size="13" font-weight="600">Indexed Query (rooms.list)</text>
+    <text x="32" y="111" fill="#64748b" font-size="11">Binary WS · p50 48 µs</text>
+    <rect x="278" y="84" width="520" height="24" rx="6" fill="url(#bar1)"/>
+    <text x="808" y="101" fill="#38bdf8" font-size="13" font-weight="700">116,573 req/s</text>
+
+    <!-- Row 2: Heavy 100-doc Query -->
+    <text x="32" y="140" fill="#e2e8f0" font-size="13" font-weight="600">100-Doc List Query (18.8 KB JSON)</text>
+    <text x="32" y="155" fill="#64748b" font-size="11">Zero-parse raw query · 1.30 GB/s</text>
+    <rect x="278" y="128" width="315" height="24" rx="6" fill="url(#bar2)"/>
+    <text x="604" y="145" fill="#a5b4fc" font-size="13" font-weight="700">70,748 req/s (1.30 GB/s)</text>
+
+    <!-- Row 3: Durable 1-table WAL Group Commit -->
+    <text x="32" y="184" fill="#e2e8f0" font-size="13" font-weight="600">Durable WAL fsync ACID Writes</text>
+    <text x="32" y="199" fill="#64748b" font-size="11">24 clients · Group Commit + SSD fsync</text>
+    <rect x="278" y="172" width="206" height="24" rx="6" fill="url(#bar3)"/>
+    <text x="494" y="189" fill="#34d399" font-size="13" font-weight="700">46,130 writes/s</text>
+
+    <!-- Row 4: 4-Component 6-Op ACID Tx -->
+    <text x="32" y="228" fill="#e2e8f0" font-size="13" font-weight="600">4-Component 6-Op ACID Tx</text>
+    <text x="32" y="243" fill="#64748b" font-size="11">Room + RateLimit + Msg + Analytics + Monitor</text>
+    <rect x="278" y="216" width="52" height="24" rx="6" fill="url(#bar4)"/>
+    <text x="340" y="233" fill="#fbbf24" font-size="13" font-weight="700">10,347 tx/s (~62k ops/s)</text>
+
+    <!-- Row 5: Live Postgres 16 PgStore -->
+    <text x="32" y="272" fill="#e2e8f0" font-size="13" font-weight="600">PostgreSQL 16 PgStore Queries</text>
+    <text x="32" y="287" fill="#64748b" font-size="11">Docker PG 16 · pool=16 · p50 0.49 ms</text>
+    <rect x="278" y="260" width="40" height="24" rx="6" fill="url(#bar5)"/>
+    <text x="328" y="277" fill="#cbd5e1" font-size="13" font-weight="700">8,070 req/s</text>
+  </g>
+</svg>
