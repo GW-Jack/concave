@@ -48,7 +48,10 @@ pub fn main(init: std.process.Init) !void {
         buildRocApp(gpa, io, entry, bin, opt) catch std.process.exit(1);
         var manifest = introspectBinary(gpa, io, bin) catch std.process.exit(1);
         defer manifest.deinit();
-        try codegen_mod.writeGeneratedFiles(gpa, io, &manifest, out_dir);
+        codegen_mod.writeGeneratedFiles(gpa, io, &manifest, out_dir) catch |err| {
+            std.debug.print("Error writing generated files to `{s}`: {s}\n", .{ out_dir, @errorName(err) });
+            std.process.exit(1);
+        };
         std.debug.print(
             "Generated {s}/dataModel.d.ts, {s}/api.d.ts, and {s}/api.js ({d} tables, {d} components, {d} functions)\n",
             .{ out_dir, out_dir, out_dir, manifest.tables.len, manifest.components.len, manifest.functions.len },
@@ -181,7 +184,10 @@ pub fn main(init: std.process.Init) !void {
             printInitUsage();
             std.process.exit(2);
         };
-        try scaffoldApp(gpa, io, target_dir, template, platform, sdk);
+        scaffoldApp(gpa, io, target_dir, template, platform, sdk) catch |err| {
+            std.debug.print("Error initializing Concave app in `{s}`: {s}\n", .{ target_dir, @errorName(err) });
+            std.process.exit(1);
+        };
         std.debug.print("Initialized Concave app ({s} template) in {s}\n", .{ template, target_dir });
     } else {
         std.debug.print("Unknown command: {s}\n\n", .{cmd});

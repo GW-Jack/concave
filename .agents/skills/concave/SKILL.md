@@ -158,22 +158,72 @@ add_todo! = |ctx, args| {
 }
 ```
 
-### Capabilities (`Ctx`)
-- **`Ctx.QueryCtx`**: Read-only, reactive over WebSockets. Capabilities: `ctx.db : DbReader`, `ctx.storage`, `ctx.auth!`, `ctx.now_ms!`.
-- **`Ctx.MutationCtx`**: ACID transaction with OCC retries and read-your-own-writes. Capabilities: `ctx.db : DbWriter`, `ctx.scheduler`, `ctx.storage`, `ctx.auth!`, `ctx.now_ms!`.
-- **`Ctx.ActionCtx`**: External HTTP I/O (`ctx.http_fetch!`), re-entrant `ctx.run_query!`, `ctx.run_mutation!`.
-- Helpers: `Ctx.require_auth!(ctx.auth!)`, `Ctx.as_reader(ctx.db)`, `Ctx.as_query_ctx(ctx)`.
-- All `Db` read functions (`Db.get!`, `Db.collect!`, `Db.collect_raw!`, `Db.first!`, `Db.paginate!`, `Db.search!`) accept `Ctx.DbReadable(r)`, so they work directly with `ctx.db` in **both** `QueryCtx` and `MutationCtx` (while write ops remain statically restricted to `MutationCtx`).
+### Capabilities & Helpers (`Ctx`)
+> **Roc `0.1.0_RC1` syntax notes:**
+> - Dot-call syntax (`ctx.http_fetch!(...)`) is UFCS method dispatch in Roc `0.1.0_RC1`, not a record-field function call. Always use the `Ctx.*` wrapper functions below (or bind a record field to a local `f! = ctx.foo!` before calling it).
+> - Single-field records require an explicit colon (`{ id: id }`) — `{ id }` without a colon is parsed as a block returning `id`!
+> - Built-in `Json.to_str`, `Json.to_str_try`, and `Json.parse` are available globally in Roc `0.1.0_RC1`.
+
+- **`Ctx.QueryCtx`**: Read-only, reactive over WebSockets (`db : DbReader`, `storage : StorageReader`, `auth!`, `now_ms!`).
+- **`Ctx.MutationCtx`**: ACID transaction with OCC retries and read-your-own-writes (`db : DbWriter`, `scheduler`, `storage : StorageWriter`, `auth!`, `now_ms!`).
+- **`Ctx.ActionCtx`**: External HTTP/HTTPS I/O (`http_fetch!`, `run_query!`, `run_mutation!`, `storage : StorageWriter`, `auth!`, `now_ms!`).
+
+#### Auth & Time
+- `Ctx.require_auth!(ctx.auth!)` -> `Try(Ctx.AuthIdentity, Str)` where `AuthIdentity : { subject : Str, issuer : Str, name : Str }`.
+  - Dev token format: `"dev:<subject>:<name>"` (pass via `new ConcaveClient(url, { authToken })`, `client.setAuth(...)`, or HTTP header `Authorization: Bearer dev:alice:Alice`).
+- `Ctx.now_ms!(ctx)` -> `I64` (Unix epoch ms; works in all 3 contexts).
+- `Ctx.as_reader(ctx.db)`, `Ctx.as_query_ctx(ctx)` (for passing a `MutationCtx` into helpers taking `QueryCtx`).
+
+#### Transactional Scheduler (inside `MutationCtx`)
+Jobs commit atomically with the mutation (rolled back on `Err`):
+- `Ctx.run_after!(ctx, delay_ms, "fn.name", args_record)` -> `Try(Str, Str)` (returns `job_id`; automatically JSON-encodes `args_record`). Use `Ctx.run_after_raw!(ctx, delay_ms, fn_name, args_json)` for pre-encoded JSON.
+- `Ctx.run_at!(ctx, run_at_ms, "fn.name", args_record)` / `Ctx.run_at_raw!(...)` -> `Try(Str, Str)`.
+- `Ctx.cancel_job!(ctx, job_id)` -> `Try({}, Str)`.
+
+#### Blob / File Storage (`Ctx` + HTTP Upload Protocol)
+- `Ctx.generate_upload_url!(ctx)` -> `Try(Str, Str)` (`MutationCtx` or `ActionCtx`).
+- `Ctx.get_storage_url!(ctx, storage_id)` -> `Try(Str, Str)` (any context).
+- `Ctx.delete_storage!(ctx, storage_id)` -> `Try({}, Str)` (`MutationCtx` or `ActionCtx`).
+- **Browser upload protocol:** `POST` or `PUT` raw file bytes to the signed URL returned by `generate_upload_url!` (with `Content-Type` header); the server responds `200 {"storage_id": "<id>"}`. `GET` on the URL returned by `get_storage_url!` serves the bytes (and `404` after deletion).
+
+#### External HTTP Actions & Custom HTTP Webhooks
+- `Ctx.http_fetch!(ctx, { method: "GET", url, body: "" })` -> `Try(Ctx.HttpResponse, Str)` where `HttpRequest : { method : Str, url : Str, body : Str }` and `HttpResponse : { status : U64, body : Str }` (use `resp.status.to_str()` for string conversion).
+- `Ctx.run_query!(ctx, "fn.name", args_record)` / `Ctx.run_mutation!(ctx, "fn.name", args_record)` -> `Try(Str, Str)` (auto-encodes `args_record` as JSON and returns the **JSON-encoded** result string; use `Ctx.run_query_raw!` / `Ctx.run_mutation_raw!` when forwarding raw JSON strings such as `req.body`).
+- `App.http_route(method, path, handler!)` handler signature:
+  ```roc
+  webhook! : Ctx.ActionCtx, App.HttpRouteRequest => Try(App.HttpRouteResponse, Str)
+  # HttpRouteRequest  : { method : Str, path : Str, query : Str, body : Str, content_type : Str }
+  # HttpRouteResponse : { status : U64, content_type : Str, body : Str }
+  webhook! = |ctx, req| {
+      id_json = Ctx.run_mutation_raw!(ctx, "todos.add", req.body)?
+      Ok({ status: 201, content_type: "application/json", body: "{\"ok\":true,\"id\":${id_json}}" })
+  }
+  ```
+
+### Multi-File Roc `0.1.0_RC1` Modules
+Do **not** use deprecated `module [...]` headers or top-level type aliases in helper files. Define a headerless **nominal type module** matching the filename (e.g. `backend/Bookmark.roc`):
+```roc
+import sdk.Schema
+import sdk.Table
+
+Bookmark :: [Bookmark].{
+    Doc : { id : Str, created_at : I64, url : Str, title : Str }
+    table : Table(Doc)
+    table = Table.define("bookmarks", Schema.record([Schema.field("url", Schema.str), Schema.field("title", Schema.str)]))
+}
+```
+Import it in `backend/main.roc` with `import Bookmark` and reference `Bookmark.Doc`, `Bookmark.table`.
 
 ### Database Operations & Edge-Case Semantics (`Db` & `Key`)
+- All `Db` read functions (`Db.get!`, `Db.collect!`, `Db.collect_raw!`, `Db.first!`, `Db.paginate!`, `Db.search!`) accept `Ctx.DbReadable(r)` and work directly on `ctx.db` in **both** `QueryCtx` and `MutationCtx`.
 - `Db.get!(ctx.db, table, id)` -> `Try([Found(doc), NotFound], Str)`.
 - `Db.insert!(ctx.db, table, body)` -> `Try(Str, Str)` (returns generated document ID).
 - `Db.patch!(ctx.db, table, id, fields)` -> `Try({}, Str)`; returns `Err("NotFound")` if `id` does not exist.
 - `Db.replace!(ctx.db, table, id, body)` -> `Try({}, Str)`; returns `Err("NotFound")` if `id` does not exist.
 - `Db.delete!(ctx.db, table, id)` -> `Try({}, Str)`; idempotent (`Ok({})` even if `id` does not exist).
-- `Db.search!(ctx.db, table, "field", query_text, limit)` -> reactive case-insensitive multi-token search; empty `query_text` (`""`) returns up to `limit` docs descending by `created_at`.
-- `Db.paginate!(ctx.db, cursor, page_size)` -> `Try({ page : List(Doc), next_cursor : Str, is_done : Bool }, Str)` (pass `""` for first page).
-- Query combinators: `Db.query(table)`, `Db.from_index(idx)`, `Db.eq(keys)`, `Db.gte(keys)`, `Db.gt(keys)`, `Db.lte(keys)`, `Db.lt(keys)`, `Db.asc()`, `Db.desc()`, `Db.take(n)`, `Db.collect!(db)`, `Db.collect_raw!(db)`, `Db.first!(db)`.
+- `Db.search!(ctx.db, table, "field", query_text, limit_u64)` -> reactive case-insensitive multi-token search; empty `query_text` (`""`) returns up to `limit_u64` docs descending by `created_at`.
+- `Db.paginate!(ctx.db, cursor, page_size_u64)` -> `Try({ page : List(Doc), next_cursor : Str, is_done : Bool }, Str)` (note: `page_size` is **`U64`**, not `I64`; pass `""` for first page).
+- Query combinators: `Db.query(table)`, `Db.from_index(idx)`, `Db.eq(keys)`, `Db.gte(keys)`, `Db.gt(keys)`, `Db.lte(keys)`, `Db.lt(keys)`, `Db.asc()`, `Db.desc()`, `Db.take(n_u64)`, `Db.collect!(db)`, `Db.collect_raw!(db)`, `Db.first!(db)`.
 - Key constructors: `Key.null`, `Key.bool(b)`, `Key.int(i)`, `Key.float(f)`, `Key.str(s)`, `Key.id(id)`.
 
 ### Registering the App
@@ -312,6 +362,7 @@ mount(document.getElementById("app"), () =>
 
 ### Wire Endpoints (for Testing / Custom Clients)
 - WebSocket sync & RPC: `ws(s)://<host>/ws` (binary default via `?proto=bin`, or JSON text frames). Live reload pushes `{"type":"reload","reason":"css" | "static"}`.
-- HTTP RPC: `POST /api/query/<name>`, `POST /api/mutation/<name>`, `POST /api/action/<name>`.
+- HTTP RPC: `POST /api/query/<name>`, `POST /api/mutation/<name>`, `POST /api/action/<name>` with JSON body and optional `Authorization: Bearer <token>` header; responds `{"ok":true,"value":...}` or `{"ok":false,"error":"..."}`.
+- Blob storage: `POST`/`PUT` bytes to signed `/_storage/upload/<token>` -> `{"storage_id":"<id>"}`; `GET /_storage/<id>` downloads bytes.
 - Health / readiness: `GET /health`, `GET /ready`.
 - Embedded SDK assets: `/_concave/index.js`, `/_concave/analytics.js`, `/_concave/monitor.js`.

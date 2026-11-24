@@ -1147,15 +1147,20 @@ fn runServer(
                     while (!g_shutdown.load(.acquire) and !ctx.engine.stop_tailer.load(.acquire)) {
                         ctx.io.sleep(.fromMilliseconds(@intCast(ctx.poll_ms)), .awake) catch break;
                         if (g_shutdown.load(.acquire) or ctx.engine.stop_tailer.load(.acquire)) break;
-                        const cur = computeStaticFingerprints(ctx.allocator, ctx.io, ctx.dir);
-                        if (cur.other != last.other) {
-                            last = cur;
-                            std.debug.print("[concave dev] static file changed — reloading connected clients\n", .{});
-                            ctx.engine.broadcastReload("static");
-                        } else if (cur.css != last.css) {
-                            last = cur;
-                            std.debug.print("[concave dev] stylesheet changed — hot-reloading CSS\n", .{});
-                            ctx.engine.broadcastReload("css");
+                        var cur = computeStaticFingerprints(ctx.allocator, ctx.io, ctx.dir);
+                        if (cur.other != last.other or cur.css != last.css) {
+                            // Brief debounce to coalesce truncate + write pairs into a single reload.
+                            ctx.io.sleep(.fromMilliseconds(40), .awake) catch break;
+                            cur = computeStaticFingerprints(ctx.allocator, ctx.io, ctx.dir);
+                            if (cur.other != last.other) {
+                                last = cur;
+                                std.debug.print("[concave dev] static file changed — reloading connected clients\n", .{});
+                                ctx.engine.broadcastReload("static");
+                            } else if (cur.css != last.css) {
+                                last = cur;
+                                std.debug.print("[concave dev] stylesheet changed — hot-reloading CSS\n", .{});
+                                ctx.engine.broadcastReload("css");
+                            }
                         }
                     }
                 }

@@ -41,7 +41,7 @@ send_message! = |ctx, args| {
     user = Ctx.require_auth!(ctx.auth!)?
     _ = RateLimiter.enforce!(limiter, ctx, user.subject)?
     id = Db.insert!(ctx.db, messages_table, { room: args.room, body: args.body })?
-    _ = ctx.scheduler.run_after!(5000, "notifications.digest", "{\"id\":${Json.to_str(id)}}")?
+    _ = Ctx.run_after!(ctx, 5000, "notifications.digest", { id: id })?
     Ok(id)
 }
 ```

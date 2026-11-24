@@ -158,4 +158,125 @@ Ctx := [Ctx].{
             Ok(id) => Ok(id)
             Err(Unauthenticated) => Err("Unauthenticated")
         }
+
+    ## Read current Unix epoch milliseconds from any context (`QueryCtx`, `MutationCtx`, or `ActionCtx`).
+    now_ms! : { now_ms! : () => I64, ..r } => I64
+    now_ms! = |ctx| {
+        f! = ctx.now_ms!
+        f!()
+    }
+
+    ## Schedule a mutation or action after `delay_ms` with a typed `Json.Encodable` args value
+    ## (committed atomically with the enclosing mutation).
+    run_after! : { scheduler : Scheduler, ..r }, I64, Str, args => Try(Str, Str)
+        where [args.Json.Encodable(enc_err)]
+    run_after! = |ctx, delay_ms, fn_name, args| {
+        encoded = match Json.to_str_try(args) {
+            Ok(s) => s
+            Err(_) => return Err("failed to encode scheduled job args for `${fn_name}`")
+        }
+        f! = ctx.scheduler.run_after!
+        f!(delay_ms, fn_name, encoded)
+    }
+
+    ## Schedule a mutation or action after `delay_ms` with a pre-encoded JSON args string.
+    run_after_raw! : { scheduler : Scheduler, ..r }, I64, Str, Str => Try(Str, Str)
+    run_after_raw! = |ctx, delay_ms, fn_name, args_json| {
+        f! = ctx.scheduler.run_after!
+        f!(delay_ms, fn_name, args_json)
+    }
+
+    ## Schedule a mutation or action at `run_at_ms` (Unix epoch ms) with a typed `Json.Encodable` args value.
+    run_at! : { scheduler : Scheduler, ..r }, I64, Str, args => Try(Str, Str)
+        where [args.Json.Encodable(enc_err)]
+    run_at! = |ctx, run_at_ms, fn_name, args| {
+        encoded = match Json.to_str_try(args) {
+            Ok(s) => s
+            Err(_) => return Err("failed to encode scheduled job args for `${fn_name}`")
+        }
+        f! = ctx.scheduler.run_at!
+        f!(run_at_ms, fn_name, encoded)
+    }
+
+    ## Schedule a mutation or action at `run_at_ms` with a pre-encoded JSON args string.
+    run_at_raw! : { scheduler : Scheduler, ..r }, I64, Str, Str => Try(Str, Str)
+    run_at_raw! = |ctx, run_at_ms, fn_name, args_json| {
+        f! = ctx.scheduler.run_at!
+        f!(run_at_ms, fn_name, args_json)
+    }
+
+    ## Cancel a pending scheduled job by ID inside a mutation.
+    cancel_job! : { scheduler : Scheduler, ..r }, Str => Try({}, Str)
+    cancel_job! = |ctx, job_id| {
+        f! = ctx.scheduler.cancel!
+        f!(job_id)
+    }
+
+    ## Generate a signed blob upload URL inside a `MutationCtx` or `ActionCtx`.
+    generate_upload_url! : { storage : StorageWriter, ..r } => Try(Str, Str)
+    generate_upload_url! = |ctx| {
+        f! = ctx.storage.generate_upload_url!
+        f!()
+    }
+
+    ## Resolve a blob download URL inside any context (`QueryCtx`, `MutationCtx`, or `ActionCtx`).
+    get_storage_url! : { storage : { get_url! : Str => Try(Str, Str), ..s }, ..r }, Str => Try(Str, Str)
+    get_storage_url! = |ctx, storage_id| {
+        f! = ctx.storage.get_url!
+        f!(storage_id)
+    }
+
+    ## Delete a stored blob by ID inside a `MutationCtx` or `ActionCtx`.
+    delete_storage! : { storage : StorageWriter, ..r }, Str => Try({}, Str)
+    delete_storage! = |ctx, storage_id| {
+        f! = ctx.storage.delete!
+        f!(storage_id)
+    }
+
+    ## Perform an outbound HTTP/HTTPS request inside an `ActionCtx`.
+    http_fetch! : ActionCtx, HttpRequest => Try(HttpResponse, Str)
+    http_fetch! = |ctx, req| {
+        f! = ctx.http_fetch!
+        f!(req)
+    }
+
+    ## Invoke a registered query re-entrantly from an `ActionCtx` with typed `Json.Encodable` args.
+    ## Returns the JSON-encoded query result string.
+    run_query! : ActionCtx, Str, args => Try(Str, Str)
+        where [args.Json.Encodable(enc_err)]
+    run_query! = |ctx, name, args| {
+        encoded = match Json.to_str_try(args) {
+            Ok(s) => s
+            Err(_) => return Err("failed to encode query args for `${name}`")
+        }
+        f! = ctx.run_query!
+        f!(name, encoded)
+    }
+
+    ## Invoke a registered query re-entrantly from an `ActionCtx` with a pre-encoded JSON args string.
+    run_query_raw! : ActionCtx, Str, Str => Try(Str, Str)
+    run_query_raw! = |ctx, name, args_json| {
+        f! = ctx.run_query!
+        f!(name, args_json)
+    }
+
+    ## Invoke a registered mutation re-entrantly from an `ActionCtx` with typed `Json.Encodable` args.
+    ## Returns the JSON-encoded mutation result string.
+    run_mutation! : ActionCtx, Str, args => Try(Str, Str)
+        where [args.Json.Encodable(enc_err)]
+    run_mutation! = |ctx, name, args| {
+        encoded = match Json.to_str_try(args) {
+            Ok(s) => s
+            Err(_) => return Err("failed to encode mutation args for `${name}`")
+        }
+        f! = ctx.run_mutation!
+        f!(name, encoded)
+    }
+
+    ## Invoke a registered mutation re-entrantly from an `ActionCtx` with a pre-encoded JSON args string.
+    run_mutation_raw! : ActionCtx, Str, Str => Try(Str, Str)
+    run_mutation_raw! = |ctx, name, args_json| {
+        f! = ctx.run_mutation!
+        f!(name, args_json)
+    }
 }

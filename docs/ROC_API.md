@@ -122,9 +122,9 @@ matches = Db.search!(ctx.db, notes_table, "body", args.q, 25)?
 Inside any `MutationCtx`:
 ```roc
 # Scheduled atomically with the mutation (dropped automatically if the mutation returns `Err`):
-job_id = ctx.scheduler.run_after!(5000, "emails.send_welcome", "{\"user_id\":${Json.to_str(id)}}")?
-job_id2 = ctx.scheduler.run_at!(target_epoch_ms, "billing.charge", "{}")?
-_ = ctx.scheduler.cancel!(job_id)?
+job_id = Ctx.run_after!(ctx, 5000, "emails.send_welcome", { user_id: id })?
+job_id2 = Ctx.run_at!(ctx, target_epoch_ms, "billing.charge", {})?
+_ = Ctx.cancel_job!(ctx, job_id)?
 ```
 
 Register recurring Crons on `App`:
@@ -136,14 +136,14 @@ Scheduled jobs and crons are stored in `_system._scheduled_jobs` and claimed ato
 
 ---
 
-## 5. Blob / File Storage (`ctx.storage`)
+## 5. Blob / File Storage (`Ctx` storage helpers)
 
 - **Mutations & Actions** (`StorageWriter`):
-  - `ctx.storage.generate_upload_url!()` -> returns an HMAC-signed local upload URL (`/_storage/upload/<token>`) or a zero-dep AWS SigV4 presigned `PUT` URL when `CONCAVE_S3_*` is configured.
-  - `ctx.storage.get_url!(storage_id)` -> returns a download URL (`/_storage/<id>` or SigV4 presigned `GET` URL).
-  - `ctx.storage.delete!(storage_id)` -> deletes the blob.
+  - `Ctx.generate_upload_url!(ctx)` -> returns an HMAC-signed local upload URL (`/_storage/upload/<token>`) or a zero-dep AWS SigV4 presigned `PUT` URL when `CONCAVE_S3_*` is configured. Clients `POST`/`PUT` bytes to the URL and receive `200 {"storage_id":"<id>"}`.
+  - `Ctx.get_storage_url!(ctx, storage_id)` -> returns a download URL (`/_storage/<id>` or SigV4 presigned `GET` URL).
+  - `Ctx.delete_storage!(ctx, storage_id)` -> deletes the blob.
 - **Queries** (`StorageReader`):
-  - `ctx.storage.get_url!(storage_id)` -> read-only download URL lookup.
+  - `Ctx.get_storage_url!(ctx, storage_id)` -> read-only download URL lookup.
 
 ---
 
@@ -154,7 +154,7 @@ Route handlers receive `Ctx.ActionCtx` and `App.HttpRouteRequest` (`{ method, pa
 ```roc
 stripe_webhook! : Ctx.ActionCtx, App.HttpRouteRequest => Try(App.HttpRouteResponse, Str)
 stripe_webhook! = |ctx, req| {
-    _ = ctx.run_mutation!("billing.handle_event", req.body)?
+    _ = Ctx.run_mutation_raw!(ctx, "billing.handle_event", req.body)?
     Ok({ status: 200, content_type: "application/json", body: "{\"ok\":true}" })
 }
 

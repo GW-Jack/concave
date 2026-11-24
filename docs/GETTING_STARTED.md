@@ -117,9 +117,9 @@ Because `list_todos!` queries `todos_by_list |> Db.eq([Key.str(args.list_id)])`,
 Schedule work atomically inside any mutation — if the mutation returns `Err(...)`, the scheduled job is rolled back with it:
 
 ```roc
-job_id = ctx.scheduler.run_after!(60000, "todos.send_reminder", "{\"todo_id\":${Json.to_str(id)}}")?
+job_id = Ctx.run_after!(ctx, 60000, "todos.send_reminder", { todo_id: id })?
 # Cancel later if needed:
-_ = ctx.scheduler.cancel!(job_id)?
+_ = Ctx.cancel_job!(ctx, job_id)?
 ```
 
 Declare recurring background crons on `App`:
@@ -134,8 +134,8 @@ Handle external webhooks (Stripe, GitHub, Slack, etc.) directly in Roc with full
 ```roc
 webhook_handler! : Ctx.ActionCtx, App.HttpRouteRequest => Try(App.HttpRouteResponse, Str)
 webhook_handler! = |ctx, req| {
-    id = ctx.run_mutation!("todos.add", req.body)?
-    Ok({ status: 201, content_type: "application/json", body: "{\"id\":${id}}" })
+    id_json = Ctx.run_mutation_raw!(ctx, "todos.add", req.body)?
+    Ok({ status: 201, content_type: "application/json", body: "{\"id\":${id_json}}" })
 }
 
 # On App:
@@ -143,15 +143,15 @@ webhook_handler! = |ctx, req| {
 ```
 
 ### Built-in Blob Storage
-Generate an HMAC-signed upload URL in a mutation or action, `POST`/`PUT` bytes directly from the browser, and retrieve download URLs in queries:
+Generate an HMAC-signed upload URL in a mutation or action, `POST`/`PUT` bytes directly from the browser (`200 {"storage_id":"..."}`), and retrieve download URLs in queries:
 
 ```roc
 # Mutation:
-upload_url = ctx.storage.generate_upload_url!()?
-# Query:
-download_url = ctx.storage.get_url!(doc.attachment_id)?
+upload_url = Ctx.generate_upload_url!(ctx)?
+# Query (or Mutation/Action):
+download_url = Ctx.get_storage_url!(ctx, doc.attachment_id)?
 # Mutation:
-_ = ctx.storage.delete!(doc.attachment_id)?
+_ = Ctx.delete_storage!(ctx, doc.attachment_id)?
 ```
 
 Locally, blobs are stored in `CONCAVE_STORAGE_DIR` (default `.concave/storage`). In production, set `CONCAVE_S3_*` environment variables to automatically issue zero-dep AWS SigV4 presigned URLs for S3, Cloudflare R2, or GCS.
