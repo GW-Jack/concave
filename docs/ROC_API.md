@@ -95,9 +95,9 @@ docs =
 Available query builder combinators:
 - Source: `Db.query(table)` (scans `by_creation_time`) or `Db.from_index(index_ref)`
 - Bounds: `Db.eq(prefix)`, `Db.gte(lower)`, `Db.gt(lower)`, `Db.lte(upper)`, `Db.lt(upper)`
-- Key values: `Key.null`, `Key.bool(b)`, `Key.int(i)`, `Key.float(f)`, `Key.str(s)`, `Key.id(id)`
-- Order & limit: `Db.asc`, `Db.desc`, `Db.take(n)`
-- Execution: `Db.collect!(db)`, `Db.first!(db)`
+- Key values: `Key.null`, `Key.bool(b)`, `Key.int(i)`, `Key.float(f)`, `Key.str(s)` (use `Key.str` for all indexed string and `Schema.id` foreign-key fields), `Key.id(id)` (system `id` tiebreaker)
+- Order & limit: `Db.asc()`, `Db.desc()`, `Db.take(n)`
+- Execution: `Db.collect!(db)`, `Db.collect_raw!(db)`, `Db.first!(db)` (returns `Try([Found(doc), NotFound], Str)` — register nullable endpoints with `App.query_optional` / `App.mutation_optional` so `NotFound` encodes as JSON `null` and `Found(doc)` unwraps to `doc`)
 
 ### Reactive Cursor Pagination (`Db.paginate!`)
 ```roc

@@ -149,6 +149,60 @@ App := {
         }
     }
 
+    ## Register a typed reactive Query returning `Try([Found(out), NotFound], Str)` (e.g. `Db.get!` or `Db.first!`).
+    ## Automatically wraps `inner_returns_schema` in `Schema.optional(...)` and encodes `NotFound` as JSON `null`
+    ## and `Found(out)` as unwrapped `out` JSON so runtime output matches generated TypeScript `T | null`.
+    query_optional :
+        App,
+        Str,
+        Schema,
+        Schema,
+        (Ctx.QueryCtx, args => Try([Found(out), NotFound], Str))
+        -> App
+        where [
+            args.Json.Parseable([InvalidJson(Str)]),
+            out.Json.Encodable(enc_err),
+        ]
+    query_optional = |a, name, args_schema, inner_returns_schema, handler!| {
+        wrapped! : Ctx.QueryCtx, Str => Try(Str, Str)
+        wrapped! = |ctx, raw_args| {
+            parsed : args
+            parsed = match Json.parse(raw_args) {
+                Ok(v) => v
+                Err(InvalidJson(msg)) => return Err("invalid query args for `${name}`: ${msg}")
+            }
+            match handler!(ctx, parsed)? {
+                NotFound => Ok("null")
+                Found(out) =>
+                    match Json.to_str_try(out) {
+                        Ok(s) => Ok(s)
+                        Err(_) => Err("failed to encode query result for `${name}`")
+                    }
+            }
+        }
+        entry : QueryEntry
+        entry = {
+            meta: {
+                name,
+                kind: Query,
+                namespace: "",
+                args_schema,
+                returns_schema: Schema.optional(inner_returns_schema),
+            },
+            run!: Box.box(wrapped!),
+        }
+        {
+            app_name: a.app_name,
+            tables: a.tables,
+            components: a.components,
+            queries: List.append(a.queries, entry),
+            mutations: a.mutations,
+            actions: a.actions,
+            crons: a.crons,
+            http_routes: a.http_routes,
+        }
+    }
+
     ## Register a zero-parse pass-through reactive Query whose handler returns pre-encoded JSON
     ## (e.g. from `Db.collect_raw!`), skipping redundant JSON decode/encode while keeping full schema & codegen.
     query_raw :
@@ -279,6 +333,59 @@ App := {
                 namespace: "",
                 args_schema,
                 returns_schema,
+            },
+            run!: Box.box(wrapped!),
+        }
+        {
+            app_name: a.app_name,
+            tables: a.tables,
+            components: a.components,
+            queries: a.queries,
+            mutations: List.append(a.mutations, entry),
+            actions: a.actions,
+            crons: a.crons,
+            http_routes: a.http_routes,
+        }
+    }
+
+    ## Register a typed ACID transactional Mutation returning `Try([Found(out), NotFound], Str)`,
+    ## encoded as JSON `null` or unwrapped `out` JSON matching `Schema.optional(inner_returns_schema)`.
+    mutation_optional :
+        App,
+        Str,
+        Schema,
+        Schema,
+        (Ctx.MutationCtx, args => Try([Found(out), NotFound], Str))
+        -> App
+        where [
+            args.Json.Parseable([InvalidJson(Str)]),
+            out.Json.Encodable(enc_err),
+        ]
+    mutation_optional = |a, name, args_schema, inner_returns_schema, handler!| {
+        wrapped! : Ctx.MutationCtx, Str => Try(Str, Str)
+        wrapped! = |ctx, raw_args| {
+            parsed : args
+            parsed = match Json.parse(raw_args) {
+                Ok(v) => v
+                Err(InvalidJson(msg)) => return Err("invalid mutation args for `${name}`: ${msg}")
+            }
+            match handler!(ctx, parsed)? {
+                NotFound => Ok("null")
+                Found(out) =>
+                    match Json.to_str_try(out) {
+                        Ok(s) => Ok(s)
+                        Err(_) => Err("failed to encode mutation result for `${name}`")
+                    }
+            }
+        }
+        entry : MutationEntry
+        entry = {
+            meta: {
+                name,
+                kind: Mutation,
+                namespace: "",
+                args_schema,
+                returns_schema: Schema.optional(inner_returns_schema),
             },
             run!: Box.box(wrapped!),
         }

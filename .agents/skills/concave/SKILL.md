@@ -111,7 +111,7 @@ todos_by_list = Table.index_ref(todos_table, "by_list")
 - Document schema helper: `Table.doc_schema(tbl)` (prepends `id` and `created_at`)
 
 ### Complete Query & Mutation Handler Examples
-In Roc `0.1.0_RC1`, effectful functions use `=>` in type signatures, `|ctx, args|` for lambdas, `?` to propagate `Try(ok, Str)` errors, and `match` for tag unions.
+In Roc `0.1.0_RC1`, effectful functions use `=>` in type signatures, `|ctx, args|` for lambdas, `?` to propagate `Try(ok, Str)` errors, `match` for tag unions, and `for item in list { ... }` / `var $count = 0` (no inline `: Type` on `var`) for loops.
 
 ```roc
 # Read-only reactive Query (args = `{}` when taking no arguments)
@@ -122,6 +122,14 @@ list_todos! = |ctx, args|
     |> Db.asc()
     |> Db.take(100)
     |> Db.collect!(ctx.db)
+
+# Nullable / Optional Query (use `App.query_optional` so `NotFound` encodes as JSON `null` and `Found(doc)` unwraps!)
+latest_todo! : Ctx.QueryCtx, { list_id : Str } => Try([Found(TodoDoc), NotFound], Str)
+latest_todo! = |ctx, args|
+    Db.from_index(todos_by_list)
+    |> Db.eq([Key.str(args.list_id)])
+    |> Db.desc()
+    |> Db.first!(ctx.db)
 
 # Zero-parse pass-through Query (faster for simple lists; register with `App.query_raw`)
 list_all_raw! : Ctx.QueryCtx, {} => Try(Str, Str)
@@ -144,17 +152,17 @@ toggle_todo! = |ctx, args| {
     }
 }
 
-add_todo! : Ctx.MutationCtx, { list_id : Str, text : Str } => Try(Str, Str)
-add_todo! = |ctx, args| {
-    trimmed = Str.trim(args.text)
-    if Str.is_empty(trimmed) {
-        return Err("Todo text cannot be empty")
+add_many! : Ctx.MutationCtx, { list_id : Str, items : List(Str) } => Try(I64, Str)
+add_many! = |ctx, args| {
+    var $count = 0
+    for text in args.items {
+        trimmed = Str.trim(text)
+        if !Str.is_empty(trimmed) {
+            _ = Db.insert!(ctx.db, todos_table, { list_id: args.list_id, text: trimmed, done: False })?
+            $count = $count + 1
+        }
     }
-    Db.insert!(ctx.db, todos_table, {
-        list_id: args.list_id,
-        text: trimmed,
-        done: False,
-    })
+    Ok($count)
 }
 ```
 
@@ -217,14 +225,16 @@ Import it in `backend/main.roc` with `import Bookmark` and reference `Bookmark.D
 ### Database Operations & Edge-Case Semantics (`Db` & `Key`)
 - All `Db` read functions (`Db.get!`, `Db.collect!`, `Db.collect_raw!`, `Db.first!`, `Db.paginate!`, `Db.search!`) accept `Ctx.DbReadable(r)` and work directly on `ctx.db` in **both** `QueryCtx` and `MutationCtx`.
 - `Db.get!(ctx.db, table, id)` -> `Try([Found(doc), NotFound], Str)`.
-- `Db.insert!(ctx.db, table, body)` -> `Try(Str, Str)` (returns generated document ID).
+- `Db.first!(ctx.db)` (on a `QueryBuilder`) -> `Try([Found(doc), NotFound], Str)`. When returning a `[Found(doc), NotFound]` result directly to JS, register the endpoint with **`App.query_optional`** / **`App.mutation_optional`** (do NOT pass `[Found(doc), NotFound]` to `App.query(..., Schema.optional(...))` or Roc will serialize `"NotFound"` / `{"Found": ...}`).
+- `Db.insert!(ctx.db, table, body)` -> `Try(Str, Str)` (returns generated document ID; `body` omits system fields `id` and `created_at`).
 - `Db.patch!(ctx.db, table, id, fields)` -> `Try({}, Str)`; returns `Err("NotFound")` if `id` does not exist.
-- `Db.replace!(ctx.db, table, id, body)` -> `Try({}, Str)`; returns `Err("NotFound")` if `id` does not exist.
+- `Db.replace!(ctx.db, table, id, body)` -> `Try({}, Str)`; replaces all user fields (`body` omits `id` and `created_at`; original `created_at` is preserved); returns `Err("NotFound")` if `id` does not exist.
 - `Db.delete!(ctx.db, table, id)` -> `Try({}, Str)`; idempotent (`Ok({})` even if `id` does not exist).
 - `Db.search!(ctx.db, table, "field", query_text, limit_u64)` -> reactive case-insensitive multi-token search; empty `query_text` (`""`) returns up to `limit_u64` docs descending by `created_at`.
 - `Db.paginate!(ctx.db, cursor, page_size_u64)` -> `Try({ page : List(Doc), next_cursor : Str, is_done : Bool }, Str)` (note: `page_size` is **`U64`**, not `I64`; pass `""` for first page).
 - Query combinators: `Db.query(table)`, `Db.from_index(idx)`, `Db.eq(keys)`, `Db.gte(keys)`, `Db.gt(keys)`, `Db.lte(keys)`, `Db.lt(keys)`, `Db.asc()`, `Db.desc()`, `Db.take(n_u64)`, `Db.collect!(db)`, `Db.collect_raw!(db)`, `Db.first!(db)`.
 - Key constructors: `Key.null`, `Key.bool(b)`, `Key.int(i)`, `Key.float(f)`, `Key.str(s)`, `Key.id(id)`.
+  - **Important (`Schema.id` vs `Key.str`):** Foreign-key fields declared with `Schema.id("polls")` produce branded `Id<"polls">` types in TypeScript, and are indexed as JSON strings — always query secondary indexes on those fields with **`Key.str(poll_id)`** (never `Key.id`, which is reserved for the internal system `id` tiebreaker!).
 
 ### Registering the App
 ```roc
@@ -233,10 +243,13 @@ concave_app = ||
     App.new("my-app")
     |> App.table(todos_table)
     |> App.query("todos.list", list_args_schema, Schema.list(Table.doc_schema(todos_table)), list_todos!)
+    |> App.query_optional("todos.latest", list_args_schema, Table.doc_schema(todos_table), latest_todo!)
     |> App.query_raw("todos.listAll", Schema.record([]), Schema.list(Table.doc_schema(todos_table)), list_all_raw!)
-    |> App.mutation("todos.add", add_args_schema, Schema.id("todos"), add_todo!)
+    |> App.mutation("todos.addMany", add_args_schema, Schema.int, add_many!)
     |> App.mutation("todos.toggle", Schema.record([Schema.field("id", Schema.id("todos"))]), Schema.bool, toggle_todo!)
     |> App.action("todos.sync", sync_args_schema, Schema.str, sync_todos!)
+    # App.cron(name : Str, interval_ms : I64, fn_name : Str, args_json : Str)
+    # Persisted in `_system._scheduled_jobs` for multi-replica at-most-once execution.
     |> App.cron("cleanup", 3600000, "todos.prune", "{}")
     |> App.http_route("POST", "/webhooks/todos", webhook!)
 ```
