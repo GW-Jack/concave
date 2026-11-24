@@ -846,15 +846,24 @@ export fn main(argc: c_int, argv: [*]const [*:0]const u8, envp: [*:null]const ?[
         std.fmt.parseInt(u64, s, 10) catch 100
     else
         100;
+    var live_reload: bool = if (getEnvSlice("CONCAVE_LIVE_RELOAD")) |v|
+        std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true")
+    else
+        false;
 
     const count: usize = @intCast(@max(0, argc));
     var i: usize = 1;
     while (i < count) : (i += 1) {
         const arg = std.mem.span(argv[i]);
-        if (std.mem.eql(u8, arg, "--introspect")) {
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            printServerUsage(if (count > 0) std.mem.span(argv[0]) else "concave-server");
+            return 0;
+        } else if (std.mem.eql(u8, arg, "--introspect")) {
             introspect = true;
         } else if (std.mem.eql(u8, arg, "--serve")) {
             // default mode
+        } else if (std.mem.eql(u8, arg, "--live-reload")) {
+            live_reload = true;
         } else if (std.mem.eql(u8, arg, "--host") and i + 1 < count) {
             i += 1;
             host = std.mem.span(argv[i]);
@@ -879,6 +888,10 @@ export fn main(argc: c_int, argv: [*]const [*:0]const u8, envp: [*:null]const ?[
         } else if (std.mem.eql(u8, arg, "--commit-poll-ms") and i + 1 < count) {
             i += 1;
             commit_poll_ms = std.fmt.parseInt(u64, std.mem.span(argv[i]), 10) catch 100;
+        } else {
+            std.debug.print("Unknown or incomplete option: {s}\n\n", .{arg});
+            printServerUsage(if (count > 0) std.mem.span(argv[0]) else "concave-server");
+            return 2;
         }
     }
 
@@ -894,11 +907,31 @@ export fn main(argc: c_int, argv: [*]const [*:0]const u8, envp: [*:null]const ?[
         return 0;
     }
 
-    runServer(host, port, db_path, database_url, deployment_id, static_dir, commit_poll_ms) catch |err| {
+    runServer(host, port, db_path, database_url, deployment_id, static_dir, commit_poll_ms, live_reload) catch |err| {
         std.debug.print("concave host error: {s}\n", .{@errorName(err)});
         return 1;
     };
     return 0;
+}
+
+fn printServerUsage(prog: []const u8) void {
+    std.debug.print(
+        \\Usage: {s} [options]
+        \\
+        \\Options:
+        \\  --serve                  Run HTTP/WS server (default)
+        \\  --introspect             Print AppManifest JSON to stdout and exit
+        \\  --host <addr>            Bind address (default: 127.0.0.1)
+        \\  --port <port>            Listen port (default: 3210)
+        \\  --db <path>              Local WAL database path (default: .concave/dev.wal)
+        \\  --database-url <url>     PostgreSQL connection URL (overrides --db)
+        \\  --deployment-id <id>     Deployment namespace (default: default)
+        \\  --static-dir <dir>       Serve static frontend assets from <dir>
+        \\  --live-reload            Watch --static-dir and push WS reload frames (no-cache)
+        \\  --commit-poll-ms <ms>    Commit tailer poll interval (default: 100)
+        \\  -h, --help               Show this help message
+        \\
+    , .{prog});
 }
 
 var g_shutdown: std.atomic.Value(bool) = .init(false);
@@ -917,6 +950,46 @@ fn installSignalHandlers() void {
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
 }
 
+const StaticFingerprints = struct {
+    css: u64 = 0,
+    other: u64 = 0,
+};
+
+fn isIgnoredStaticPath(path: []const u8) bool {
+    var it = std.mem.splitAny(u8, path, "/\\");
+    while (it.next()) |seg| {
+        if (seg.len == 0) continue;
+        if (seg[0] == '.' or std.mem.eql(u8, seg, "node_modules")) return true;
+    }
+    return false;
+}
+
+fn computeStaticFingerprints(allocator: Allocator, io: std.Io, dir_path: []const u8) StaticFingerprints {
+    var res: StaticFingerprints = .{};
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return res;
+    defer dir.close(io);
+
+    var walker = dir.walk(allocator) catch return res;
+    defer walker.deinit();
+    while (walker.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (isIgnoredStaticPath(entry.path)) continue;
+        const stat = dir.statFile(io, entry.path, .{}) catch continue;
+        var h = std.hash.Wyhash.init(0x9e3779b97f4a7c15);
+        h.update(entry.path);
+        const mtime_ns: i96 = stat.mtime.nanoseconds;
+        h.update(std.mem.asBytes(&mtime_ns));
+        h.update(std.mem.asBytes(&stat.size));
+        const digest = h.final();
+        if (std.mem.endsWith(u8, entry.path, ".css")) {
+            res.css ^= digest;
+        } else {
+            res.other ^= digest;
+        }
+    }
+    return res;
+}
+
 fn runServer(
     host: []const u8,
     port: u16,
@@ -925,6 +998,7 @@ fn runServer(
     deployment_id: []const u8,
     static_dir: ?[]const u8,
     commit_poll_ms: u64,
+    live_reload: bool,
 ) !void {
     installSignalHandlers();
 
@@ -1054,10 +1128,53 @@ fn runServer(
     }});
     watcher.detach();
 
+    var static_watcher_thread: ?std.Thread = null;
+    if (live_reload) {
+        if (static_dir) |sd| {
+            const poll_ms: u64 = if (getEnvSlice("CONCAVE_LIVE_RELOAD_POLL_MS")) |s|
+                std.fmt.parseInt(u64, s, 10) catch 200
+            else
+                200;
+            const StaticWatcher = struct {
+                allocator: Allocator,
+                io: std.Io,
+                engine: *engine_mod.ConcaveEngine,
+                dir: []const u8,
+                poll_ms: u64,
+
+                fn run(ctx: @This()) void {
+                    var last = computeStaticFingerprints(ctx.allocator, ctx.io, ctx.dir);
+                    while (!g_shutdown.load(.acquire) and !ctx.engine.stop_tailer.load(.acquire)) {
+                        ctx.io.sleep(.fromMilliseconds(@intCast(ctx.poll_ms)), .awake) catch break;
+                        if (g_shutdown.load(.acquire) or ctx.engine.stop_tailer.load(.acquire)) break;
+                        const cur = computeStaticFingerprints(ctx.allocator, ctx.io, ctx.dir);
+                        if (cur.other != last.other) {
+                            last = cur;
+                            std.debug.print("[concave dev] static file changed — reloading connected clients\n", .{});
+                            ctx.engine.broadcastReload("static");
+                        } else if (cur.css != last.css) {
+                            last = cur;
+                            std.debug.print("[concave dev] stylesheet changed — hot-reloading CSS\n", .{});
+                            ctx.engine.broadcastReload("css");
+                        }
+                    }
+                }
+            };
+            static_watcher_thread = try std.Thread.spawn(.{}, StaticWatcher.run, .{StaticWatcher{
+                .allocator = g_alloc,
+                .io = io,
+                .engine = engine,
+                .dir = sd,
+                .poll_ms = poll_ms,
+            }});
+        }
+    }
+
     try server_mod.serve(g_alloc, io, engine, .{
         .host = host,
         .port = port,
         .static_dir = static_dir,
+        .live_reload = live_reload,
         .admin_key = getEnvSlice("CONCAVE_ADMIN_KEY"),
         .operator_token = getEnvSlice("CONCAVE_OPERATOR_TOKEN"),
         .shutdown_flag = &g_shutdown,
@@ -1065,6 +1182,7 @@ fn runServer(
 
     // Cleanly stop & join background workers before tearing down storage/engine.
     engine.stop_tailer.store(true, .release);
+    if (static_watcher_thread) |t| t.join();
     if (tailer_thread) |t| t.join();
     if (sched_thread) |t| t.join();
 }

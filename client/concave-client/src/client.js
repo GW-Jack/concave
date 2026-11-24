@@ -132,6 +132,31 @@ function subKey(name, args) {
   return `${name}:${stableStringify(args)}`;
 }
 
+const resolveRef = (r) => r?.ref ?? r;
+
+export function optimisticAppend(ref, args, item) {
+  const r = resolveRef(ref);
+  return {
+    optimisticUpdate(store) {
+      const prev = store.getQuery(r, args) ?? [];
+      store.setQuery(r, args, [...prev, typeof item === "function" ? item(prev) : item]);
+    },
+  };
+}
+
+function applyLiveReload(reason) {
+  const links = reason === "css" && globalThis.document?.querySelectorAll?.('link[rel="stylesheet"]');
+  if (links?.length) {
+    const t = Date.now();
+    for (const l of links) {
+      const h = l.getAttribute("href")?.replace(/[?&]_cr=\d+/, "");
+      if (h) l.setAttribute("href", `${h}${h.includes("?") ? "&" : "?"}_cr=${t}`);
+    }
+    return;
+  }
+  globalThis.location?.reload?.();
+}
+
 export class ConcaveClient {
   constructor(url, options = {}) {
     this.status = signal("connecting");
@@ -148,14 +173,12 @@ export class ConcaveClient {
     this._nextId = 1;
 
     this._authToken = options.authToken ?? null;
+    this._liveReload = options.liveReload ?? true;
+    this._onReload = options.onReload ?? null;
     this._subsByKey = new Map();
     this._subsById = new Map();
-    this._pendingMutations = new Map();
-    this._pendingActions = new Map();
-    this._pendingQueries = new Map();
-    this._inFlightMutations = new Set();
-    this._inFlightActions = new Set();
-    this._inFlightQueries = new Set();
+    this._pending = new Map();
+    this._inFlight = new Set();
     this._optimisticQueue = [];
     this._outboundQueue = [];
 
@@ -192,13 +215,7 @@ export class ConcaveClient {
 
       while (this._outboundQueue.length > 0) {
         const frame = this._outboundQueue.shift();
-        if (frame.type === "mutation") {
-          this._inFlightMutations.add(frame.req_id);
-        } else if (frame.type === "action") {
-          this._inFlightActions.add(frame.req_id);
-        } else if (frame.type === "query") {
-          this._inFlightQueries.add(frame.req_id);
-        }
+        if (frame.req_id) this._inFlight.add(frame.req_id);
         ws.send(this._binary ? encodeBinaryFrame(frame) : JSON.stringify(frame));
       }
     });
@@ -244,18 +261,12 @@ export class ConcaveClient {
   }
 
   _failInFlightOnDisconnect() {
-    if (
-      this._inFlightMutations.size === 0 &&
-      this._inFlightActions.size === 0 &&
-      this._inFlightQueries.size === 0
-    ) {
-      return;
-    }
+    if (this._inFlight.size === 0) return;
     const err = new Error("WebSocket disconnected");
     let removedAnyOpt = false;
-    for (const reqId of this._inFlightMutations) {
-      const pending = this._pendingMutations.get(reqId);
-      this._pendingMutations.delete(reqId);
+    for (const reqId of this._inFlight) {
+      const pending = this._pending.get(reqId);
+      this._pending.delete(reqId);
       const idx = this._optimisticQueue.findIndex((o) => o.reqId === reqId);
       if (idx !== -1) {
         this._optimisticQueue.splice(idx, 1);
@@ -263,38 +274,15 @@ export class ConcaveClient {
       }
       pending?.reject(err);
     }
-    this._inFlightMutations.clear();
-
-    for (const reqId of this._inFlightActions) {
-      const pending = this._pendingActions.get(reqId);
-      this._pendingActions.delete(reqId);
-      pending?.reject(err);
-    }
-    this._inFlightActions.clear();
-
-    for (const reqId of this._inFlightQueries) {
-      const pending = this._pendingQueries.get(reqId);
-      this._pendingQueries.delete(reqId);
-      pending?.reject(err);
-    }
-    this._inFlightQueries.clear();
-
-    if (removedAnyOpt) {
-      this._recomputeOptimisticSignals();
-    }
+    this._inFlight.clear();
+    if (removedAnyOpt) this._recomputeOptimisticSignals();
   }
 
   _sendRaw(payload) {
     if (this._ws && this._ws.readyState === this._WsCtor.OPEN) {
-      if (payload.type === "mutation") {
-        this._inFlightMutations.add(payload.req_id);
-      } else if (payload.type === "action") {
-        this._inFlightActions.add(payload.req_id);
-      } else if (payload.type === "query") {
-        this._inFlightQueries.add(payload.req_id);
-      }
+      if (payload.req_id) this._inFlight.add(payload.req_id);
       this._ws.send(this._binary ? encodeBinaryFrame(payload) : JSON.stringify(payload));
-    } else if (payload.type === "mutation" || payload.type === "action" || payload.type === "query") {
+    } else if (payload.req_id) {
       // Only queue RPCs; `authenticate` and active `subscribe` frames are re-emitted cleanly on `open`
       // without duplicating subscriptions or sending stale auth frames.
       this._outboundQueue.push(payload);
@@ -327,48 +315,38 @@ export class ConcaveClient {
         });
         break;
       }
-      case "mutation_result": {
-        this._inFlightMutations.delete(frame.req_id);
-        const pending = this._pendingMutations.get(frame.req_id);
-        this._pendingMutations.delete(frame.req_id);
+      case "mutation_result":
+      case "action_result":
+      case "query_result": {
+        this._inFlight.delete(frame.req_id);
+        const pending = this._pending.get(frame.req_id);
+        this._pending.delete(frame.req_id);
         if (frame.ok) {
-          const opt = this._optimisticQueue.find((o) => o.reqId === frame.req_id);
-          if (opt) {
-            opt.resolvedCommitTs = frame.commit_ts ?? this.commitTs.peek();
-            this._pruneOptimistic(this.commitTs.peek());
-            this._recomputeOptimisticSignals();
+          if (frame.type === "mutation_result") {
+            const opt = this._optimisticQueue.find((o) => o.reqId === frame.req_id);
+            if (opt) {
+              opt.resolvedCommitTs = frame.commit_ts ?? this.commitTs.peek();
+              this._pruneOptimistic(this.commitTs.peek());
+              this._recomputeOptimisticSignals();
+            }
           }
           pending?.resolve(frame.value);
         } else {
-          this._removeOptimistic(frame.req_id);
-          pending?.reject(new Error(frame.error ?? "mutation failed"));
-        }
-        break;
-      }
-      case "action_result": {
-        this._inFlightActions.delete(frame.req_id);
-        const pending = this._pendingActions.get(frame.req_id);
-        this._pendingActions.delete(frame.req_id);
-        if (frame.ok) {
-          pending?.resolve(frame.value);
-        } else {
-          pending?.reject(new Error(frame.error ?? "action failed"));
-        }
-        break;
-      }
-      case "query_result": {
-        this._inFlightQueries.delete(frame.req_id);
-        const pending = this._pendingQueries.get(frame.req_id);
-        this._pendingQueries.delete(frame.req_id);
-        if (frame.ok) {
-          pending?.resolve(frame.value);
-        } else {
-          pending?.reject(new Error(frame.error ?? "query failed"));
+          if (frame.type === "mutation_result") this._removeOptimistic(frame.req_id);
+          pending?.reject(new Error(frame.error ?? `${frame.type.split("_")[0]} failed`));
         }
         break;
       }
       case "pong":
         break;
+      case "reload": {
+        if (this._onReload) {
+          this._onReload(frame);
+        } else if (this._liveReload) {
+          applyLiveReload(frame.reason);
+        }
+        break;
+      }
       case "error":
         console.error("[concave-client] server error:", frame.message);
         break;
@@ -401,9 +379,9 @@ export class ConcaveClient {
     }
 
     const store = {
-      getQuery: (ref, args) => overlay.get(subKey(ref.name, args)),
+      getQuery: (ref, args) => overlay.get(subKey(resolveRef(ref).name, args)),
       setQuery: (ref, args, value) => {
-        overlay.set(subKey(ref.name, args), value);
+        overlay.set(subKey(resolveRef(ref).name, args), value);
       },
     };
 
@@ -477,6 +455,7 @@ export class ConcaveClient {
   }
 
   query(ref, argsOrAccessor) {
+    const name = resolveRef(ref).name;
     const out = signal({
       status: "loading",
       data: undefined,
@@ -488,11 +467,11 @@ export class ConcaveClient {
       const resolved = isFn ? argsOrAccessor() : argsOrAccessor;
 
       if (resolved === null || resolved === undefined) {
-        out.set({ status: "loading", data: undefined, error: undefined });
+        out.set({ status: "paused", data: undefined, error: undefined });
         return;
       }
 
-      const { entry, release } = this._acquireSub(ref.name, resolved);
+      const { entry, release } = this._acquireSub(name, resolved);
       const stopMirror = effect(() => {
         out.set(entry.signal());
       });
@@ -508,51 +487,32 @@ export class ConcaveClient {
     return accessor;
   }
 
-  mutate(ref, args, options) {
-    const reqId = `mut_${this._nextId++}`;
-    if (options?.optimisticUpdate) {
-      this._optimisticQueue.push({
-        reqId,
-        apply: options.optimisticUpdate,
-      });
+  _rpc(type, prefix, ref, args, opt) {
+    const req_id = `${prefix}_${this._nextId++}`;
+    if (opt) {
+      this._optimisticQueue.push({ reqId: req_id, apply: opt });
       this._recomputeOptimisticSignals();
     }
-
     return new Promise((resolve, reject) => {
-      this._pendingMutations.set(reqId, { resolve, reject });
-      this._sendRaw({
-        type: "mutation",
-        req_id: reqId,
-        name: ref.name,
-        args,
-      });
+      this._pending.set(req_id, { resolve, reject });
+      this._sendRaw({ type, req_id, name: resolveRef(ref).name, args });
     });
+  }
+
+  mutate(ref, args, options) {
+    return this._rpc("mutation", "mut", ref, args, options?.optimisticUpdate);
+  }
+
+  optimisticAppend(ref, args, item) {
+    return optimisticAppend(ref, args, item);
   }
 
   action(ref, args) {
-    const reqId = `act_${this._nextId++}`;
-    return new Promise((resolve, reject) => {
-      this._pendingActions.set(reqId, { resolve, reject });
-      this._sendRaw({
-        type: "action",
-        req_id: reqId,
-        name: ref.name,
-        args,
-      });
-    });
+    return this._rpc("action", "act", ref, args);
   }
 
   queryOnce(ref, args) {
-    const reqId = `qry_${this._nextId++}`;
-    return new Promise((resolve, reject) => {
-      this._pendingQueries.set(reqId, { resolve, reject });
-      this._sendRaw({
-        type: "query",
-        req_id: reqId,
-        name: ref.name,
-        args,
-      });
-    });
+    return this._rpc("query", "qry", ref, args);
   }
 
   close() {

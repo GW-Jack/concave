@@ -519,6 +519,18 @@ pub const ConcaveEngine = struct {
         }
     }
 
+    /// Broadcast a dev-mode live-reload notification to every connected WebSocket client.
+    pub fn broadcastReload(self: *ConcaveEngine, reason: []const u8) void {
+        var buf: [128]u8 = undefined;
+        const payload = std.fmt.bufPrint(&buf, "{{\"type\":\"reload\",\"reason\":\"{s}\"}}", .{reason}) catch return;
+        self.clients_mutex.lockUncancelable(self.io);
+        defer self.clients_mutex.unlock(self.io);
+        var it = self.clients.valueIterator();
+        while (it.next()) |sess| {
+            sess.*.sink.send(payload);
+        }
+    }
+
     pub fn verifyAuthToken(self: *ConcaveEngine, allocator: Allocator, token: []const u8) !auth_mod.AuthIdentity {
         return try auth_mod.verifyToken(allocator, self.io, self.auth_config, token);
     }

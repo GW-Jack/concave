@@ -14,6 +14,7 @@ pub const ServerConfig = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 3210,
     static_dir: ?[]const u8 = null,
+    live_reload: bool = false,
     admin_key: ?[]const u8 = null,
     operator_token: ?[]const u8 = null,
     shutdown_flag: ?*std.atomic.Value(bool) = null,
@@ -66,6 +67,7 @@ pub fn serve(
             io: std.Io,
             engine: *engine_mod.ConcaveEngine,
             static_dir: ?[]const u8,
+            live_reload: bool,
             admin_key: ?[]const u8,
             operator_token: ?[]const u8,
             shutdown_flag: ?*std.atomic.Value(bool),
@@ -77,6 +79,7 @@ pub fn serve(
                     ctx.io,
                     ctx.engine,
                     ctx.static_dir,
+                    ctx.live_reload,
                     ctx.admin_key,
                     ctx.operator_token,
                     ctx.shutdown_flag,
@@ -90,6 +93,7 @@ pub fn serve(
             .io = io,
             .engine = engine,
             .static_dir = config.static_dir,
+            .live_reload = config.live_reload,
             .admin_key = config.admin_key,
             .operator_token = config.operator_token,
             .shutdown_flag = config.shutdown_flag,
@@ -270,12 +274,13 @@ const DispatchCtx = struct {
     io: std.Io,
     engine: *engine_mod.ConcaveEngine,
     static_dir: ?[]const u8,
+    live_reload: bool,
     admin_key: ?[]const u8,
     operator_token: ?[]const u8,
 
     fn h2Dispatch(ptr: *anyopaque, allocator: Allocator, req: *const http2.H2Request) http2.H2Response {
         const self: *DispatchCtx = @ptrCast(@alignCast(ptr));
-        return dispatchHttpRequest(allocator, self.io, self.engine, self.static_dir, self.admin_key, self.operator_token, req);
+        return dispatchHttpRequest(allocator, self.io, self.engine, self.static_dir, self.live_reload, self.admin_key, self.operator_token, req);
     }
 };
 
@@ -284,6 +289,7 @@ fn handleConnection(
     io: std.Io,
     engine: *engine_mod.ConcaveEngine,
     static_dir: ?[]const u8,
+    live_reload: bool,
     admin_key: ?[]const u8,
     operator_token: ?[]const u8,
     shutdown_flag: ?*std.atomic.Value(bool),
@@ -298,6 +304,7 @@ fn handleConnection(
         .io = io,
         .engine = engine,
         .static_dir = static_dir,
+        .live_reload = live_reload,
         .admin_key = admin_key,
         .operator_token = operator_token,
     };
@@ -354,7 +361,7 @@ fn handleConnection(
         }
 
         const h2_view = req.asH2View();
-        const resp = dispatchHttpRequest(ra, io, engine, static_dir, admin_key, operator_token, &h2_view);
+        const resp = dispatchHttpRequest(ra, io, engine, static_dir, live_reload, admin_key, operator_token, &h2_view);
 
         const shutting_down = if (shutdown_flag) |sf| sf.load(.acquire) else false;
         const keep_conn = req.keep_alive and !shutting_down and resp.status < 400;
@@ -370,11 +377,12 @@ fn dispatchHttpRequest(
     io: std.Io,
     engine: *engine_mod.ConcaveEngine,
     static_dir: ?[]const u8,
+    live_reload: bool,
     admin_key: ?[]const u8,
     operator_token: ?[]const u8,
     req: *const http2.H2Request,
 ) http2.H2Response {
-    const resp = dispatchHttpRequestInner(allocator, io, engine, static_dir, admin_key, operator_token, req);
+    const resp = dispatchHttpRequestInner(allocator, io, engine, static_dir, live_reload, admin_key, operator_token, req);
     engine.metrics.recordHttpStatus(resp.status);
     return resp;
 }
@@ -384,6 +392,7 @@ fn dispatchHttpRequestInner(
     io: std.Io,
     engine: *engine_mod.ConcaveEngine,
     static_dir: ?[]const u8,
+    live_reload: bool,
     admin_key: ?[]const u8,
     operator_token: ?[]const u8,
     req: *const http2.H2Request,
@@ -661,7 +670,7 @@ fn dispatchHttpRequestInner(
     // Static frontend serving from `--static-dir` (with ETag/304 + gzip compression)
     if (std.mem.eql(u8, req.method, "GET")) {
         if (static_dir) |root| {
-            return serveStaticFileResponse(allocator, io, root, req.path, want_gzip, req.if_none_match);
+            return serveStaticFileResponse(allocator, io, root, req.path, want_gzip, req.if_none_match, live_reload);
         }
     }
 
@@ -820,6 +829,7 @@ fn serveStaticFileResponse(
     raw_path: []const u8,
     want_gzip: bool,
     if_none_match: ?[]const u8,
+    live_reload: bool,
 ) http2.H2Response {
     const rel = sanitizeStaticPath(allocator, raw_path) catch
         return makeResponse(allocator, 403, "text/plain", "forbidden", false);
@@ -837,6 +847,7 @@ fn serveStaticFileResponse(
     var etag_buf: [18]u8 = undefined;
     const etag = compress.computeEtag(bytes, &etag_buf);
     const etag_copy = allocator.dupe(u8, etag) catch null;
+    const cache_control: []const u8 = if (live_reload) "no-cache" else "public, max-age=60";
 
     if (compress.etagMatches(if_none_match, etag)) {
         return .{
@@ -844,13 +855,13 @@ fn serveStaticFileResponse(
             .content_type = mime,
             .body = allocator.alloc(u8, 0) catch &.{},
             .etag = etag_copy,
-            .cache_control = "public, max-age=60",
+            .cache_control = cache_control,
         };
     }
 
     var resp = makeResponse(allocator, 200, mime, bytes, want_gzip);
     resp.etag = etag_copy;
-    resp.cache_control = "public, max-age=60";
+    resp.cache_control = cache_control;
     return resp;
 }
 

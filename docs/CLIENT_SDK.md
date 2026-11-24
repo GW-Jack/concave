@@ -6,18 +6,27 @@ Companion `.d.ts` declarations (`client/concave-client/src/*.d.ts`) work alongsi
 
 ---
 
-## Connecting with `ConcaveClient`
+## Connecting with `ConcaveClient` & `createApi`
 
 ```js
 import { ConcaveClient } from "/_concave/index.js";
-import { api } from "./_generated/api.js";
+import { createApi } from "./_generated/api.js";
 
 const client = new ConcaveClient(window.location.origin, {
   authToken: "dev:alice:Alice", // optional; or call client.setAuth(...) later
 });
+const db = createApi(client);
 ```
 
 `ConcaveClient` accepts either an `http(s)://` origin (automatically upgraded to `ws(s)://.../ws`) or an explicit `ws(s)://.../ws` URL.
+
+`createApi(client)` wraps your generated `api` tree so every query, mutation, and action is directly callable with full end-to-end TypeScript inference (`db.rooms.list()`, `db.messages.send(...)`, `db.rooms.list.once()`), while still exposing `.ref` and keeping the raw `api` export available.
+
+### Dev Live Reload
+When running `concave dev --static-dir ...`, the server automatically enables `--live-reload`, watches `--static-dir`, sets `Cache-Control: no-cache` on static files, and pushes WebSocket `{ type: "reload", reason }` frames on edit:
+- **CSS-only edits** hot-swap `<link rel="stylesheet">` tags in place without losing DOM/form state.
+- **JS/HTML edits** reload the page automatically.
+- Configure or disable per client via `new ConcaveClient(url, { liveReload: false })` or `{ onReload(ev) { ... } }`.
 
 ### Reactive Client Signals
 - `client.status()` — `"connecting" | "connected" | "reconnecting" | "closed"`
@@ -49,7 +58,8 @@ const messages = client.query(api.messages.list, () => ({
 }));
 
 // Read reactive state anywhere inside `computed`, `effect`, or DOM bindings:
-// messages() -> { status: "loading" | "ready" | "error", data, error }
+// messages() -> { status: "paused" | "loading" | "ready" | "error", data, error }
+// When the args accessor returns `null` or `undefined`, status becomes `"paused"`.
 ```
 
 - All subscriptions updated by the same backend commit advance **atomically** in a single `batch()` (`transition { to_ts, updates }`), preventing torn UI states.
@@ -57,20 +67,28 @@ const messages = client.query(api.messages.list, () => ({
 
 ---
 
-## Mutations & Optimistic Updates (`client.mutate`)
+## Mutations & Optimistic Updates (`client.mutate` / `optimisticAppend`)
 
 ```js
-await client.mutate(
-  api.messages.send,
+// Shorthand for appending to a live list query:
+await db.messages.send(
+  { room_id: activeRoom(), body: "Hello!" },
+  client.optimisticAppend(db.messages.list, { room_id: activeRoom() }, {
+    id: "optimistic",
+    created_at: Date.now(),
+    room_id: activeRoom(),
+    body: "Hello!",
+  }),
+);
+
+// Or write a custom optimistic reducer:
+await db.messages.send(
   { room_id: activeRoom(), body: "Hello!" },
   {
     optimisticUpdate(store) {
       const args = { room_id: activeRoom() };
-      const prev = store.getQuery(api.messages.list, args) ?? [];
-      store.setQuery(api.messages.list, args, [
-        ...prev,
-        { id: "optimistic", created_at: Date.now(), room_id: args.room_id, body: "Hello!" },
-      ]);
+      const prev = store.getQuery(db.messages.list, args) ?? [];
+      store.setQuery(db.messages.list, args, [...prev, nextItem]);
     },
   },
 );
@@ -107,28 +125,36 @@ Glitch-free push-pull topological reactivity (formally verified in `specs/maude/
 Zero Virtual DOM — updates only the exact text node, attribute, or keyed list item that changed:
 
 ```js
-import { el, each, show, mount } from "/_concave/index.js";
+import { bindValue, each, mount, show, tags } from "/_concave/index.js";
+
+const { button, form, h1, input, li, main, p, ul } = tags;
 
 const dispose = mount(document.getElementById("root"), () =>
-  el("main", { class: "app" },
-    el("h1", null, () => `Connected (${client.status()})`),
+  main({ class: "app" },
+    h1(() => `Connected (${client.status()})`),
     show(
       () => messages().status === "ready",
       () =>
-        el("ul", null,
+        ul(
           each(
             () => messages().data ?? [],
             (msg) => msg.id,
-            (msg) => el("li", null, () => msg().body),
+            (msg) => li(() => msg().body),
           ),
         ),
-      () => el("p", null, "Loading messages…"),
+      () => p("Loading messages…"),
+    ),
+    form({ onSubmit },
+      input({ placeholder: "Say hi…", ...bindValue(draft) }),
+      button({ type: "submit" }, "Send"),
     ),
   ),
 );
 ```
 
-- `el(tag, props, ...children)`: Any prop or child may be a reactive accessor `() => value`; event handlers use `onClick`, `onInput`, `onSubmit`, etc.
+- `el(tag, props, ...children)`: Core element constructor. Any prop or child may be a reactive accessor `() => value`; event handlers use `onClick`, `onInput`, `onSubmit`, etc.
+- `tags`: Proxy providing shorthand element builders (`const { div, button, input } = tags`) where the `props` object is optional (`div("hi")` or `div({ class: "card" }, "hi")`).
+- `bindValue(sig, onInput?)` / `bindChecked(sig, onChange?)`: Two-way binding prop helpers for inputs/checkboxes (`input({ ...bindValue(draft) })`).
 - `each(itemsAccessor, keyFn, renderItem)`: Keyed list reconciliation preserving DOM node identity across inserts, deletes, and reorders, and disposing removed item roots automatically.
 - `show(whenAccessor, renderThen, renderElse?)`: Conditional reactive branch with automatic root cleanup.
 - `mount(container, renderRoot)`: Mounts into `container` inside a `createRoot` and returns `dispose`.

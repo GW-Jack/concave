@@ -221,7 +221,102 @@ pub fn generateApiDts(allocator: Allocator, manifest: *const AppManifest) ![]u8 
         \\export declare const api: 
     );
     try root.renderDts(w, allocator, 0);
-    try w.writeAll(";\n\nexport type Api = typeof api;\n");
+    try w.writeAll(
+        \\;
+        \\
+        \\export type Api = typeof api;
+        \\
+        \\export type FunctionReferenceLike<
+        \\  Kind extends FunctionKind,
+        \\  Args,
+        \\  Result
+        \\> =
+        \\  | FunctionReference<Kind, Args, Result>
+        \\  | { readonly ref: FunctionReference<Kind, Args, Result> };
+        \\
+        \\export interface QueryState<T> {
+        \\  readonly status: "paused" | "loading" | "ready" | "error";
+        \\  readonly data: T | undefined;
+        \\  readonly error: string | undefined;
+        \\}
+        \\
+        \\export interface OptimisticLocalStore {
+        \\  getQuery<Args, Result>(
+        \\    ref: FunctionReferenceLike<"query", Args, Result>,
+        \\    args: Args,
+        \\  ): Result | undefined;
+        \\  setQuery<Args, Result>(
+        \\    ref: FunctionReferenceLike<"query", Args, Result>,
+        \\    args: Args,
+        \\    value: Result,
+        \\  ): void;
+        \\}
+        \\
+        \\export interface MutateOptions {
+        \\  optimisticUpdate?: (store: OptimisticLocalStore) => void;
+        \\}
+        \\
+        \\export interface BoundQuery<Args, Result> {
+        \\  (
+        \\    ...args: Record<string, never> extends Args
+        \\      ? [argsOrAccessor?: Args | (() => Args | null | undefined)]
+        \\      : [argsOrAccessor: Args | (() => Args | null | undefined)]
+        \\  ): (() => QueryState<Result>) & { dispose: () => void };
+        \\  once(
+        \\    ...args: Record<string, never> extends Args ? [args?: Args] : [args: Args]
+        \\  ): Promise<Result>;
+        \\  readonly ref: FunctionReference<"query", Args, Result>;
+        \\}
+        \\
+        \\export interface BoundMutation<Args, Result> {
+        \\  (
+        \\    ...args: Record<string, never> extends Args
+        \\      ? [args?: Args, options?: MutateOptions]
+        \\      : [args: Args, options?: MutateOptions]
+        \\  ): Promise<Result>;
+        \\  readonly ref: FunctionReference<"mutation", Args, Result>;
+        \\}
+        \\
+        \\export interface BoundAction<Args, Result> {
+        \\  (
+        \\    ...args: Record<string, never> extends Args ? [args?: Args] : [args: Args]
+        \\  ): Promise<Result>;
+        \\  readonly ref: FunctionReference<"action", Args, Result>;
+        \\}
+        \\
+        \\export interface ConcaveClientLike {
+        \\  query<Args, Result>(
+        \\    ref: FunctionReferenceLike<"query", Args, Result>,
+        \\    argsOrAccessor: Args | (() => Args | null | undefined),
+        \\  ): (() => QueryState<Result>) & { dispose: () => void };
+        \\  mutate<Args, Result>(
+        \\    ref: FunctionReferenceLike<"mutation", Args, Result>,
+        \\    args: Args,
+        \\    options?: MutateOptions,
+        \\  ): Promise<Result>;
+        \\  action<Args, Result>(
+        \\    ref: FunctionReferenceLike<"action", Args, Result>,
+        \\    args: Args,
+        \\  ): Promise<Result>;
+        \\  queryOnce<Args, Result>(
+        \\    ref: FunctionReferenceLike<"query", Args, Result>,
+        \\    args: Args,
+        \\  ): Promise<Result>;
+        \\}
+        \\
+        \\export type BoundApi<T> = {
+        \\  readonly [K in keyof T]: T[K] extends FunctionReference<"query", infer A, infer R>
+        \\    ? BoundQuery<A, R>
+        \\    : T[K] extends FunctionReference<"mutation", infer A, infer R>
+        \\      ? BoundMutation<A, R>
+        \\      : T[K] extends FunctionReference<"action", infer A, infer R>
+        \\        ? BoundAction<A, R>
+        \\        : BoundApi<T[K]>;
+        \\};
+        \\
+        \\export declare function createApi(client: ConcaveClientLike): BoundApi<Api>;
+        \\
+    );
     return try out.toOwnedSlice();
 }
 
@@ -247,7 +342,35 @@ pub fn generateApiJs(allocator: Allocator, manifest: *const AppManifest) ![]u8 {
         \\export const api = Object.freeze(
     );
     try root.renderJs(w, 0);
-    try w.writeAll(");\n");
+    try w.writeAll(
+        \\);
+        \\
+        \\function bindNode(node, client) {
+        \\  if (node && typeof node.kind === "string" && typeof node.name === "string") {
+        \\    const fn =
+        \\      node.kind === "query"
+        \\        ? (args = {}) => client.query(node, args)
+        \\        : node.kind === "mutation"
+        \\          ? (args = {}, options) => client.mutate(node, args, options)
+        \\          : (args = {}) => client.action(node, args);
+        \\    fn.ref = node;
+        \\    if (node.kind === "query") {
+        \\      fn.once = (args = {}) => client.queryOnce(node, args);
+        \\    }
+        \\    return fn;
+        \\  }
+        \\  const out = {};
+        \\  for (const key of Object.keys(node)) {
+        \\    out[key] = bindNode(node[key], client);
+        \\  }
+        \\  return Object.freeze(out);
+        \\}
+        \\
+        \\export function createApi(client) {
+        \\  return bindNode(api, client);
+        \\}
+        \\
+    );
     return try out.toOwnedSlice();
 }
 
@@ -356,5 +479,7 @@ test "codegen emits api.js, api.d.ts, and dataModel.d.ts" {
     try std.testing.expect(std.mem.indexOf(u8, files.data_model_dts, "export interface MessagesDoc") != null);
     try std.testing.expect(std.mem.indexOf(u8, files.data_model_dts, "export interface PresenceSessionsDoc") != null);
     try std.testing.expect(std.mem.indexOf(u8, files.api_dts, "FunctionReference<\"query\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, files.api_dts, "export declare function createApi") != null);
     try std.testing.expect(std.mem.indexOf(u8, files.api_js, "makeRef(\"query\", \"messages.list\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, files.api_js, "export function createApi(client)") != null);
 }

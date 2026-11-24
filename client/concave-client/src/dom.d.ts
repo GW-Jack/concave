@@ -1,4 +1,4 @@
-import type { Accessor, Dispose } from "./signals.js";
+import type { Accessor, Dispose, Signal } from "./signals.js";
 
 export interface ChildArray extends Array<Child> {}
 
@@ -47,5 +47,36 @@ export function each<T, K>(
   keyFn: (item: T) => K,
   renderItem: (item: Accessor<T>) => Node,
 ): Node;
+
+export interface ValueBindingProps {
+  value: Accessor<string>;
+  onInput: (e: Event) => void;
+}
+
+export interface CheckedBindingProps {
+  checked: Accessor<boolean>;
+  onChange: (e: Event) => void;
+}
+
+export function bindValue(
+  sig: Signal<string>,
+  onInput?: (value: string, e: Event) => void,
+): ValueBindingProps;
+
+export function bindChecked(
+  sig: Signal<boolean>,
+  onChange?: (checked: boolean, e: Event) => void,
+): CheckedBindingProps;
+
+export type TagHelper<K extends keyof HTMLElementTagNameMap> = {
+  (props?: ElementProps | null, ...children: Child[]): HTMLElementTagNameMap[K];
+  (...children: Child[]): HTMLElementTagNameMap[K];
+};
+
+export type Tags = {
+  readonly [K in keyof HTMLElementTagNameMap]: TagHelper<K>;
+};
+
+export const tags: Tags;
 
 export function mount(container: Element, renderRoot: () => Child): Dispose;

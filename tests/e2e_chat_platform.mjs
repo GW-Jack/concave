@@ -334,3 +334,98 @@ test("end-to-end native Roc platform: WS reactivity, index-range isolation, comp
   aliceFlags.dispose();
   liveMonitorLogs.dispose();
 });
+
+test("end-to-end dev live reload: CSS hot-swap, JS reload, no-cache headers, and embedded SDK helpers", async (t) => {
+  const binPath = path.join(ROOT, "examples/chat-app/.concave/e2e-server");
+  const dbPath = path.join(ROOT, "examples/chat-app/.concave/e2e-reload.wal");
+  const tmpStatic = fs.mkdtempSync(path.join(ROOT, "examples/chat-app/.concave/static-reload-"));
+  fs.writeFileSync(path.join(tmpStatic, "styles.css"), "body { color: black; }\n");
+  fs.writeFileSync(path.join(tmpStatic, "app.js"), "export const v = 1;\n");
+
+  for (const suffix of ["", "-wal", "-shm", ".tmp"]) {
+    fs.rmSync(`${dbPath}${suffix}`, { force: true });
+  }
+
+  const port = 13229;
+  const serverUrl = `http://127.0.0.1:${port}`;
+  const serverProc = spawn(
+    binPath,
+    [
+      "--serve",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      String(port),
+      "--db",
+      dbPath,
+      "--static-dir",
+      tmpStatic,
+      "--live-reload",
+    ],
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, CONCAVE_LIVE_RELOAD_POLL_MS: "50" },
+    },
+  );
+  t.after(() => {
+    serverProc.kill("SIGTERM");
+    fs.rmSync(tmpStatic, { recursive: true, force: true });
+    for (const suffix of ["", "-wal", "-shm", ".tmp"]) {
+      fs.rmSync(`${dbPath}${suffix}`, { force: true });
+    }
+  });
+
+  await waitForHealth(serverUrl);
+
+  // 1. CLI & compiled binary `--help` flags exit cleanly without side effects.
+  const cliBin = path.join(ROOT, "zig-out/bin/concave");
+  for (const sub of ["init", "codegen", "dev", "build"]) {
+    const res = spawnSync(cliBin, [sub, "--help"], { cwd: tmpStatic, encoding: "utf8" });
+    assert.equal(res.status, 0, `concave ${sub} --help should exit 0`);
+    assert.ok(res.stderr.includes(`Usage: concave ${sub}`), `expected usage for ${sub}`);
+  }
+  assert.equal(fs.existsSync(path.join(tmpStatic, "--help")), false, "concave init --help must not create --help dir");
+
+  const binHelp = spawnSync(binPath, ["--help"], { cwd: tmpStatic, encoding: "utf8" });
+  assert.equal(binHelp.status, 0, "compiled server --help should exit 0");
+  assert.ok(binHelp.stderr.includes("--live-reload"), "compiled server --help lists --live-reload");
+
+  // 2. Embedded `/_concave/index.js` includes the new ergonomic helpers and is syntactically valid JS.
+  const sdkRes = await fetch(`${serverUrl}/_concave/index.js`);
+  assert.equal(sdkRes.status, 200);
+  const sdkSrc = await sdkRes.text();
+  assert.ok(sdkSrc.includes("export const bindValue"), "embedded bundle exports bindValue");
+  assert.ok(sdkSrc.includes("export const tags"), "embedded bundle exports tags");
+  assert.ok(sdkSrc.includes("export function optimisticAppend"), "embedded bundle exports optimisticAppend");
+
+  // 2. Static files served with `--live-reload` use `Cache-Control: no-cache`.
+  const staticRes = await fetch(`${serverUrl}/app.js`);
+  assert.equal(staticRes.status, 200);
+  assert.equal(staticRes.headers.get("cache-control"), "no-cache");
+
+  // 3. Connected ConcaveClient receives live-reload frames on CSS and JS edits.
+  const reloads = [];
+  const client = new ConcaveClient(serverUrl, {
+    onReload: (ev) => reloads.push(ev),
+  });
+  t.after(() => client.close());
+  await waitForCondition(() => client.status() === "connected", 5000, "live-reload client connected");
+
+  // Let initial baseline settle, then modify CSS.
+  await new Promise((r) => setTimeout(r, 120));
+  fs.writeFileSync(path.join(tmpStatic, "styles.css"), "body { color: rebeccapurple; }\n");
+  await waitForCondition(
+    () => reloads.some((r) => r.reason === "css"),
+    5000,
+    "CSS live-reload notification received",
+  );
+
+  // Modify JS -> full static reload notification.
+  await new Promise((r) => setTimeout(r, 120));
+  fs.writeFileSync(path.join(tmpStatic, "app.js"), "export const v = 2;\n");
+  await waitForCondition(
+    () => reloads.some((r) => r.reason === "static"),
+    5000,
+    "static JS live-reload notification received",
+  );
+});

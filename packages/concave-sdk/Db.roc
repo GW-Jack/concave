@@ -14,7 +14,7 @@ Db := [Db].{
     }
 
     ## Fetch a single document by ID, decoded into `doc` using Roc's built-in `Json.parse`.
-    get! : Ctx.DbReader, Table(doc), Str => Try([Found(doc), NotFound], Str)
+    get! : Ctx.DbReadable(r), Table(doc), Str => Try([Found(doc), NotFound], Str)
         where [doc.Json.Parseable([InvalidJson(Str)])]
     get! = |db, table, doc_id| {
         get_raw! = db.get_raw!
@@ -196,7 +196,7 @@ Db := [Db].{
 
     ## Execute the query against `db` and return the host-serialized JSON array directly
     ## (zero Roc JSON parse/re-encode overhead for pass-through queries).
-    collect_raw! : QueryBuilder(doc), Ctx.DbReader => Try(Str, Str)
+    collect_raw! : QueryBuilder(doc), Ctx.DbReadable(r) => Try(Str, Str)
     collect_raw! = |q, db| {
         req_wire = encode_query_wire(db.namespace, q)
         query_raw! = db.query_raw!
@@ -204,7 +204,7 @@ Db := [Db].{
     }
 
     ## Execute the query against `db` and decode the matching documents into `List(doc)`.
-    collect! : QueryBuilder(doc), Ctx.DbReader => Try(List(doc), Str)
+    collect! : QueryBuilder(doc), Ctx.DbReadable(r) => Try(List(doc), Str)
         where [doc.Json.Parseable([InvalidJson(Str)])]
     collect! = |q, db| {
         raw = collect_raw!(q, db)?
@@ -222,7 +222,7 @@ Db := [Db].{
     }
 
     ## Execute the query with `limit = 1` and return `Found(doc)` or `NotFound`.
-    first! : QueryBuilder(doc), Ctx.DbReader => Try([Found(doc), NotFound], Str)
+    first! : QueryBuilder(doc), Ctx.DbReadable(r) => Try([Found(doc), NotFound], Str)
         where [doc.Json.Parseable([InvalidJson(Str)])]
     first! = |qb, db| {
         docs = qb |> take(1) |> collect!(db)?
@@ -233,7 +233,7 @@ Db := [Db].{
     }
 
     ## Reactive cursor pagination over any indexed query (`cursor == ""` starts from the beginning).
-    paginate! : QueryBuilder(doc), Ctx.DbReader, Str, U64 => Try(Page(doc), Str)
+    paginate! : QueryBuilder(doc), Ctx.DbReadable(r), Str, U64 => Try(Page(doc), Str)
         where [doc.Json.Parseable([InvalidJson(Str)])]
     paginate! = |q, db, cursor, page_size| {
         req_wire =
@@ -247,7 +247,7 @@ Db := [Db].{
     }
 
     ## Reactive case-insensitive multi-token full-text search on a string field of `table`.
-    search! : Ctx.DbReader, Table(doc), Str, Str, U64 => Try(List(doc), Str)
+    search! : Ctx.DbReadable(r), Table(doc), Str, Str, U64 => Try(List(doc), Str)
         where [doc.Json.Parseable([InvalidJson(Str)])]
     search! = |db, table, field, query_text, limit| {
         req_wire =

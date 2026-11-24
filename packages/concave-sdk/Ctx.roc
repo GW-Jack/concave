@@ -38,6 +38,16 @@ Ctx := [Ctx].{
         delete! : Str => Try({}, Str),
     }
 
+    ## Structural read-capable DB constraint satisfied by both `DbReader` and `DbWriter`.
+    DbReadable(r) : {
+        namespace : Str,
+        get_raw! : Str, Str, Str => Try(Str, Str),
+        query_raw! : Str => Try(Str, Str),
+        paginate_raw! : Str => Try(Str, Str),
+        search_raw! : Str => Try(Str, Str),
+        ..r
+    }
+
     ## Read-only database capability (scoped to a single component namespace, "" for root app).
     DbReader : {
         namespace : Str,

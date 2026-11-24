@@ -15,13 +15,20 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const cmd = args[1];
+    if (isHelpFlag(cmd)) {
+        printUsage();
+        return;
+    }
     if (std.mem.eql(u8, cmd, "codegen")) {
         var entry: []const u8 = "backend/main.roc";
         var out_dir: []const u8 = "frontend/src/_generated";
         var opt: []const u8 = "dev";
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
-            if (std.mem.eql(u8, args[i], "--entry") and i + 1 < args.len) {
+            if (isHelpFlag(args[i])) {
+                printCodegenUsage();
+                return;
+            } else if (std.mem.eql(u8, args[i], "--entry") and i + 1 < args.len) {
                 i += 1;
                 entry = args[i];
             } else if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
@@ -30,12 +37,16 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, args[i], "--opt") and i + 1 < args.len) {
                 i += 1;
                 opt = args[i];
+            } else {
+                std.debug.print("Unknown or incomplete option for `concave codegen`: {s}\n\n", .{args[i]});
+                printCodegenUsage();
+                std.process.exit(2);
             }
         }
         const bin = try defaultDevBin(gpa, entry);
         defer gpa.free(bin);
-        try buildRocApp(gpa, io, entry, bin, opt);
-        var manifest = try introspectBinary(gpa, io, bin);
+        buildRocApp(gpa, io, entry, bin, opt) catch std.process.exit(1);
+        var manifest = introspectBinary(gpa, io, bin) catch std.process.exit(1);
         defer manifest.deinit();
         try codegen_mod.writeGeneratedFiles(gpa, io, &manifest, out_dir);
         std.debug.print(
@@ -48,7 +59,10 @@ pub fn main(init: std.process.Init) !void {
         var opt: []const u8 = "speed";
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
-            if (std.mem.eql(u8, args[i], "--entry") and i + 1 < args.len) {
+            if (isHelpFlag(args[i])) {
+                printBuildUsage();
+                return;
+            } else if (std.mem.eql(u8, args[i], "--entry") and i + 1 < args.len) {
                 i += 1;
                 entry = args[i];
             } else if ((std.mem.eql(u8, args[i], "--output") or std.mem.eql(u8, args[i], "-o")) and i + 1 < args.len) {
@@ -57,9 +71,13 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, args[i], "--opt") and i + 1 < args.len) {
                 i += 1;
                 opt = args[i];
+            } else {
+                std.debug.print("Unknown or incomplete option for `concave build`: {s}\n\n", .{args[i]});
+                printBuildUsage();
+                std.process.exit(2);
             }
         }
-        try buildRocApp(gpa, io, entry, output, opt);
+        buildRocApp(gpa, io, entry, output, opt) catch std.process.exit(1);
         std.debug.print("Built standalone Concave server binary: {s}\n", .{output});
     } else if (std.mem.eql(u8, cmd, "dev")) {
         var entry: []const u8 = "backend/main.roc";
@@ -74,7 +92,10 @@ pub fn main(init: std.process.Init) !void {
 
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
-            if (std.mem.eql(u8, args[i], "--entry") and i + 1 < args.len) {
+            if (isHelpFlag(args[i])) {
+                printDevUsage();
+                return;
+            } else if (std.mem.eql(u8, args[i], "--entry") and i + 1 < args.len) {
                 i += 1;
                 entry = args[i];
             } else if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
@@ -101,6 +122,10 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, args[i], "--opt") and i + 1 < args.len) {
                 i += 1;
                 opt = args[i];
+            } else {
+                std.debug.print("Unknown or incomplete option for `concave dev`: {s}\n\n", .{args[i]});
+                printDevUsage();
+                std.process.exit(2);
             }
         }
 
@@ -116,17 +141,16 @@ pub fn main(init: std.process.Init) !void {
             .opt = opt,
         });
     } else if (std.mem.eql(u8, cmd, "init")) {
-        if (args.len < 3) {
-            std.debug.print("Usage: concave init <dir> [--template minimal|chat|kanban] [--platform <path>] [--sdk <path>]\n", .{});
-            return;
-        }
-        const dir = args[2];
+        var dir: ?[]const u8 = null;
         var template: []const u8 = "minimal";
         var platform: []const u8 = "./platform/main.roc";
         var sdk: []const u8 = "./packages/concave-sdk/main.roc";
-        var i: usize = 3;
+        var i: usize = 2;
         while (i < args.len) : (i += 1) {
-            if (std.mem.eql(u8, args[i], "--template") and i + 1 < args.len) {
+            if (isHelpFlag(args[i])) {
+                printInitUsage();
+                return;
+            } else if (std.mem.eql(u8, args[i], "--template") and i + 1 < args.len) {
                 i += 1;
                 template = args[i];
             } else if (std.mem.startsWith(u8, args[i], "--template=")) {
@@ -141,13 +165,33 @@ pub fn main(init: std.process.Init) !void {
                 sdk = args[i];
             } else if (std.mem.startsWith(u8, args[i], "--sdk=")) {
                 sdk = args[i]["--sdk=".len..];
+            } else if (std.mem.startsWith(u8, args[i], "-")) {
+                std.debug.print("Unknown or incomplete option for `concave init`: {s}\n\n", .{args[i]});
+                printInitUsage();
+                std.process.exit(2);
+            } else if (dir == null) {
+                dir = args[i];
+            } else {
+                std.debug.print("Unexpected positional argument for `concave init`: {s}\n\n", .{args[i]});
+                printInitUsage();
+                std.process.exit(2);
             }
         }
-        try scaffoldApp(gpa, io, dir, template, platform, sdk);
-        std.debug.print("Initialized Concave app ({s} template) in {s}\n", .{ template, dir });
+        const target_dir = dir orelse {
+            printInitUsage();
+            std.process.exit(2);
+        };
+        try scaffoldApp(gpa, io, target_dir, template, platform, sdk);
+        std.debug.print("Initialized Concave app ({s} template) in {s}\n", .{ template, target_dir });
     } else {
+        std.debug.print("Unknown command: {s}\n\n", .{cmd});
         printUsage();
+        std.process.exit(2);
     }
+}
+
+fn isHelpFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help");
 }
 
 fn printUsage() void {
@@ -159,6 +203,62 @@ fn printUsage() void {
         \\  dev      Watch .roc files, rebuild, run codegen, and supervise the live server
         \\  build    Build a standalone native Concave server executable
         \\  init     Scaffold a new Concave app (--template minimal|chat|kanban)
+        \\
+        \\Run `concave <command> --help` for subcommand options.
+        \\
+    , .{});
+}
+
+fn printCodegenUsage() void {
+    std.debug.print(
+        \\Usage: concave codegen [--entry <path>] [--out <dir>] [--opt dev|size|speed]
+        \\
+        \\Options:
+        \\  --entry <path>   Roc backend entrypoint (default: backend/main.roc)
+        \\  --out <dir>      Output directory for api.js / api.d.ts / dataModel.d.ts (default: frontend/src/_generated)
+        \\  --opt <mode>     Roc optimization level: dev, size, or speed (default: dev)
+        \\
+    , .{});
+}
+
+fn printBuildUsage() void {
+    std.debug.print(
+        \\Usage: concave build [--entry <path>] [--output|-o <path>] [--opt dev|size|speed]
+        \\
+        \\Options:
+        \\  --entry <path>   Roc backend entrypoint (default: backend/main.roc)
+        \\  -o, --output     Output binary path (default: .concave/server)
+        \\  --opt <mode>     Roc optimization level: dev, size, or speed (default: speed)
+        \\
+    , .{});
+}
+
+fn printDevUsage() void {
+    std.debug.print(
+        \\Usage: concave dev [options]
+        \\
+        \\Options:
+        \\  --entry <path>          Roc backend entrypoint (default: backend/main.roc)
+        \\  --out <dir>             Codegen output directory (default: frontend/src/_generated)
+        \\  --host <addr>           Bind address (default: 127.0.0.1)
+        \\  --port <port>           Listen port (default: 3210)
+        \\  --db <path>             Local WAL database path (default: .concave/dev.wal)
+        \\  --database-url <url>    PostgreSQL connection URL (overrides --db)
+        \\  --deployment-id <id>    Deployment namespace (default: default)
+        \\  --static-dir <dir>      Serve static frontend files with live reload
+        \\  --opt <mode>            Roc optimization level (default: dev)
+        \\
+    , .{});
+}
+
+fn printInitUsage() void {
+    std.debug.print(
+        \\Usage: concave init <dir> [--template minimal|chat|kanban] [--platform <path>] [--sdk <path>]
+        \\
+        \\Options:
+        \\  --template <name>   Starter template: minimal, chat, or kanban (default: minimal)
+        \\  --platform <path>   Relative path or URL to platform/main.roc (from <dir>/backend/main.roc)
+        \\  --sdk <path>        Relative path or URL to packages/concave-sdk/main.roc
         \\
     , .{});
 }
@@ -246,7 +346,7 @@ fn spawnServer(allocator: Allocator, io: std.Io, bin: []const u8, opts: DevOptio
         try argv.appendSlice(allocator, &.{ "--database-url", url });
     }
     if (opts.static_dir) |sd| {
-        try argv.appendSlice(allocator, &.{ "--static-dir", sd });
+        try argv.appendSlice(allocator, &.{ "--static-dir", sd, "--live-reload" });
     }
     return try std.process.spawn(io, .{ .argv = argv.items });
 }
@@ -279,9 +379,11 @@ fn runDevLoop(allocator: Allocator, io: std.Io, opts: DevOptions) !void {
     defer if (child) |*c| c.kill(io);
 
     var last_fp: u64 = 0;
+    var attempted = false;
     while (true) {
         const fp = computeRocFingerprint(allocator, io, watch_dir);
-        if (fp != last_fp or child == null) {
+        if (!attempted or fp != last_fp) {
+            attempted = true;
             last_fp = fp;
             if (child) |*c| {
                 c.kill(io);
@@ -562,9 +664,12 @@ fn scaffoldApp(
     // Write zero-dependency reactive frontend starter (`frontend/index.html` + `frontend/src/main.js`).
     const html_path = try std.fs.path.join(allocator, &.{ dir, "frontend", "index.html" });
     defer allocator.free(html_path);
-    try std.Io.Dir.cwd().writeFile(io, .{
-        .sub_path = html_path,
-        .data =
+    const extra_css = if (std.mem.eql(u8, template, "kanban"))
+        "    .cols { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-top: 1rem; }\n    .col { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 0.75rem; }\n"
+    else
+        "";
+    const html_data = try std.fmt.allocPrint(
+        allocator,
         \\<!doctype html>
         \\<html lang="en">
         \\<head>
@@ -572,13 +677,11 @@ fn scaffoldApp(
         \\  <meta name="viewport" content="width=device-width, initial-scale=1" />
         \\  <title>Concave App</title>
         \\  <style>
-        \\    body { font-family: system-ui, -apple-system, sans-serif; max-width: 820px; margin: 2rem auto; padding: 0 1rem; background: #0f1115; color: #e6edf3; }
-        \\    input, button { padding: 0.5rem 0.75rem; border-radius: 6px; border: 1px solid #30363d; background: #161b22; color: #e6edf3; }
-        \\    button { background: #238636; border-color: #2ea043; cursor: pointer; }
-        \\    .cols { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-top: 1rem; }
-        \\    .col { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 0.75rem; }
-        \\    .card { background: #21262d; padding: 0.6rem; border-radius: 6px; margin-bottom: 0.5rem; display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; }
-        \\    a { color: #58a6ff; }
+        \\    body {{ font-family: system-ui, -apple-system, sans-serif; max-width: 820px; margin: 2rem auto; padding: 0 1rem; background: #0f1115; color: #e6edf3; }}
+        \\    input, button {{ padding: 0.5rem 0.75rem; border-radius: 6px; border: 1px solid #30363d; background: #161b22; color: #e6edf3; }}
+        \\    button {{ background: #238636; border-color: #2ea043; cursor: pointer; }}
+        \\{s}    .card {{ background: #21262d; padding: 0.6rem; border-radius: 6px; margin-bottom: 0.5rem; display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; }}
+        \\    a {{ color: #58a6ff; }}
         \\  </style>
         \\</head>
         \\<body>
@@ -587,41 +690,46 @@ fn scaffoldApp(
         \\</body>
         \\</html>
         \\
-        ,
-    });
+    ,
+        .{extra_css},
+    );
+    defer allocator.free(html_data);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = html_path, .data = html_data });
 
     const js_data = if (std.mem.eql(u8, template, "kanban"))
-        \\import { ConcaveClient, el, each, mount } from "/_concave/index.js";
-        \\import { api } from "./_generated/api.js";
+        \\import { ConcaveClient, bindValue, each, mount, signal, tags } from "/_concave/index.js";
+        \\import { createApi } from "./_generated/api.js";
         \\
+        \\const { a, button, div, form, h1, h3, input, p, span } = tags;
         \\const client = new ConcaveClient(window.location.origin);
-        \\const cards = client.query(api.cards.list, {});
+        \\const db = createApi(client);
+        \\const cards = db.cards.list();
+        \\const draft = signal("");
         \\const COLS = ["todo", "doing", "done"];
-        \\let inputEl;
         \\
-        \\mount(document.getElementById("app"), () => el("div", {},
-        \\  el("h1", {}, "Concave Live Kanban"),
-        \\  el("p", {}, "Open a second tab — every move syncs live. ", el("a", { href: "/_dashboard", target: "_blank" }, "Open Dashboard")),
-        \\  el("form", {
-        \\    onsubmit: async (e) => {
+        \\mount(document.getElementById("app"), () => div(
+        \\  h1("Concave Live Kanban"),
+        \\  p("Open a second tab — every move syncs live. ", a({ href: "/_dashboard", target: "_blank" }, "Open Dashboard")),
+        \\  form({
+        \\    onSubmit: async (e) => {
         \\      e.preventDefault();
-        \\      const title = inputEl.value.trim();
+        \\      const title = draft().trim();
         \\      if (!title) return;
-        \\      inputEl.value = "";
-        \\      await client.mutate(api.cards.create, { title, column: "todo", assignee: "you" });
+        \\      draft.set("");
+        \\      await db.cards.create({ title, column: "todo", assignee: "you" });
         \\    },
         \\  },
-        \\    (inputEl = el("input", { placeholder: "New task...", style: "width: 65%; margin-right: 0.5rem;" })),
-        \\    el("button", { type: "submit" }, "Add Card"),
+        \\    input({ placeholder: "New task...", style: "width: 65%; margin-right: 0.5rem;", ...bindValue(draft) }),
+        \\    button({ type: "submit" }, "Add Card"),
         \\  ),
-        \\  el("div", { class: "cols" }, ...COLS.map((col) =>
-        \\    el("div", { class: "col" },
-        \\      el("h3", {}, col.toUpperCase()),
+        \\  div({ class: "cols" }, ...COLS.map((col) =>
+        \\    div({ class: "col" },
+        \\      h3(col.toUpperCase()),
         \\      each(() => (cards().data ?? []).filter((c) => c.column === col), (c) => c.id, (card) =>
-        \\        el("div", { class: "card" },
-        \\          el("span", {}, () => card().title),
-        \\          el("div", {},
-        \\            col !== "done" ? el("button", { onclick: () => client.mutate(api.cards.move, { id: card().id, column: COLS[COLS.indexOf(col) + 1] }) }, "→") : "",
+        \\        div({ class: "card" },
+        \\          span(() => card().title),
+        \\          div(
+        \\            col !== "done" ? button({ onClick: () => db.cards.move({ id: card().id, column: COLS[COLS.indexOf(col) + 1] }) }, "→") : "",
         \\          ),
         \\        ),
         \\      ),
@@ -630,61 +738,65 @@ fn scaffoldApp(
         \\));
         \\
     else if (std.mem.eql(u8, template, "chat"))
-        \\import { ConcaveClient, el, each, mount } from "/_concave/index.js";
-        \\import { api } from "./_generated/api.js";
+        \\import { ConcaveClient, bindValue, each, mount, signal, tags } from "/_concave/index.js";
+        \\import { createApi } from "./_generated/api.js";
         \\
+        \\const { a, button, div, form, h1, input, p, span } = tags;
         \\const client = new ConcaveClient(window.location.origin);
-        \\const messages = client.query(api.messages.list, { room: "general" });
-        \\let inputEl;
+        \\const db = createApi(client);
+        \\const messages = db.messages.list({ room: "general" });
+        \\const draft = signal("");
         \\
-        \\mount(document.getElementById("app"), () => el("div", {},
-        \\  el("h1", {}, "Concave Live Chat (#general)"),
-        \\  el("p", {}, "Zero npm dependencies. ", el("a", { href: "/_dashboard", target: "_blank" }, "Open Dashboard")),
-        \\  el("div", {},
+        \\mount(document.getElementById("app"), () => div(
+        \\  h1("Concave Live Chat (#general)"),
+        \\  p("Zero npm dependencies. ", a({ href: "/_dashboard", target: "_blank" }, "Open Dashboard")),
+        \\  div(
         \\    each(() => messages().data ?? [], (m) => m.id, (msg) =>
-        \\      el("div", { class: "card" }, el("span", {}, () => `${msg().author}: ${msg().body}`)),
+        \\      div({ class: "card" }, span(() => `${msg().author}: ${msg().body}`)),
         \\    ),
         \\  ),
-        \\  el("form", {
-        \\    onsubmit: async (e) => {
+        \\  form({
+        \\    onSubmit: async (e) => {
         \\      e.preventDefault();
-        \\      const body = inputEl.value.trim();
+        \\      const body = draft().trim();
         \\      if (!body) return;
-        \\      inputEl.value = "";
-        \\      await client.mutate(api.messages.send, { room: "general", author: "You", body });
+        \\      draft.set("");
+        \\      await db.messages.send({ room: "general", author: "You", body });
         \\    },
         \\  },
-        \\    (inputEl = el("input", { placeholder: "Say hi...", style: "width: 70%; margin-right: 0.5rem;" })),
-        \\    el("button", { type: "submit" }, "Send"),
+        \\    input({ placeholder: "Say hi...", style: "width: 70%; margin-right: 0.5rem;", ...bindValue(draft) }),
+        \\    button({ type: "submit" }, "Send"),
         \\  ),
         \\));
         \\
     else
-        \\import { ConcaveClient, el, each, mount } from "/_concave/index.js";
-        \\import { api } from "./_generated/api.js";
+        \\import { ConcaveClient, bindValue, each, mount, signal, tags } from "/_concave/index.js";
+        \\import { createApi } from "./_generated/api.js";
         \\
+        \\const { a, button, div, form, h1, input, p, span } = tags;
         \\const client = new ConcaveClient(window.location.origin);
-        \\const notes = client.query(api.notes.list, {});
-        \\let inputEl;
+        \\const db = createApi(client);
+        \\const notes = db.notes.list();
+        \\const draft = signal("");
         \\
-        \\mount(document.getElementById("app"), () => el("div", {},
-        \\  el("h1", {}, "Concave Live Notes"),
-        \\  el("p", {}, "Zero npm dependencies. ", el("a", { href: "/_dashboard", target: "_blank" }, "Open Dashboard")),
-        \\  el("form", {
-        \\    onsubmit: async (e) => {
+        \\mount(document.getElementById("app"), () => div(
+        \\  h1("Concave Live Notes"),
+        \\  p("Zero npm dependencies. ", a({ href: "/_dashboard", target: "_blank" }, "Open Dashboard")),
+        \\  form({
+        \\    onSubmit: async (e) => {
         \\      e.preventDefault();
-        \\      const text = inputEl.value.trim();
+        \\      const text = draft().trim();
         \\      if (!text) return;
-        \\      inputEl.value = "";
-        \\      await client.mutate(api.notes.add, { text });
+        \\      draft.set("");
+        \\      await db.notes.add({ text });
         \\    },
         \\  },
-        \\    (inputEl = el("input", { placeholder: "Write a note...", style: "width: 70%; margin-right: 0.5rem;" })),
-        \\    el("button", { type: "submit" }, "Add"),
+        \\    input({ placeholder: "Write a note...", style: "width: 70%; margin-right: 0.5rem;", ...bindValue(draft) }),
+        \\    button({ type: "submit" }, "Add"),
         \\  ),
-        \\  el("div", { style: "margin-top: 1rem;" },
+        \\  div({ style: "margin-top: 1rem;" },
         \\    each(() => notes().data ?? [], (n) => n.id, (note) =>
-        \\      el("div", { class: "card" }, el("span", {}, () => note().text)),
+        \\      div({ class: "card" }, span(() => note().text)),
         \\    ),
         \\  ),
         \\));

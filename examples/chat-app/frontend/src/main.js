@@ -5,6 +5,7 @@
 
 import {
   ConcaveClient,
+  bindValue,
   computed,
   each,
   effect,
@@ -13,10 +14,13 @@ import {
   onCleanup,
   show,
   signal,
+  tags,
 } from "/_concave/index.js";
 import { createAnalytics, fromProps } from "/_concave/analytics.js";
 import { createMonitor } from "/_concave/monitor.js";
-import { api } from "./_generated/api.js";
+import { api, createApi } from "./_generated/api.js";
+
+const { article, aside, button, div, form, h1, h2, header, input, main, p, section, span } = tags;
 
 /** @typedef {import("./_generated/dataModel.d.ts").Id<"rooms">} RoomId */
 /** @typedef {import("./_generated/dataModel.d.ts").Id<"messages">} MessageId */
@@ -52,6 +56,7 @@ function makeDevToken(handle) {
 const client = new ConcaveClient(SERVER_URL, {
   authToken: makeDevToken(storedHandle),
 });
+const db = createApi(client);
 const analytics = createAnalytics(client, api.analytics);
 const monitor = createMonitor(client, api.monitor, {
   service: "chat-web",
@@ -61,7 +66,7 @@ const monitor = createMonitor(client, api.monitor, {
 });
 
 // Seed default rooms & feature flags on boot if the database is empty.
-void client.mutate(api.rooms.ensureDefaults, {}).then((rooms) => {
+void db.rooms.ensureDefaults().then((rooms) => {
   if (!activeRoomId() && rooms.length > 0) {
     activeRoomId.set(rooms[0].id);
   }
@@ -106,16 +111,16 @@ effect(() => {
 });
 
 // Reactive queries directly wired to Concave WebSocket `commit_ts` transitions.
-const roomsQuery = client.query(api.rooms.list, {});
-const messagesQuery = client.query(api.messages.list, () => {
+const roomsQuery = db.rooms.list();
+const messagesQuery = db.messages.list(() => {
   const id = activeRoomId();
   return id ? { room_id: id } : null;
 });
-const presenceQuery = client.query(api.presence.listOnline, () => {
+const presenceQuery = db.presence.listOnline(() => {
   const id = activeRoomId();
   return id ? { room_id: id } : null;
 });
-const rateLimitQuery = client.query(api.rate_limit.status, () => {
+const rateLimitQuery = db.rate_limit.status(() => {
   const id = client.identity();
   return id ? { key: id.subject } : null;
 });
@@ -201,16 +206,14 @@ effect(() => {
 
   /** @param {boolean} typing */
   const beat = (typing) => {
-    void client
-      .mutate(api.presence.heartbeat, { room_id: roomId, typing })
-      .catch(() => {});
+    void db.presence.heartbeat({ room_id: roomId, typing }).catch(() => {});
   };
 
   beat(false);
   const timer = setInterval(() => beat(draft().trim().length > 0), 8000);
   onCleanup(() => {
     clearInterval(timer);
-    void client.mutate(api.presence.leave, { room_id: roomId }).catch(() => {});
+    void db.presence.leave({ room_id: roomId }).catch(() => {});
   });
 });
 
@@ -220,9 +223,7 @@ let typingTimeout = null;
 function notifyTyping(isTyping) {
   const roomId = activeRoomId();
   if (!roomId || !client.identity()) return;
-  void client
-    .mutate(api.presence.heartbeat, { room_id: roomId, typing: isTyping })
-    .catch(() => {});
+  void db.presence.heartbeat({ room_id: roomId, typing: isTyping }).catch(() => {});
 }
 
 /** @param {Event} ev */
@@ -240,7 +241,7 @@ async function handleSend(ev) {
     draft.set("");
     previewBusy.set(true);
     try {
-      await client.action(api.messages.fetchPreview, { room_id: roomId, url });
+      await db.messages.fetchPreview({ room_id: roomId, url });
     } catch (err) {
       errorMessage.set(err instanceof Error ? err.message : String(err));
       void monitor.captureException(err, { source: "chat-web", attrs: { action: "preview", url } }).catch(() => {});
@@ -257,27 +258,17 @@ async function handleSend(ev) {
   monitor.addBreadcrumb("chat", `Sent message in ${roomId}`);
 
   try {
-    await client.mutate(
-      api.messages.send,
+    await db.messages.send(
       { room_id: roomId, body: text },
-      {
-        optimisticUpdate: (store) => {
-          const current =
-            store.getQuery(api.messages.list, { room_id: roomId }) ?? [];
-          store.setQuery(api.messages.list, { room_id: roomId }, [
-            ...current,
-            {
-              id: /** @type {MessageId} */ (`optimistic-${Date.now()}`),
-              created_at: Date.now(),
-              room_id: roomId,
-              author_id: authorId,
-              author_name: authorName,
-              body: text,
-              kind: "optimistic",
-            },
-          ]);
-        },
-      },
+      client.optimisticAppend(db.messages.list, { room_id: roomId }, {
+        id: /** @type {MessageId} */ (`optimistic-${Date.now()}`),
+        created_at: Date.now(),
+        room_id: roomId,
+        author_id: authorId,
+        author_name: authorName,
+        body: text,
+        kind: "optimistic",
+      }),
     );
   } catch (err) {
     errorMessage.set(err instanceof Error ? err.message : String(err));
@@ -292,7 +283,7 @@ async function handleCreateRoom(ev) {
   const name = newRoomName().trim();
   if (!name) return;
   try {
-    const id = await client.mutate(api.rooms.create, {
+    const id = await db.rooms.create({
       name,
       topic: newRoomTopic().trim() || "Reactive Concave room",
     });
@@ -705,51 +696,36 @@ function MonitorPanel() {
 }
 
 function AppView() {
-  return el(
-    "div",
+  return div(
     { class: () => `layout ${activeDrawer() !== "none" ? "with-analytics" : ""}` },
-    el(
-      "aside",
+    aside(
       { class: "sidebar" },
-      el(
-        "div",
+      div(
         { class: "brand" },
-        el("h1", null, "Concave"),
-        el(
-          "span",
-          {
-            class: () => `badge ${client.status()}`,
-          },
+        h1("Concave"),
+        span(
+          { class: () => `badge ${client.status()}` },
           () => `${client.status()} · ts:${client.commitTs()}`,
         ),
       ),
-      el(
-        "form",
+      form(
         { class: "identity-box", onSubmit: applyHandle },
-        el("div", { class: "section-title" }, "Identity (ctx.auth!)"),
-        el("input", {
+        div({ class: "section-title" }, "Identity (ctx.auth!)"),
+        input({
           class: "input",
-          value: () => handleSignal(),
           placeholder: "Your handle",
-          onInput: (/** @type {Event} */ e) =>
-            handleSignal.set(/** @type {HTMLInputElement} */ (e.target).value),
+          ...bindValue(handleSignal),
         }),
-        el(
-          "button",
-          { class: "btn secondary", type: "submit" },
-          "Switch Identity",
-        ),
+        button({ class: "btn secondary", type: "submit" }, "Switch Identity"),
       ),
-      el(
-        "div",
+      div(
         { class: "room-list" },
-        el("div", { class: "section-title" }, "Rooms (index-isolated)"),
+        div({ class: "section-title" }, "Rooms (index-isolated)"),
         each(
           rooms,
           (r) => r.id,
           (room) =>
-            el(
-              "button",
+            button(
               {
                 class: () =>
                   `room-btn ${activeRoomId() === room().id ? "active" : ""}`,
@@ -762,55 +738,44 @@ function AppView() {
             ),
         ),
       ),
-      el(
-        "form",
+      form(
         { class: "new-room-form", onSubmit: handleCreateRoom },
-        el("div", { class: "section-title" }, "New Room"),
-        el("input", {
+        div({ class: "section-title" }, "New Room"),
+        input({
           class: "input",
           placeholder: "room-name",
-          value: () => newRoomName(),
-          onInput: (/** @type {Event} */ e) =>
-            newRoomName.set(/** @type {HTMLInputElement} */ (e.target).value),
+          ...bindValue(newRoomName),
         }),
-        el("input", {
+        input({
           class: "input",
           placeholder: "topic (optional)",
-          value: () => newRoomTopic(),
-          onInput: (/** @type {Event} */ e) =>
-            newRoomTopic.set(/** @type {HTMLInputElement} */ (e.target).value),
+          ...bindValue(newRoomTopic),
         }),
-        el("button", { class: "btn", type: "submit" }, "Create Room"),
+        button({ class: "btn", type: "submit" }, "Create Room"),
       ),
     ),
-    el(
-      "main",
+    main(
       { class: "main" },
-      el(
-        "header",
+      header(
         { class: "topbar" },
-        el(
-          "div",
-          null,
-          el("h2", { class: "room-title" }, () => {
+        div(
+          h2({ class: "room-title" }, () => {
             const r = activeRoom();
             return r ? `# ${r.name}` : "Loading rooms...";
           }),
-          el("p", { class: "room-topic" }, () => activeRoom()?.topic ?? ""),
+          p({ class: "room-topic" }, () => activeRoom()?.topic ?? ""),
         ),
-        el(
-          "div",
+        div(
           { class: "topbar-meta" },
-          el("span", { class: "badge" }, () => {
+          span({ class: "badge" }, () => {
             const rl = rateLimitQuery().data;
             return rl ? `quota: ${rl.remaining} msgs left` : "quota: --";
           }),
-          el("span", { class: "badge" }, () => {
+          span({ class: "badge" }, () => {
             const ident = client.identity();
             return ident ? `as ${ident.name ?? ident.subject}` : "unauthenticated";
           }),
-          el(
-            "button",
+          button(
             {
               class: () => `btn secondary toggle-analytics ${showAnalytics() ? "active" : ""}`,
               type: "button",
@@ -819,8 +784,7 @@ function AppView() {
             },
             () => (showAnalytics() ? "Hide Analytics" : "Analytics"),
           ),
-          el(
-            "button",
+          button(
             {
               class: () => `btn secondary toggle-analytics ${showMonitor() ? "active" : ""}`,
               type: "button",
@@ -831,69 +795,59 @@ function AppView() {
           ),
         ),
       ),
-      el(
-        "div",
+      div(
         { class: "presence-bar" },
-        el("span", null, "Online here:"),
+        span("Online here:"),
         each(
           onlineUsers,
           (u) => u.user_id,
           (u) =>
-            el(
-              "span",
+            span(
               { class: "presence-pill" },
-              el("span", { class: "dot" }),
+              span({ class: "dot" }),
               () =>
                 u().typing ? `${u().user_name} (typing...)` : u().user_name,
             ),
         ),
       ),
-      el(
-        "section",
+      section(
         { class: "messages" },
         each(
           messages,
           (m) => m.id,
           (m) =>
-            el(
-              "article",
+            article(
               { class: () => `msg ${m().kind}` },
-              el(
-                "div",
+              div(
                 { class: "msg-head" },
-                el("span", { class: "msg-author" }, () => m().author_name),
-                el("span", { class: "msg-time" }, () =>
+                span({ class: "msg-author" }, () => m().author_name),
+                span({ class: "msg-time" }, () =>
                   m().kind === "optimistic"
                     ? "sending..."
                     : formatTime(m().created_at),
                 ),
               ),
-              el("div", { class: "msg-body" }, () => m().body),
+              div({ class: "msg-body" }, () => m().body),
             ),
         ),
       ),
-      show(errorMessage, (err) => el("div", { class: "error-banner" }, err)),
-      el(
-        "form",
+      show(errorMessage, (err) => div({ class: "error-banner" }, err)),
+      form(
         { class: "composer", onSubmit: handleSend },
-        el("input", {
+        input({
           class: "input",
           placeholder: () =>
             linkPreviewsEnabled()
               ? "Type a message, or `/preview https://example.com` to run an external Action..."
               : "Type a message (/preview disabled by feature flag)...",
-          value: () => draft(),
           disabled: () => previewBusy(),
-          onInput: (/** @type {Event} */ e) => {
-            const val = /** @type {HTMLInputElement} */ (e.target).value;
-            draft.set(val);
+          ...bindValue(draft, (val) => {
             notifyTyping(val.trim().length > 0);
             if (typingTimeout) clearTimeout(typingTimeout);
             typingTimeout = setTimeout(() => notifyTyping(false), 2500);
-          },
+          }),
         }),
-        el(
-          "button",
+        button(
           { class: "btn", type: "submit", disabled: () => previewBusy() },
           () => {
             if (previewBusy()) return "Fetching...";

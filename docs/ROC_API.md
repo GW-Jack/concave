@@ -69,14 +69,14 @@ Roc's type & effect system statically enforces what each function kind can do:
 
 ### Point Reads & Writes
 ```roc
-# Read (QueryCtx or MutationCtx via Ctx.as_reader)
+# Read (works directly on `ctx.db` in both QueryCtx and MutationCtx!)
 maybe_doc = Db.get!(ctx.db, rooms_table, room_id)? # Found(RoomDoc) | NotFound
 
 # Writes (MutationCtx only)
 id = Db.insert!(ctx.db, rooms_table, { name: "general", topic: "Welcome" })?
-_ = Db.patch!(ctx.db, rooms_table, id, { topic: "Updated topic" })?
+_ = Db.patch!(ctx.db, rooms_table, id, { topic: "Updated topic" })?       # Err("NotFound") if missing
 _ = Db.replace!(ctx.db, rooms_table, id, { name: "general", topic: "Replaced" })?
-_ = Db.delete!(ctx.db, rooms_table, id)?
+_ = Db.delete!(ctx.db, rooms_table, id)?                                  # idempotent Ok({})
 ```
 
 ### Indexed Range Queries

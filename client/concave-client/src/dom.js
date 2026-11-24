@@ -87,31 +87,30 @@ function appendChild(parent, child) {
   }
 }
 
+function bindProp(node, key, raw) {
+  if (typeof raw === "function") effect(() => setProp(node, key, raw()));
+  else setProp(node, key, raw);
+}
+
 export function el(tag, props, ...children) {
   const node = document.createElement(tag);
+  let refFn, val;
 
   if (props) {
-    for (const [key, raw] of Object.entries(props)) {
-      if (key === "ref" && typeof raw === "function") {
-        raw(node);
-      } else if (key.startsWith("on") && typeof raw === "function") {
-        const eventName = key.slice(2).toLowerCase();
-        node.addEventListener(eventName, raw);
-        onCleanup(() => node.removeEventListener(eventName, raw));
-      } else if (typeof raw === "function") {
-        effect(() => {
-          setProp(node, key, raw());
-        });
-      } else {
-        setProp(node, key, raw);
-      }
+    for (const [k, raw] of Object.entries(props)) {
+      if (k === "ref" && typeof raw === "function") refFn = raw;
+      else if (k === "value") val = [raw];
+      else if (k.startsWith("on") && typeof raw === "function") {
+        const ev = k.slice(2).toLowerCase();
+        node.addEventListener(ev, raw);
+        onCleanup(() => node.removeEventListener(ev, raw));
+      } else bindProp(node, k, raw);
     }
   }
 
-  for (const child of children) {
-    appendChild(node, child);
-  }
-
+  for (const child of children) appendChild(node, child);
+  if (val) bindProp(node, "value", val[0]);
+  refFn?.(node);
   return node;
 }
 
@@ -194,6 +193,34 @@ export function each(items, keyFn, renderItem) {
 
   return frag;
 }
+
+export const bindValue = (sig, onInput) => ({
+  value: () => sig(),
+  onInput: (e) => {
+    const v = e.target.value;
+    sig.set(v);
+    onInput?.(v, e);
+  },
+});
+
+export const bindChecked = (sig, onChange) => ({
+  checked: () => Boolean(sig()),
+  onChange: (e) => {
+    const v = Boolean(e.target.checked);
+    sig.set(v);
+    onChange?.(v, e);
+  },
+});
+
+export const tags = new Proxy(Object.create(null), {
+  get: (_, tag) =>
+    typeof tag === "string"
+      ? (first, ...rest) =>
+          first !== null && typeof first === "object" && !(first instanceof Node) && !Array.isArray(first)
+            ? el(tag, first, ...rest)
+            : el(tag, null, first, ...rest)
+      : undefined,
+});
 
 export function mount(container, renderRoot) {
   container.innerHTML = "";

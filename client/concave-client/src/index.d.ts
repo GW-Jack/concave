@@ -13,23 +13,33 @@ export {
 
 export {
   ConcaveClient,
+  optimisticAppend,
   type AuthIdentity,
   type ConcaveClientOptions,
   type ConnectionStatus,
   type FunctionKind,
   type FunctionReference,
+  type FunctionReferenceLike,
   type MutateOptions,
   type OptimisticLocalStore,
   type QueryState,
+  type ReloadEvent,
 } from "./client.js";
 
 export {
+  bindChecked,
+  bindValue,
   each,
   el,
   mount,
   show,
+  tags,
+  type CheckedBindingProps,
   type Child,
   type ChildArray,
   type ElementProps,
   type PropValue,
+  type TagHelper,
+  type Tags,
+  type ValueBindingProps,
 } from "./dom.js";

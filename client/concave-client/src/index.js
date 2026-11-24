@@ -8,6 +8,6 @@ export {
   untrack,
 } from "./signals.js";
 
-export { ConcaveClient } from "./client.js";
+export { ConcaveClient, optimisticAppend } from "./client.js";
 
-export { each, el, mount, show } from "./dom.js";
+export { bindChecked, bindValue, each, el, mount, show, tags } from "./dom.js";
