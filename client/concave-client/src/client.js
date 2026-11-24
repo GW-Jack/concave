@@ -238,16 +238,18 @@ export class ConcaveClient {
       }
     });
 
-    ws.addEventListener("close", () => {
+    const onDrop = () => {
       if (this._ws !== ws) return;
       this._ws = null;
+      try { ws.close(); } catch {}
       this._failInFlightOnDisconnect();
-      if (!this._closed) {
-        this._scheduleReconnect();
-      }
-    });
+      if (!this._closed) this._scheduleReconnect();
+    };
 
-    ws.addEventListener("error", () => {});
+    ws.addEventListener("close", onDrop);
+    ws.addEventListener("error", () => {
+      if (ws.readyState !== this._WsCtor.OPEN) onDrop();
+    });
   }
 
   _scheduleReconnect() {

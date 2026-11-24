@@ -262,24 +262,30 @@ App := {
             out.Json.Encodable(enc_err),
         ]
     component_query = |a, namespace, name, args_schema, returns_schema, handler!| {
+        full_name =
+            if !Str.is_empty(namespace) and !Str.starts_with(name, "${namespace}.") {
+                "${namespace}.${name}"
+            } else {
+                name
+            }
         wrapped! : Ctx.QueryCtx, Str => Try(Str, Str)
         wrapped! = |ctx, raw_args| {
             scoped_ctx = Ctx.scope_query(ctx, namespace)
             parsed : args
             parsed = match Json.parse(raw_args) {
                 Ok(v) => v
-                Err(InvalidJson(msg)) => return Err("invalid query args for `${name}`: ${msg}")
+                Err(InvalidJson(msg)) => return Err("invalid query args for `${full_name}`: ${msg}")
             }
             out = handler!(scoped_ctx, parsed)?
             match Json.to_str_try(out) {
                 Ok(s) => Ok(s)
-                Err(_) => Err("failed to encode query result for `${name}`")
+                Err(_) => Err("failed to encode query result for `${full_name}`")
             }
         }
         entry : QueryEntry
         entry = {
             meta: {
-                name,
+                name: full_name,
                 kind: Query,
                 namespace,
                 args_schema,
@@ -415,24 +421,30 @@ App := {
             out.Json.Encodable(enc_err),
         ]
     component_mutation = |a, namespace, name, args_schema, returns_schema, handler!| {
+        full_name =
+            if !Str.is_empty(namespace) and !Str.starts_with(name, "${namespace}.") {
+                "${namespace}.${name}"
+            } else {
+                name
+            }
         wrapped! : Ctx.MutationCtx, Str => Try(Str, Str)
         wrapped! = |ctx, raw_args| {
             scoped_ctx = Ctx.scope_mutation(ctx, namespace)
             parsed : args
             parsed = match Json.parse(raw_args) {
                 Ok(v) => v
-                Err(InvalidJson(msg)) => return Err("invalid mutation args for `${name}`: ${msg}")
+                Err(InvalidJson(msg)) => return Err("invalid mutation args for `${full_name}`: ${msg}")
             }
             out = handler!(scoped_ctx, parsed)?
             match Json.to_str_try(out) {
                 Ok(s) => Ok(s)
-                Err(_) => Err("failed to encode mutation result for `${name}`")
+                Err(_) => Err("failed to encode mutation result for `${full_name}`")
             }
         }
         entry : MutationEntry
         entry = {
             meta: {
-                name,
+                name: full_name,
                 kind: Mutation,
                 namespace,
                 args_schema,

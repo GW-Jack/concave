@@ -284,6 +284,57 @@ test("createApi, optimisticAppend, and live reload frames", async () => {
   client.close();
 });
 
+test("ConcaveClient reconnects even if WebSocket emits error without close during CONNECTING", async () => {
+  const sockets = [];
+  class ErrorOnlyConnectSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
+
+    constructor(url) {
+      this.url = url;
+      this.readyState = ErrorOnlyConnectSocket.CONNECTING;
+      this.listeners = new Map();
+      this.closed = false;
+      sockets.push(this);
+    }
+    addEventListener(type, fn) {
+      if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+      this.listeners.get(type).add(fn);
+    }
+    send() {}
+    close() {
+      this.closed = true;
+      this.readyState = ErrorOnlyConnectSocket.CLOSED;
+    }
+    emit(type, ev = {}) {
+      for (const fn of this.listeners.get(type) ?? []) fn(ev);
+    }
+  }
+
+  const client = new ConcaveClient("http://127.0.0.1:3210", {
+    webSocketImpl: ErrorOnlyConnectSocket,
+  });
+  assert.equal(sockets.length, 1);
+
+  // Simulate Node 22 undici WebSocket: emits error in CONNECTING and never emits close
+  sockets[0].emit("error", { message: "ECONNREFUSED" });
+  assert.equal(client.status(), "reconnecting");
+  assert.equal(sockets[0].closed, true);
+
+  // Wait for first 200ms backoff reconnect attempt
+  await new Promise((r) => setTimeout(r, 280));
+  assert.equal(sockets.length, 2, "client must attempt reconnect after error-without-close");
+
+  // Second socket succeeds
+  sockets[1].readyState = ErrorOnlyConnectSocket.OPEN;
+  sockets[1].emit("open");
+  assert.equal(client.status(), "connected");
+
+  client.close();
+});
+
 test("dom helpers: tags proxy, bindValue, and bindChecked", () => {
   class MiniNode {
     constructor(nodeType) {

@@ -139,10 +139,23 @@ export function createAnalytics(client, analyticsApi, options = {}) {
     const previousAnon = opts.anonId ?? (distinctId !== newDistinctId ? distinctId : anonId);
     distinctId = newDistinctId;
     storage?.setItem(DISTINCT_KEY, distinctId);
+    // Support both `{ set: { ... }, setOnce: { ... } }` and shorthand flat `{ name: "Alice" }` objects.
+    let setInput = opts.set;
+    if (!setInput && opts && typeof opts === "object") {
+      /** @type {Record<string, unknown>} */
+      const flat = {};
+      let hasFlat = false;
+      for (const [k, v] of Object.entries(opts)) {
+        if (k === "set" || k === "setOnce" || k === "anonId") continue;
+        flat[k] = v;
+        hasFlat = true;
+      }
+      if (hasFlat) setInput = flat;
+    }
     return await client.mutate(analyticsApi.identify, {
       distinct_id: newDistinctId,
       anon_id: previousAnon === newDistinctId ? "" : previousAnon,
-      set: toProps(opts.set),
+      set: toProps(setInput),
       set_once: toProps(opts.setOnce),
     });
   }
@@ -380,21 +393,23 @@ export function createAnalytics(client, analyticsApi, options = {}) {
    * @param {boolean} [fallback]
    */
   function isEnabled(evals, key, fallback = false) {
-    if (!evals) return fallback;
-    const match = evals.find((f) => f.key === key);
+    const list = Array.isArray(evals) ? evals : evals?.data;
+    if (!Array.isArray(list)) return fallback;
+    const match = list.find((f) => f.key === key);
     return match ? match.enabled : fallback;
   }
 
   /**
    * Helper to read a flag's variant string from a `subscribeFlags()` query state.
    *
-   * @param {Array<{ key: string, enabled: boolean, variant: string }> | undefined} evals
+   * @param {Array<{ key: string, enabled: boolean, variant: string }> | { data?: Array<{ key: string, enabled: boolean, variant: string }> } | undefined} evals
    * @param {string} key
    * @param {string} [fallback]
    */
   function getVariant(evals, key, fallback = "") {
-    if (!evals) return fallback;
-    const match = evals.find((f) => f.key === key);
+    const list = Array.isArray(evals) ? evals : evals?.data;
+    if (!Array.isArray(list)) return fallback;
+    const match = list.find((f) => f.key === key);
     return match && match.enabled ? match.variant : fallback;
   }
 

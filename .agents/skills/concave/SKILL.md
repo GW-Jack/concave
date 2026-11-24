@@ -377,5 +377,128 @@ mount(document.getElementById("app"), () =>
 - WebSocket sync & RPC: `ws(s)://<host>/ws` (binary default via `?proto=bin`, or JSON text frames). Live reload pushes `{"type":"reload","reason":"css" | "static"}`.
 - HTTP RPC: `POST /api/query/<name>`, `POST /api/mutation/<name>`, `POST /api/action/<name>` with JSON body and optional `Authorization: Bearer <token>` header; responds `{"ok":true,"value":...}` or `{"ok":false,"error":"..."}`.
 - Blob storage: `POST`/`PUT` bytes to signed `/_storage/upload/<token>` -> `{"storage_id":"<id>"}`; `GET /_storage/<id>` downloads bytes.
-- Health / readiness: `GET /health`, `GET /ready`.
+- Health / readiness / operator telemetry: `GET /health`, `GET /ready`, `GET /_internal/status`, `GET /_internal/metrics`.
 - Embedded SDK assets: `/_concave/index.js`, `/_concave/analytics.js`, `/_concave/monitor.js`.
+
+---
+
+## 4. Built-in Composable Components & Custom Components
+
+Concave ships four zero-dependency pure-Roc component packages (each gets host-enforced table namespace isolation while participating in your app's exact same ACID transactions):
+
+```roc
+app [concave_app] {
+    pf: platform "<relative>/platform/main.roc",
+    sdk: "<relative>/packages/concave-sdk/main.roc",
+    presence: "<relative>/packages/presence/main.roc",
+    ratelimit: "<relative>/packages/rate-limiter/main.roc",
+    analytics: "<relative>/packages/analytics/main.roc",
+    monitor: "<relative>/packages/monitor/main.roc",
+}
+```
+
+### Mounting & Attaching
+```roc
+import presence.Presence
+import ratelimit.RateLimiter
+import analytics.Analytics
+import analytics.Props
+import monitor.Monitor
+import monitor.Attrs
+
+doc_presence = Presence.mount("presence", 30000)         # (namespace, ttl_ms)
+save_limiter = RateLimiter.mount("rate_limit", 10, 60000) # (namespace, max_requests, window_ms)
+app_analytics = Analytics.mount("analytics")
+app_monitor = Monitor.mount("monitor")
+
+concave_app = ||
+    App.new("my-app")
+    |> Presence.attach(doc_presence)
+    |> RateLimiter.attach(save_limiter)
+    |> Analytics.attach(app_analytics)
+    |> Monitor.attach(app_monitor) # or Monitor.attach_with_cron(app_monitor, 30000, 3600000)
+```
+
+### Server-Side Transactional Helpers (Inside Your Mutations)
+- **RateLimiter**: `_ = RateLimiter.enforce!(save_limiter, ctx, user.subject)?` (returns `Err("Rate limit exceeded")` and rolls back the enclosing mutation when quota is exhausted). Exposes query `<ns>.status` (`{ key }`).
+- **Presence**: Exposes `<ns>.heartbeat` (`{ room_id, typing }`), `<ns>.leave` (`{ room_id }`), and `<ns>.listOnline` (`{ room_id }`).
+- **Analytics**:
+  - `Analytics.is_flag_enabled!(app_analytics, Ctx.as_query_ctx(ctx), "flag-key", user.subject)?`
+  - `Analytics.track_event!(app_analytics, ctx, user.subject, "event_name", [Props.prop("k", "v")])?`
+  - Exposes `<ns>.capture`, `<ns>.identify`, `<ns>.upsertFlag`, `<ns>.listFlags`, `<ns>.evaluateAllFlags`, `<ns>.summary`, `<ns>.recentEvents`, `<ns>.trends`, `<ns>.funnel`, `<ns>.retention`.
+  - Embedded browser/Node client at `/_concave/analytics.js`:
+    ```js
+    import { createAnalytics } from "/_concave/analytics.js";
+    const posthog = createAnalytics(client, api.analytics);
+    await posthog.identify("alice", { set: { name: "Alice" }, setOnce: { first_seen: "web" } });
+    await posthog.capture("doc_saved", { doc_id });
+    const flags = posthog.subscribeFlags(); // or subscribeFlags({}, () => distinctId)
+    const canExport = posthog.isEnabled(flags().data, "export-markdown", true); // also accepts flags()
+    const summary = posthog.subscribeSummary({ top_n: 8 });
+    ```
+- **Monitor**:
+  - `Monitor.log_info!(app_monitor, ctx, "service", "message", [Attrs.attr("k", "v")])?` *(5 args — no `trace_id`; use `Monitor.record_span!` for traced spans)*
+  - `Monitor.record_metric!(app_monitor, ctx, "metric_name", "gauge", 42.0, "service", [])?`
+  - Exposes `<ns>.captureError`, `<ns>.log`, `<ns>.recordMetric`, `<ns>.overview`, `<ns>.listIssues`, `<ns>.recentLogs`, `<ns>.searchLogs`, `<ns>.metricSeries`, `<ns>.upsertAlertRule`, `<ns>.evaluateAlerts`.
+  - Embedded browser/Node client at `/_concave/monitor.js`:
+    ```js
+    import { createMonitor } from "/_concave/monitor.js";
+    const monitor = createMonitor(client, api.monitor, { service: "web", release: "1.0.0", captureGlobalErrors: true });
+    monitor.addBreadcrumb("ui", "Clicked save");
+    await monitor.captureException(err, { attrs: { doc_id } });
+    const overview = monitor.subscribeOverview({ window_ms: 3600000, top_n: 5 });
+    const logs = monitor.subscribeLogs({ service: "web", limit: 20 });
+    ```
+
+### Writing Custom Components
+Use a headerless nominal type module (`backend/AuditLog.roc`). Note that `app` is a **reserved keyword** in Roc `0.1.0_RC1` (name the `App` parameter `application` or `a`). `App.component_query` and `App.component_mutation` automatically scope `ctx` to `ns` AND auto-prefix `name` with `"${ns}."` when not already prefixed; use `Table.doc_schema_scoped(tbl, ns)` so generated `api.d.ts` uses `Id<"ns::table">`:
+
+```roc
+import sdk.App
+import sdk.Component
+import sdk.Ctx
+import sdk.Db
+import sdk.Key
+import sdk.Schema
+import sdk.Table
+
+AuditLog :: [AuditLog].{
+    EntryDoc : { id : Str, created_at : I64, doc_id : Str, actor : Str, action : Str }
+    Mount : { namespace : Str, spec : Component.ComponentSpec }
+
+    entries_table : Table(EntryDoc)
+    entries_table =
+        Table.define("entries", Schema.record([
+            Schema.field("doc_id", Schema.str),
+            Schema.field("actor", Schema.str),
+            Schema.field("action", Schema.str),
+        ]))
+        |> Table.with_index("by_doc", ["doc_id"])
+
+    by_doc : Table.Index(EntryDoc)
+    by_doc = Table.index_ref(entries_table, "by_doc")
+
+    mount : Str -> Mount
+    mount = |namespace| { namespace, spec: Component.define(namespace, "audit-log", [Table.spec(entries_table)]) }
+
+    # Transactional helper callable inside any app mutation (same ACID tx!)
+    record! : Mount, Ctx.MutationCtx, Str, Str, Str => Try(Str, Str)
+    record! = |m, ctx, doc_id, actor, action| {
+        scoped = Ctx.scope_mutation(ctx, m.namespace)
+        Db.insert!(scoped.db, entries_table, { doc_id, actor, action })
+    }
+
+    attach : App, Mount -> App
+    attach = |application, m|
+        application
+        |> App.component(m.spec)
+        |> App.component_query(
+            m.namespace,
+            "byDoc", # auto-registered as `<namespace>.byDoc` with `ctx` already scoped
+            Schema.record([Schema.field("doc_id", Schema.str)]),
+            Schema.list(Table.doc_schema_scoped(entries_table, m.namespace)),
+            |ctx, args| Db.from_index(by_doc) |> Db.eq([Key.str(args.doc_id)]) |> Db.asc() |> Db.collect!(ctx.db),
+        )
+}
+```
+

@@ -376,7 +376,24 @@ fn computeRocFingerprint(allocator: Allocator, io: std.Io, dir_path: []const u8)
     return h.final();
 }
 
+var g_dev_stop: std.atomic.Value(bool) = .init(false);
+
+fn handleDevSignal(_: std.posix.SIG) callconv(.c) void {
+    g_dev_stop.store(true, .release);
+}
+
+fn installDevSignalHandlers() void {
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = &handleDevSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+}
+
 fn runDevLoop(allocator: Allocator, io: std.Io, opts: DevOptions) !void {
+    installDevSignalHandlers();
     const bin = try defaultDevBin(allocator, opts.entry);
     defer allocator.free(bin);
     const watch_dir = std.fs.path.dirname(opts.entry) orelse ".";
@@ -386,7 +403,7 @@ fn runDevLoop(allocator: Allocator, io: std.Io, opts: DevOptions) !void {
 
     var last_fp: u64 = 0;
     var attempted = false;
-    while (true) {
+    while (!g_dev_stop.load(.acquire)) {
         const fp = computeRocFingerprint(allocator, io, watch_dir);
         if (!attempted or fp != last_fp) {
             attempted = true;
@@ -395,14 +412,17 @@ fn runDevLoop(allocator: Allocator, io: std.Io, opts: DevOptions) !void {
                 c.kill(io);
                 child = null;
             }
+            if (g_dev_stop.load(.acquire)) break;
             std.debug.print("[concave dev] building {s}...\n", .{opts.entry});
             if (buildRocApp(allocator, io, opts.entry, bin, opts.opt)) |_| {
+                if (g_dev_stop.load(.acquire)) break;
                 if (introspectBinary(allocator, io, bin)) |mf| {
                     var manifest = mf;
                     defer manifest.deinit();
                     codegen_mod.writeGeneratedFiles(allocator, io, &manifest, opts.out_dir) catch |err| {
                         std.debug.print("[concave dev] codegen error: {s}\n", .{@errorName(err)});
                     };
+                    if (g_dev_stop.load(.acquire)) break;
                     std.debug.print(
                         "[concave dev] codegen updated ({s}) — starting server on http://{s}:{s}\n",
                         .{ opts.out_dir, opts.host, opts.port },
@@ -418,7 +438,10 @@ fn runDevLoop(allocator: Allocator, io: std.Io, opts: DevOptions) !void {
                 std.debug.print("[concave dev] build failed ({s}) — watching for fixes...\n", .{@errorName(err)});
             }
         }
-        io.sleep(.fromMilliseconds(400), .awake) catch break;
+        var ticks: usize = 0;
+        while (ticks < 8 and !g_dev_stop.load(.acquire)) : (ticks += 1) {
+            io.sleep(.fromMilliseconds(50), .awake) catch break;
+        }
     }
 }
 
