@@ -89,7 +89,14 @@ test("end-to-end native Roc platform: WS reactivity, index-range isolation, comp
       "--static-dir",
       path.join(ROOT, "examples/chat-app/frontend"),
     ],
-    { stdio: ["ignore", "pipe", "pipe"] },
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        CONCAVE_ALLOW_DEV_TOKENS: "true",
+        CONCAVE_ALLOW_PRIVATE_HTTP: "true",
+      },
+    },
   );
   let stderrLog = "";
   serverProc.stderr.on("data", (d) => {
@@ -145,8 +152,8 @@ test("end-to-end native Roc platform: WS reactivity, index-range isolation, comp
   const apiJs = await apiJsResp.text();
   assert.ok(apiJs.includes("export const api ="));
 
-  // 4. Connect two real ConcaveClient WebSocket sessions (Alice in #general, Bob in #roc-lang).
-  const alice = new ConcaveClient(serverUrl, { authToken: "dev:alice:Alice" });
+  // 4. Connect two real ConcaveClient WebSocket sessions (Alice [admin] in #general, Bob in #roc-lang).
+  const alice = new ConcaveClient(serverUrl, { authToken: "dev:alice:Alice:admin" });
   const bob = new ConcaveClient(serverUrl, { authToken: "dev:bob:Bob" });
   const anon = new ConcaveClient(serverUrl);
   t.after(() => {
@@ -207,10 +214,23 @@ test("end-to-end native Roc platform: WS reactivity, index-range isolation, comp
   assert.equal(aliceFlags().data.find((f) => f.key === "link-previews")?.enabled, true);
   assert.ok(["control", "rocket"].includes(aliceFlags().data.find((f) => f.key === "composer-cta")?.variant));
 
-  // 5. Verify auth enforcement: unauthenticated `messages.send` must fail.
+  // 5. Verify auth & RBAC enforcement: unauthenticated `messages.send` must fail,
+  //    and non-admin Bob must be rejected from admin Analytics/Monitor endpoints.
   await assert.rejects(
     () => anon.mutate(api.messages.send, { room_id: generalRoom.id, body: "nope" }),
     /Unauthenticated/,
+  );
+  await assert.rejects(
+    () =>
+      bob.mutate(api.analytics.upsertFlag, {
+        key: "unauthorized-flag",
+        name: "Should fail",
+        active: true,
+        rollout_pct: 100,
+        filters: [],
+        variants: [],
+      }),
+    /Forbidden/,
   );
 
   // 6. Send a message in #general -> Alice's reactive query + rate_limit component update;

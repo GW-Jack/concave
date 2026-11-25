@@ -12,3 +12,11 @@ examples/*/frontend/src/_generated/
 *.db-wal
 *.db-shm
 .DS_Store
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+.vscode/
+.idea/

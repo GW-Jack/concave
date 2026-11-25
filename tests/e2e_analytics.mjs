@@ -93,7 +93,10 @@ test("end-to-end PostHog-style Analytics component: capture, identify/alias, fla
   const serverProc = spawn(
     binPath,
     ["--serve", "--host", "127.0.0.1", "--port", String(port), "--db", dbPath],
-    { stdio: ["ignore", "pipe", "pipe"] },
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, CONCAVE_ALLOW_DEV_TOKENS: "true" },
+    },
   );
   let stderrLog = "";
   serverProc.stderr.on("data", (d) => {
@@ -108,15 +111,18 @@ test("end-to-end PostHog-style Analytics component: capture, identify/alias, fla
 
   await waitForHealth(serverUrl);
 
-  // 4. Connect authenticated and anonymous ConcaveClient sessions.
-  const aliceClient = new ConcaveClient(serverUrl, { authToken: "dev:alice:Alice" });
+  // 4. Connect admin, non-admin, and anonymous ConcaveClient sessions.
+  const aliceClient = new ConcaveClient(serverUrl, { authToken: "dev:alice:Alice:admin" });
+  const bobClient = new ConcaveClient(serverUrl, { authToken: "dev:bob:Bob" });
   const anonClient = new ConcaveClient(serverUrl);
   t.after(() => {
     aliceClient.close();
+    bobClient.close();
     anonClient.close();
   });
 
   await waitForCondition(() => aliceClient.status() === "connected", 5000, "alice connected");
+  await waitForCondition(() => bobClient.status() === "connected", 5000, "bob connected");
   await waitForCondition(() => anonClient.status() === "connected", 5000, "anon connected");
 
   const ph = createAnalytics(aliceClient, api.analytics, {
@@ -257,11 +263,15 @@ test("end-to-end PostHog-style Analytics component: capture, identify/alias, fla
   retentionQ.dispose();
 
   // 7. Verify surgical ReadSet reactivity:
-  //    Subscribe anonClient strictly to `recentEvents(event: "rare_event")`.
-  //    Capturing `$pageview` updates `trendsQ` immediately, while `anonClient` commitTs does NOT advance!
-  const rareSub = anonClient.query(api.analytics.recentEvents, { event: "rare_event", limit: 10 });
+  //    Subscribe a second admin client strictly to `recentEvents(event: "rare_event")`.
+  //    Capturing `$pageview` updates `trendsQ` immediately, while `observerClient` commitTs does NOT advance!
+  const observerClient = new ConcaveClient(serverUrl, { authToken: "dev:observer:Obs:admin" });
+  t.after(() => observerClient.close());
+  await waitForCondition(() => observerClient.status() === "connected", 5000, "observer connected");
+
+  const rareSub = observerClient.query(api.analytics.recentEvents, { event: "rare_event", limit: 10 });
   await waitForCondition(() => rareSub().status === "ready", 5000, "rareSub ready");
-  const anonTsBefore = anonClient.commitTs();
+  const obsTsBefore = observerClient.commitTs();
 
   await ph.capture("$pageview", { path: "/pricing" }, { timestampMs: 1600 });
   await waitForCondition(
@@ -271,13 +281,27 @@ test("end-to-end PostHog-style Analytics component: capture, identify/alias, fla
   );
   await new Promise((r) => setTimeout(r, 150));
   assert.equal(
-    anonClient.commitTs(),
-    anonTsBefore,
+    observerClient.commitTs(),
+    obsTsBefore,
     "Subscriber watching `rare_event` must not be invalidated by `$pageview` capture",
   );
   rareSub.dispose();
   trendsQ.dispose();
   summaryQ.dispose();
+
+  // Verify unauthenticated & non-admin callers cannot read admin BI endpoints or alias another user.
+  await assert.rejects(
+    () => anonClient.queryOnce(api.analytics.summary, { from_ms: 0, to_ms: 200000, top_n: 5 }),
+    /Unauthenticated/,
+  );
+  await assert.rejects(
+    () => bobClient.queryOnce(api.analytics.listPersons, { limit: 10 }),
+    /Forbidden/,
+  );
+  await assert.rejects(
+    () => bobClient.mutate(api.analytics.alias, { alias_id: "alice", distinct_id: "bob" }),
+    /Forbidden/,
+  );
 
   // 8. Feature Flags & Multivariate Experiments (with live WebSocket kill-switch updates!).
   await aliceClient.mutate(api.analytics.upsertFlag, {

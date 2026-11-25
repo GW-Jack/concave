@@ -199,6 +199,8 @@ test("Wave 3 Real PostgreSQL 16 (SCRAM-SHA-256) + PgBouncer (transaction mode): 
     DATABASE_URL: pgbUrl,
     CONCAVE_DEPLOYMENT_ID: "cloud-run-cluster-test",
     CONCAVE_COMMIT_POLL_MS: "50",
+    CONCAVE_PG_COMMIT_LOG_KEEP: "5",
+    CONCAVE_SCHEDULER_POLL_MS: "10",
   };
   const rep1 = spawn(binPath, ["--serve", "--host", "127.0.0.1", "--port", "13241"], {
     env: repEnv,
@@ -258,5 +260,92 @@ test("Wave 3 Real PostgreSQL 16 (SCRAM-SHA-256) + PgBouncer (transaction mode): 
       ),
     5000,
     `bob on replica 2 receives live commit_log transition (${repErr})`,
+  );
+
+  const psqlScalar = (sql) =>
+    execFileSync(
+      "docker",
+      ["exec", pgName, "psql", "-U", "concave", "-d", "concave", "-tAc", sql],
+      { encoding: "utf8" },
+    ).trim();
+
+  // 6. Verify `--backfill-indexes` CLI flag rebuilds secondary indexes cleanly against live PostgreSQL 16!
+  psqlScalar("DELETE FROM index_entries WHERE deployment_id = 'cloud-run-cluster-test'");
+  assert.equal(
+    Number(psqlScalar("SELECT COUNT(*) FROM index_entries WHERE deployment_id = 'cloud-run-cluster-test'")),
+    0,
+    "index_entries should be cleared prior to backfill",
+  );
+
+  const backfill = spawnSync(binPath, ["--backfill-indexes"], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      DATABASE_URL: directUrl,
+      CONCAVE_DEPLOYMENT_ID: "cloud-run-cluster-test",
+    },
+    encoding: "utf8",
+  });
+  assert.equal(
+    backfill.status,
+    0,
+    `--backfill-indexes failed:\nstdout: ${backfill.stdout}\nstderr: ${backfill.stderr}`,
+  );
+  const backfillOut = backfill.stdout + backfill.stderr;
+  const backfillMatch = backfillOut.match(
+    /Backfilled secondary indexes for (\d+) document\(s\) in deployment `cloud-run-cluster-test`/,
+  );
+  assert.ok(backfillMatch, `unexpected --backfill-indexes output: ${backfillOut}`);
+  assert.ok(Number(backfillMatch[1]) >= 2, `expected >= 2 backfilled docs, got ${backfillMatch[1]}`);
+
+  const rebuiltIdxCount = Number(
+    psqlScalar("SELECT COUNT(*) FROM index_entries WHERE deployment_id = 'cloud-run-cluster-test'"),
+  );
+  assert.ok(rebuiltIdxCount > 0, "index_entries must be repopulated after --backfill-indexes");
+
+  // Confirm live secondary-index query still returns Alice's message after backfill!
+  const listResp = await fetch("http://127.0.0.1:13241/api/query/messages.list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer dev:alice:Alice" },
+    body: JSON.stringify({ room_id: general.id }),
+  });
+  assert.equal(listResp.status, 200);
+  const listJson = await listResp.json();
+  assert.equal(listJson.ok, true);
+  assert.ok(
+    listJson.value.some((m) => m.body === "Hello across Cloud Run replicas via pure Zig PG Wire v3 + PgBouncer!"),
+    "secondary-index query must return existing message after --backfill-indexes",
+  );
+
+  // 7. Verify `CONCAVE_PG_COMMIT_LOG_KEEP=5` prunes older `commit_log` rows while preserving recent commits & live reactivity!
+  for (let i = 1; i <= 10; i++) {
+    await alice.mutate(api.messages.send, {
+      room_id: general.id,
+      body: `Commit log prune batch message #${i}`,
+    });
+  }
+
+  const prunedStats = await waitFor(() => {
+    const row = psqlScalar(
+      "SELECT COUNT(*), COALESCE(MIN(commit_ts), 0), COALESCE(MAX(commit_ts), 0) FROM commit_log WHERE deployment_id = 'cloud-run-cluster-test'",
+    );
+    const [cnt, minTs, maxTs] = row.split("|").map(Number);
+    if (cnt >= 1 && cnt <= 5 && minTs > 1 && maxTs >= 10) {
+      return { cnt, minTs, maxTs };
+    }
+    return null;
+  }, 15000, `commit_log pruning to <= 5 rows (${repErr})`);
+  assert.ok(prunedStats.cnt >= 1 && prunedStats.cnt <= 5);
+  assert.ok(prunedStats.minTs > 1, `expected older commits to be pruned (min_ts=${prunedStats.minTs})`);
+
+  // Verify live cross-replica reactivity still works seamlessly after commit_log pruning!
+  await alice.mutate(api.messages.send, {
+    room_id: general.id,
+    body: "Post-prune live reactivity check!",
+  });
+  await waitFor(
+    () => bobMsgs().data?.some((m) => m.body === "Post-prune live reactivity check!"),
+    5000,
+    `bob on replica 2 receives post-prune live commit_log transition (${repErr})`,
   );
 });

@@ -30,15 +30,17 @@ Attrs := [Attrs].{
             NotFound => default_val
         }
 
-    ## Upsert a single key/value pair (replacing existing key if present).
+    ## Upsert a single key/value pair (replacing existing key and deduplicating any repeats).
     upsert : List(Attr), Str, Str -> List(Attr)
     upsert = |attrs, key, value| {
         var $out = []
         var $replaced = False
         for a in attrs {
             if a.key == key {
-                $out = List.append($out, { key, value })
-                $replaced = True
+                if !$replaced {
+                    $out = List.append($out, { key, value })
+                    $replaced = True
+                }
             } else {
                 $out = List.append($out, a)
             }

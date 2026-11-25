@@ -10,7 +10,7 @@
 
 Building a modern web app usually means wiring together a REST/GraphQL server, an ORM, WebSockets, client cache invalidation, a background job queue, a webhook handler, file uploads, an analytics SDK, an error tracker, a bundler, and 400 MB of `node_modules` — all before you build your actual product.
 
-**Concave replaces that whole pile with one [Roc](https://www.roc-lang.org/) backend, a single ~2 MB native binary, a 5.8 KB gzipped browser runtime, and literally zero external dependencies.**
+**Concave replaces that whole pile with one [Roc](https://www.roc-lang.org/) backend, a single ~2 MB native binary, a ~10 KB gzipped browser runtime, and literally zero external dependencies.**
 
 Write ordinary, type-safe Roc functions. Concave keeps your database and every connected browser tab in sync automatically over binary WebSockets, validates document schemas at runtime, serves bundled/minified/pre-gzipped assets over HTTP/1.1 Keep-Alive and HTTP/2 (`h2c`), runs on your laptop with zero setup, and scales out on Postgres when you're ready to launch.
 
@@ -77,9 +77,9 @@ When a message is sent from another tab, a webhook, or a cron job:
 ## What you get to delete
 
 - **No manual WebSockets or cache invalidation.** Queries are live subscriptions by default, with optimistic updates that reconcile or roll back automatically.
-- **No `node_modules` or frontend build pipeline.** The entire browser runtime — binary WebSocket sync, optimistic updates, glitch-free signals, and surgical DOM helpers — ships embedded at `/_concave/index.js` in **1 single request: 5.8 KB gzipped** with pre-compressed gzip + ETag caching and zero dependencies.
+- **No `node_modules` or frontend build pipeline.** The entire browser runtime — binary WebSocket sync, proactive JWT refresh, optimistic updates, glitch-free signals, surgical DOM helpers, and a reactive SPA router — ships embedded at `/_concave/index.js` in **1 single request (~10 KB gzipped)** with pre-compressed gzip + ETag caching and zero dependencies.
 - **No Redis or separate worker fleet.** Delayed jobs (`ctx.scheduler`) and recurring crons (`App.cron`) live right inside your app's transactions.
-- **No bolted-on SaaS sprawl on day one.** Drop-in pure-Roc components give you live **Presence**, **Rate Limiting**, **PostHog-style Analytics & Feature Flags**, and **Sentry-style Error & Log Monitoring** — all sharing your database and your transactions.
+- **No bolted-on SaaS sprawl on day one.** Drop-in pure-Roc components give you **Auth v2** (Ed25519 JWKS, Argon2id passwords, rotating refresh tokens, Email OTP, Magic Links, RFC 6238 TOTP MFA, OAuth2 + PKCE with single-use exchange codes), **Resumable Batched Migrations**, **Transactional Email**, **Durable Signed Webhooks**, live **Presence**, **Rate Limiting**, **PostHog-style Analytics & Feature Flags**, and **Sentry-style Error & Log Monitoring** — all sharing your database and your transactions.
 - **No local Docker needed to code.** Develop against a single local file with instant hot reloads and a built-in Dev Dashboard at `/_dashboard`. When it's time to deploy, set `DATABASE_URL` to Postgres (Neon, PlanetScale, Cloud SQL, or self-hosted) and ship a single ~7.6 MB Docker image.
 - **No runtime surprises.** Roc's compiler prevents queries from mutating data or making stray network calls, and Concave's core engine is backed by machine-checked formal proofs (Lean 4, Maude, Z3) and live Postgres testing.
 
@@ -110,13 +110,13 @@ Open **http://127.0.0.1:3210** in two browser tabs side by side:
 2. Type `/preview https://example.com` to trigger an external HTTP Action that fetches metadata and writes back into the room.
 3. Visit **http://127.0.0.1:3210/_dashboard** to inspect every table, run any query or mutation, open live subscriptions, and watch scheduled jobs in real time.
 
-### Spin up your own app (3 starter templates)
+### Spin up your own app (4 starter templates)
 
-Choose `--template=minimal`, `--template=chat`, or `--template=kanban`:
+Choose `--template=minimal`, `--template=chat`, `--template=kanban`, or `--template=auth`:
 
 ```sh
 make host
-./zig-out/bin/concave init my-app --template=kanban \
+./zig-out/bin/concave init my-app --template=auth \
   --platform ../../platform/main.roc \
   --sdk ../../packages/concave-sdk/main.roc
 ./zig-out/bin/concave dev \
@@ -126,6 +126,11 @@ make host
 ```
 
 Save any `.roc` file and Concave rebuilds, regenerates your typed client API, and reloads automatically.
+
+Other built-in CLI operations:
+- `concave secrets set|list|delete` — Manage offline XChaCha20-Poly1305 encrypted local dev vault secrets (`CONCAVE_SECRETS_VAULT`); production reads Google Cloud Secret Manager (`CONCAVE_GCP_PROJECT`) or mounted secrets (`CONCAVE_SECRETS_DIR`).
+- `concave backup --db <wal> --out <file>` / `concave restore --in <file> --db <wal>` — Atomic, compacted, checksum-verified `WalStore` backups and restores.
+- `./my-server --backfill-indexes` — Backfill newly added secondary indexes in PostgreSQL before serving traffic.
 
 ### Deploy in 1 minute (Fly.io or Cloud Run)
 
@@ -146,13 +151,13 @@ Save any `.roc` file and Concave rebuilds, regenerates your typed client API, an
 
 | Built right in | Why it's nice |
 | --- | --- |
-| **Live Queries & Optimistic UI** | Instant local feedback with consistent, glitch-free live updates across every tab and server replica — all in a **5.8 KB gzipped** zero-dependency browser bundle. |
-| **Fast Built-in Transport** | Binary WebSockets (`/ws?proto=bin`, opcode `0x02`) + JSON fallback for sub-millisecond multiplexed RPCs & live sync, plus HTTP/1.1 Keep-Alive, HTTP/2 (`h2c`), WAL group commit, automatic gzip, and `ETag`/`304` caching on the same port. |
+| **Live Queries, Optimistic UI & SPA Router** | Instant local feedback, proactive JWT refresh, reactive History API routing, and glitch-free live updates across every tab and server replica — all in a **~10 KB gzipped** zero-dependency browser bundle. |
+| **Fast Built-in Transport & Edge Hardening** | Binary WebSockets (`/ws?proto=bin`, opcode `0x02`) + JSON fallback, HTTP/1.1 Keep-Alive, HTTP/2 (`h2c`), WAL group commit, automatic gzip, `ETag`/`304`, and per-IP token-bucket rate limiting (`CONCAVE_RATE_LIMIT_RPS`, `CONCAVE_RATE_LIMIT_BURST`, `CONCAVE_TRUST_PROXY`). |
 | **Built-in Dev Dashboard (`/_dashboard`)** | Browse tables, invoke functions, stream live subscriptions, test webhooks, and monitor jobs without installing a separate tool. |
-| **Jobs, Crons, Webhooks & File Uploads** | Transactional `ctx.scheduler`, `App.cron`, custom `App.http_route` webhooks, and signed file uploads (`ctx.storage`, local or S3/R2/GCS). |
-| **Search & Pagination** | Reactive `Db.search!` and cursor-based `Db.paginate!` that update live as matching documents arrive. |
-| **Drop-in Auth** | Works out of the box with Clerk, Auth0, Supabase, Google, or custom JWTs (HS256, RS256, EdDSA, ES256 + live JWKS rotation), plus zero-config dev tokens locally. |
-| **Composable Components** | Mount [Presence](packages/presence/), [Rate Limiter](packages/rate-limiter/), [Analytics & Feature Flags](docs/ANALYTICS.md), and [Error & Log Monitoring](docs/OBSERVABILITY.md) with isolated tables inside your own ACID transactions. |
+| **Jobs, Crons, Webhooks, Storage & Secrets** | Transactional `ctx.scheduler`, `App.cron`, custom `App.http_route` / `http_route_with_headers`, signed file uploads (`ctx.storage`, local or S3/R2/GCS), allowlisted `ctx.secrets` (Google Secret Manager / tmpfs / encrypted dev vault), and host `ctx.crypto`. |
+| **Search, Pagination & Migrations** | Reactive `Db.search!` and cursor-based `Db.paginate!`, resumable batched [Migrations](docs/MIGRATIONS.md), Postgres `commit_log` pruning (`CONCAVE_PG_COMMIT_LOG_KEEP`), and `--backfill-indexes`. |
+| **Built-in Auth v2 & External JWKS** | Ship self-contained [Auth v2](docs/AUTH.md) (Ed25519 JWKS, Argon2id passwords, rotating refresh tokens, Email OTP, OAuth2 + PKCE, instant global sign-out) *or* plug in Clerk, Auth0, Supabase, or Google JWTs (HS256, RS256, EdDSA, ES256). |
+| **Composable Components** | Mount [Auth v2](docs/AUTH.md), [Migrations](docs/MIGRATIONS.md), [Presence](packages/presence/), [Rate Limiter](packages/rate-limiter/), [Analytics & Feature Flags](docs/ANALYTICS.md), and [Error & Log Monitoring](docs/OBSERVABILITY.md) with isolated tables inside your own ACID transactions. |
 
 ---
 
@@ -161,11 +166,13 @@ Save any `.roc` file and Concave rebuilds, regenerates your typed client API, an
 Ready to build? Start with **[Getting Started](docs/GETTING_STARTED.md)**.
 
 - [**Getting Started**](docs/GETTING_STARTED.md) — From `concave init` to your first live app, webhook, background job, and file upload.
-- [**Roc API Guide**](docs/ROC_API.md) — Tables, indexes, queries, mutations, pagination, search, scheduler, crons, storage, and HTTP routes.
-- [**Browser Client & Signals**](docs/CLIENT_SDK.md) — Live queries, optimistic updates, signals, and surgical DOM helpers.
+- [**Roc API Guide**](docs/ROC_API.md) — Tables, indexes, queries, mutations, pagination, search, scheduler, crons, storage, secrets, crypto, and HTTP routes.
+- [**Browser Client, Signals & Router**](docs/CLIENT_SDK.md) — Live queries, proactive JWT refresh, optimistic updates, signals, surgical DOM helpers, and SPA routing.
+- [**Auth v2 Component**](docs/AUTH.md) — Ed25519 JWKS, Argon2id passwords, rotating refresh tokens, Email OTP, modular OAuth2 + PKCE, and `/_concave/auth.js`.
+- [**Resumable Batched Migrations**](docs/MIGRATIONS.md) — Cursor-paginated OCC data migrations, dry runs, cancellation, and PostgreSQL `--backfill-indexes`.
 - [**Analytics & Feature Flags**](docs/ANALYTICS.md) — PostHog-style event tracking, funnels, retention, and reactive feature flags.
 - [**Observability & Monitoring**](docs/OBSERVABILITY.md) — Grouped error tracking, live logs, alerts, and Prometheus metrics.
-- [**Deploying to Production**](docs/DEPLOY_CLOUD_RUN.md) — Cloud Run / Docker, Postgres, JWKS auth, S3/R2 storage, and all environment variables.
+- [**Deploying to Production**](docs/DEPLOY_CLOUD_RUN.md) — Cloud Run / Docker, Postgres, Secret Manager, JWKS auth, S3/R2 storage, and all environment variables.
 - [**Architecture**](docs/ARCHITECTURE.md) & [**Wire Protocol**](docs/PROTOCOL.md) — Deep dive into how Concave works under the hood.
 - [**Verification & Formal Proofs**](docs/VERIFICATION.md) — How we prove correctness with Lean 4, Maude, Z3, simulation testing, and live Postgres 16.
 

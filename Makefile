@@ -61,11 +61,25 @@ test-roc:
 	roc test packages/monitor/Rollups.roc
 	roc test packages/monitor/Alerts.roc
 	roc test packages/monitor/Monitor.roc
+	roc check packages/auth/main.roc
+	roc test packages/auth/Totp.roc
+	roc test packages/auth/Token.roc
+	roc test packages/auth/OAuth.roc
+	roc test packages/auth/Auth.roc
+	roc check packages/migrations/main.roc
+	roc test packages/migrations/Migrations.roc
+	roc check packages/email/main.roc
+	roc test packages/email/Email.roc
+	roc check packages/webhooks/main.roc
+	roc test packages/webhooks/Webhooks.roc
 	roc check platform/main.roc
 	roc check examples/chat-app/backend/main.roc
 	roc check tests/fixtures/analytics-app/main.roc
 	roc check tests/fixtures/monitor-app/main.roc
 	roc check tests/fixtures/platform-features-app/main.roc
+	roc check tests/fixtures/auth-app/main.roc
+	roc check tests/fixtures/migrations-app/main.roc
+	roc check tests/fixtures/email-webhooks-app/main.roc
 
 test-client:
 	node --test client/concave-client/test/*.test.mjs
@@ -79,6 +93,9 @@ test-e2e: host codegen-chat
 	node --test --test-timeout=25000 tests/e2e_production_hardening.mjs
 	node --test --test-timeout=20000 tests/e2e_http2_compression.mjs
 	node --test --test-timeout=20000 tests/e2e_binary_ws_group_commit.mjs
+	node --test --test-timeout=30000 tests/e2e_auth_v2.mjs
+	node --test --test-timeout=25000 tests/e2e_migrations.mjs
+	node --test --test-timeout=30000 tests/e2e_email_webhooks.mjs
 
 test-ws: host
 	node --test --test-timeout=15000 tests/ws_conformance.mjs

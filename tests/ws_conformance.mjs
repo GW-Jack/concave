@@ -196,7 +196,7 @@ test("Wave 3 RFC 6455 WebSocket & HTTP/1.1 wire-level conformance against live R
   );
   assert.equal(build.status, 0, `roc build failed:\n${build.stderr}`);
 
-  const port = 13229;
+  const port = 13228;
   const proc = spawn(
     binPath,
     ["--serve", "--host", "127.0.0.1", "--port", String(port), "--db", walPath, "--static-dir", path.join(ROOT, "examples/chat-app/frontend")],

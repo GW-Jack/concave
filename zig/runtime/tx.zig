@@ -10,7 +10,13 @@ const IndexQuery = storage_mod.IndexQuery;
 const Storage = storage_mod.Storage;
 const WriteOp = storage_mod.WriteOp;
 
-/// Transaction context with exact `ReadSet` tracking and read-your-own-writes overlay.
+pub const MAX_PAGINATE_SCAN: usize = 10_000;
+pub const MAX_PAGE_SIZE: usize = 500;
+pub const MAX_SEARCH_SCAN: usize = 10_000;
+pub const MAX_SEARCH_TOKENS: usize = 32;
+
+/// Transaction context with exact `ReadSet` tracking, namespace/table access control,
+/// and read-your-own-writes overlay.
 pub const TxContext = struct {
     allocator: Allocator,
     io: std.Io,
@@ -19,6 +25,12 @@ pub const TxContext = struct {
     snapshot_ts: i64,
     read_only: bool,
     track_reads: bool = true,
+    /// When set to a non-empty component namespace, all reads and writes in this transaction
+    /// are strictly confined to that namespace. Root (`null` or `""`) may access root and
+    /// mounted component namespaces, but never `_system` tables unless `allow_system_access` is true.
+    allowed_namespace: ?[]const u8 = null,
+    /// Privileged internal flag for scheduler / schema migration transactions targeting `_system`.
+    allow_system_access: bool = false,
     read_set: readset_mod.ReadSet = .{},
     writes: std.ArrayList(WriteOp) = .empty,
     /// Overlay keyed by `"<ns>\x1f<table>\x1f<id>"` -> `?Document` (`null` means deleted in this tx).
@@ -54,7 +66,31 @@ pub const TxContext = struct {
         self.pending_docs.deinit(self.allocator);
     }
 
+    fn validateAccess(self: *const TxContext, ns: []const u8, table: []const u8, is_write: bool) storage_mod.StorageError!void {
+        if (table.len == 0) return storage_mod.StorageError.InvalidKey;
+        for (ns) |b| {
+            if (b == 0 or b == 0x1f) return storage_mod.StorageError.InvalidKey;
+        }
+        for (table) |b| {
+            if (b == 0 or b == 0x1f) return storage_mod.StorageError.InvalidKey;
+        }
+        // System namespaces (`_system` or any leading `_`) are reserved for internal runtime ops.
+        if (ns.len > 0 and ns[0] == '_') {
+            if (!self.allow_system_access) return storage_mod.StorageError.AccessDenied;
+            return;
+        }
+        if (self.allowed_namespace) |allowed_ns| {
+            if (allowed_ns.len > 0 and !std.mem.eql(u8, ns, allowed_ns)) {
+                return storage_mod.StorageError.AccessDenied;
+            }
+        }
+        if (is_write and self.manifest.findTable(ns, table) == null) {
+            return storage_mod.StorageError.UnknownTable;
+        }
+    }
+
     pub fn get(self: *TxContext, allocator: Allocator, ns: []const u8, table: []const u8, doc_id: []const u8) !?Document {
+        try self.validateAccess(ns, table, false);
         if (self.track_reads) {
             try self.read_set.recordDocRead(self.allocator, ns, table, doc_id);
         }
@@ -70,6 +106,7 @@ pub const TxContext = struct {
 
     /// Zero-clone fast path: streams index scan results directly as a JSON array into `w`.
     pub fn scanIndexToWireJson(self: *TxContext, allocator: Allocator, query: *const IndexQuery, w: *std.Io.Writer) !void {
+        try self.validateAccess(query.namespace, query.table, false);
         if (self.track_reads) {
             try self.read_set.recordIndexRange(
                 self.allocator,
@@ -118,6 +155,7 @@ pub const TxContext = struct {
     }
 
     pub fn scanIndex(self: *TxContext, allocator: Allocator, query: *const IndexQuery) ![]Document {
+        try self.validateAccess(query.namespace, query.table, false);
         if (self.track_reads) {
             try self.read_set.recordIndexRange(
                 self.allocator,
@@ -261,6 +299,7 @@ pub const TxContext = struct {
 
     pub fn insert(self: *TxContext, allocator: Allocator, ns: []const u8, table: []const u8, body_json: []const u8) ![]u8 {
         if (self.read_only) return storage_mod.StorageError.ReadOnly;
+        try self.validateAccess(ns, table, true);
         const clean_body = try storage_mod.stripSystemFields(self.allocator, body_json);
         errdefer self.allocator.free(clean_body);
         if (self.manifest.findTable(ns, table)) |tspec| {
@@ -290,6 +329,7 @@ pub const TxContext = struct {
 
     pub fn patch(self: *TxContext, ns: []const u8, table: []const u8, doc_id: []const u8, patch_json: []const u8) !void {
         if (self.read_only) return storage_mod.StorageError.ReadOnly;
+        try self.validateAccess(ns, table, true);
         const existing = try self.get(self.allocator, ns, table, doc_id) orelse return storage_mod.StorageError.NotFound;
         defer existing.deinit(self.allocator);
 
@@ -314,6 +354,7 @@ pub const TxContext = struct {
 
     pub fn replace(self: *TxContext, ns: []const u8, table: []const u8, doc_id: []const u8, body_json: []const u8) !void {
         if (self.read_only) return storage_mod.StorageError.ReadOnly;
+        try self.validateAccess(ns, table, true);
         const existing = try self.get(self.allocator, ns, table, doc_id) orelse return storage_mod.StorageError.NotFound;
         defer existing.deinit(self.allocator);
 
@@ -339,6 +380,7 @@ pub const TxContext = struct {
 
     pub fn delete(self: *TxContext, ns: []const u8, table: []const u8, doc_id: []const u8) !void {
         if (self.read_only) return storage_mod.StorageError.ReadOnly;
+        try self.validateAccess(ns, table, true);
         if (try self.get(self.allocator, ns, table, doc_id)) |doc| {
             doc.deinit(self.allocator);
         }
@@ -375,11 +417,17 @@ pub const TxContext = struct {
             try storage_mod.writeJsonString(w, cn);
         }
         try w.writeAll(",\"attempts\":0}");
+        const prev_sys = self.allow_system_access;
+        self.allow_system_access = true;
+        defer self.allow_system_access = prev_sys;
         return try self.insert(allocator, "_system", "_scheduled_jobs", out.written());
     }
 
     pub fn cancelJob(self: *TxContext, job_id: []const u8) !void {
         if (self.read_only) return storage_mod.StorageError.ReadOnly;
+        const prev_sys = self.allow_system_access;
+        self.allow_system_access = true;
+        defer self.allow_system_access = prev_sys;
         try self.patch("_system", "_scheduled_jobs", job_id, "{\"status\":\"canceled\"}");
     }
 
@@ -404,10 +452,10 @@ pub const TxContext = struct {
         cursor: []const u8,
         page_size: usize,
     ) !PageResult {
-        const effective_size = if (page_size == 0) 1 else page_size;
-        var unbounded = query.*;
-        unbounded.limit = null;
-        const all_docs = try self.scanIndex(self.allocator, &unbounded);
+        const effective_size = @min(if (page_size == 0) 1 else page_size, MAX_PAGE_SIZE);
+        var bounded = query.*;
+        bounded.limit = MAX_PAGINATE_SCAN;
+        const all_docs = try self.scanIndex(self.allocator, &bounded);
         defer {
             for (all_docs) |*d| d.deinit(self.allocator);
             self.allocator.free(all_docs);
@@ -471,7 +519,7 @@ pub const TxContext = struct {
             .start = .unbounded,
             .end = .unbounded,
             .order = .desc,
-            .limit = null,
+            .limit = MAX_SEARCH_SCAN,
         });
         defer {
             for (all_docs) |*d| d.deinit(self.allocator);
@@ -482,6 +530,7 @@ pub const TxContext = struct {
         defer tokens.deinit(self.allocator);
         var tit = std.mem.tokenizeAny(u8, query_text, " \t\r\n");
         while (tit.next()) |tok| {
+            if (tokens.items.len >= MAX_SEARCH_TOKENS) break;
             try tokens.append(self.allocator, tok);
         }
 
@@ -491,7 +540,7 @@ pub const TxContext = struct {
             matched.deinit(allocator);
         }
 
-        const max_docs = if (limit == 0) 50 else limit;
+        const max_docs = @min(if (limit == 0) 50 else limit, MAX_PAGE_SIZE);
         for (all_docs) |*doc| {
             if (matched.items.len >= max_docs) break;
             if (tokens.items.len == 0) {

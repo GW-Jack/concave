@@ -38,7 +38,9 @@ async function waitForHealth(url, timeoutMs = 10000) {
   throw new Error(`Timed out waiting for ${url}/health`);
 }
 
-async function rpc(serverUrl, kind, name, args, authToken = null) {
+const ADMIN_TOKEN = "dev:admin:Admin:admin";
+
+async function rpc(serverUrl, kind, name, args, authToken = ADMIN_TOKEN) {
   const headers = { "Content-Type": "application/json" };
   if (authToken) headers.Authorization = `Bearer ${authToken}`;
   const res = await fetch(`${serverUrl}/api/${kind}/${name}`, {
@@ -256,12 +258,15 @@ test("model-based differential oracle & boundary fuzz test against compiled nati
   });
   assert.equal(build.status, 0, `roc build failed:\n${build.stdout}\n${build.stderr}`);
 
-  const port = 13229;
+  const port = 13227;
   const serverUrl = `http://127.0.0.1:${port}`;
   const serverProc = spawn(
     binPath,
     ["--serve", "--host", "127.0.0.1", "--port", String(port), "--db", dbPath],
-    { stdio: ["ignore", "pipe", "pipe"] },
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, CONCAVE_ALLOW_DEV_TOKENS: "true" },
+    },
   );
   let stderrLog = "";
   serverProc.stderr.on("data", (d) => {
@@ -326,7 +331,7 @@ test("model-based differential oracle & boundary fuzz test against compiled nati
         assert.equal(gp.value.found, true);
         assert.equal(gp.value.event_count, expPerson.eventCount, `event_count(${id}) at ${stepLabel}`);
         assert.equal(gp.value.event_count, oracle.resolvedEventCount(canon), `conservation(${id}) at ${stepLabel}`);
-        const actualProps = fromProps(gp.value.properties);
+        const actualProps = { ...fromProps(gp.value.properties) };
         assert.deepEqual(actualProps, Object.fromEntries(expPerson.props), `props(${id}) at ${stepLabel}`);
       } else {
         assert.equal(gp.value.found, false);

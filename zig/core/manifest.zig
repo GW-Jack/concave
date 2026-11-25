@@ -65,12 +65,31 @@ pub const ComponentSpec = struct {
     namespace: []const u8,
     package: []const u8,
     tables: []const TableSpec,
+    allowed_secrets: [][]u8 = &.{},
+};
+
+pub const FunctionVisibility = enum {
+    public,
+    internal,
+
+    pub fn fromStr(s: []const u8) FunctionVisibility {
+        if (std.mem.eql(u8, s, "internal")) return .internal;
+        return .public;
+    }
+
+    pub fn toStr(self: FunctionVisibility) []const u8 {
+        return switch (self) {
+            .public => "public",
+            .internal => "internal",
+        };
+    }
 };
 
 pub const FunctionSpec = struct {
     name: []const u8,
     kind: FunctionKind,
     namespace: []const u8,
+    visibility: FunctionVisibility = .public,
     args_schema: SchemaType,
     returns_schema: SchemaType,
 };
@@ -85,6 +104,7 @@ pub const CronSpec = struct {
 pub const HttpRouteSpec = struct {
     method: []const u8,
     path: []const u8,
+    namespace: []const u8 = "",
 };
 
 const system_sched_idx_status_fields = [_][]const u8{ "status", "run_at_ms" };
@@ -118,6 +138,7 @@ pub const AppManifest = struct {
     functions: []const FunctionSpec,
     crons: []const CronSpec = &.{},
     http_routes: []const HttpRouteSpec = &.{},
+    allowed_secrets: [][]u8 = &.{},
 
     pub fn deinit(self: *AppManifest) void {
         self.arena.deinit();
@@ -190,15 +211,19 @@ pub const AppManifest = struct {
                     if (item != .object) continue;
                     const method = getOptionalStr(item.object, "method");
                     const route_path = getOptionalStr(item.object, "path");
+                    const route_ns = getOptionalStr(item.object, "namespace");
                     if (method.len > 0 and route_path.len > 0) {
                         try http_routes.append(alloc, .{
                             .method = method,
                             .path = route_path,
+                            .namespace = route_ns,
                         });
                     }
                 }
             }
         }
+
+        const allowed_secrets = try parseAllowedSecrets(alloc, obj);
 
         return .{
             .arena = arena,
@@ -209,7 +234,26 @@ pub const AppManifest = struct {
             .functions = try functions.toOwnedSlice(alloc),
             .crons = try crons.toOwnedSlice(alloc),
             .http_routes = try http_routes.toOwnedSlice(alloc),
+            .allowed_secrets = allowed_secrets,
         };
+    }
+
+    pub fn isSecretAllowed(self: *const AppManifest, namespace: []const u8, secret_name: []const u8) bool {
+        if (namespace.len == 0) {
+            for (self.allowed_secrets) |s| {
+                if (std.mem.eql(u8, s, secret_name)) return true;
+            }
+            return false;
+        }
+        for (self.components) |*c| {
+            if (std.mem.eql(u8, c.namespace, namespace)) {
+                for (c.allowed_secrets) |s| {
+                    if (std.mem.eql(u8, s, secret_name)) return true;
+                }
+                return false;
+            }
+        }
+        return false;
     }
 
     pub fn findTable(self: *const AppManifest, namespace: []const u8, table_name: []const u8) ?*const TableSpec {
@@ -243,12 +287,18 @@ pub const AppManifest = struct {
     }
 
     pub fn matchHttpRoute(self: *const AppManifest, method: []const u8, req_path: []const u8) ?*const HttpRouteSpec {
+        if (hasPathTraversalSegment(req_path)) return null;
         for (self.http_routes) |*r| {
             const method_ok = std.mem.eql(u8, r.method, "*") or std.ascii.eqlIgnoreCase(r.method, method);
             if (!method_ok) continue;
             if (std.mem.endsWith(u8, r.path, "*")) {
                 const prefix = r.path[0 .. r.path.len - 1];
-                if (std.mem.startsWith(u8, req_path, prefix)) return r;
+                if (std.mem.startsWith(u8, req_path, prefix)) {
+                    // Enforce segment boundary if prefix does not end with '/'.
+                    if (prefix.len == 0 or prefix[prefix.len - 1] == '/' or req_path.len == prefix.len or req_path[prefix.len] == '/') {
+                        return r;
+                    }
+                }
             } else if (std.mem.eql(u8, r.path, req_path)) {
                 return r;
             }
@@ -256,6 +306,15 @@ pub const AppManifest = struct {
         return null;
     }
 };
+
+fn hasPathTraversalSegment(path: []const u8) bool {
+    var segs = std.mem.splitScalar(u8, path, '/');
+    while (segs.next()) |seg| {
+        if (std.mem.eql(u8, seg, "..") or std.mem.eql(u8, seg, ".")) return true;
+        if (std.mem.indexOfScalar(u8, seg, '\\') != null or std.mem.indexOfScalar(u8, seg, 0) != null) return true;
+    }
+    return false;
+}
 
 fn getRequiredStr(obj: std.json.ObjectMap, key: []const u8) ![]const u8 {
     const v = obj.get(key) orelse return error.InvalidManifest;
@@ -306,6 +365,20 @@ fn parseTable(alloc: Allocator, val: std.json.Value) !TableSpec {
     };
 }
 
+fn parseAllowedSecrets(alloc: Allocator, obj: std.json.ObjectMap) ![][]u8 {
+    var list: std.ArrayList([]u8) = .empty;
+    if (obj.get("allowed_secrets")) |sv| {
+        if (sv == .array) {
+            for (sv.array.items) |item| {
+                if (item == .string and item.string.len > 0) {
+                    try list.append(alloc, try alloc.dupe(u8, item.string));
+                }
+            }
+        }
+    }
+    return try list.toOwnedSlice(alloc);
+}
+
 fn parseComponent(alloc: Allocator, val: std.json.Value) !ComponentSpec {
     if (val != .object) return error.InvalidManifest;
     const obj = val.object;
@@ -321,10 +394,13 @@ fn parseComponent(alloc: Allocator, val: std.json.Value) !ComponentSpec {
         }
     }
 
+    const allowed_secrets = try parseAllowedSecrets(alloc, obj);
+
     return .{
         .namespace = namespace,
         .package = package,
         .tables = try tables.toOwnedSlice(alloc),
+        .allowed_secrets = allowed_secrets,
     };
 }
 
@@ -335,6 +411,7 @@ fn parseFunction(alloc: Allocator, val: std.json.Value) !FunctionSpec {
         .name = try getRequiredStr(obj, "name"),
         .kind = try FunctionKind.fromStr(try getRequiredStr(obj, "kind")),
         .namespace = getOptionalStr(obj, "namespace"),
+        .visibility = FunctionVisibility.fromStr(getOptionalStr(obj, "visibility")),
         .args_schema = if (obj.get("args_schema")) |s| try parseSchema(alloc, s) else .any_t,
         .returns_schema = if (obj.get("returns_schema")) |s| try parseSchema(alloc, s) else .any_t,
     };
@@ -411,4 +488,37 @@ fn parseSchema(alloc: Allocator, val: std.json.Value) !SchemaType {
         return .{ .union_t = try variants.toOwnedSlice(alloc) };
     }
     return .any_t;
+}
+
+test "manifest: parses allowed_secrets on root app and components + HTTP route namespaces" {
+    const allocator = std.testing.allocator;
+    const raw =
+        \\{
+        \\  "app_name": "demo",
+        \\  "tables": [],
+        \\  "allowed_secrets": ["STRIPE_KEY", "RESEND_API_KEY"],
+        \\  "components": [
+        \\    {"namespace": "auth", "package": "concave-auth", "tables": [], "allowed_secrets": ["AUTH_JWT_SEED", "OAUTH_GOOGLE_SECRET"]}
+        \\  ],
+        \\  "functions": [],
+        \\  "crons": [],
+        \\  "http_routes": [
+        \\    {"method": "GET", "path": "/.well-known/jwks.json", "namespace": "auth"},
+        \\    {"method": "POST", "path": "/webhooks/stripe"}
+        \\  ]
+        \\}
+    ;
+    var mf = try AppManifest.parseJson(allocator, raw);
+    defer mf.deinit();
+
+    try std.testing.expect(mf.isSecretAllowed("", "STRIPE_KEY"));
+    try std.testing.expect(!mf.isSecretAllowed("", "AUTH_JWT_SEED"));
+    try std.testing.expect(mf.isSecretAllowed("auth", "AUTH_JWT_SEED"));
+    try std.testing.expect(!mf.isSecretAllowed("auth", "STRIPE_KEY"));
+    try std.testing.expect(!mf.isSecretAllowed("unknown", "STRIPE_KEY"));
+
+    const r1 = mf.matchHttpRoute("GET", "/.well-known/jwks.json").?;
+    try std.testing.expectEqualStrings("auth", r1.namespace);
+    const r2 = mf.matchHttpRoute("POST", "/webhooks/stripe").?;
+    try std.testing.expectEqualStrings("", r2.namespace);
 }

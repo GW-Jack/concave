@@ -140,6 +140,8 @@ test("end-to-end Observability: Layer 1 Zig operator telemetry + Layer 2 pure-Ro
       env: {
         ...process.env,
         CONCAVE_OPERATOR_TOKEN: operatorToken,
+        CONCAVE_ALLOW_DEV_TOKENS: "true",
+        CONCAVE_ALLOW_PRIVATE_HTTP: "true",
       },
     },
   );
@@ -183,18 +185,40 @@ test("end-to-end Observability: Layer 1 Zig operator telemetry + Layer 2 pure-Ro
   assert.ok(promInitial.includes("concave_mutation_duration_seconds_bucket"));
   assert.ok(promInitial.includes("concave_occ_retries_total"));
 
-  // Also test `?token=` query auth for `/_internal/status`.
-  const statusInitialRes = await fetch(`${serverUrl}/_internal/status?token=${operatorToken}`);
+  // Query-string `?token=` auth MUST be rejected (prevents token leakage in URLs/logs).
+  const queryTokRes = await fetch(`${serverUrl}/_internal/status?token=${operatorToken}`);
+  assert.equal(queryTokRes.status, 401);
+
+  // Header-based `Authorization: Bearer` succeeds.
+  const statusInitialRes = await fetch(`${serverUrl}/_internal/status`, {
+    headers: { Authorization: `Bearer ${operatorToken}` },
+  });
   assert.equal(statusInitialRes.status, 200);
   const statusInitial = await statusInitialRes.json();
   assert.equal(statusInitial.status, "ok");
   assert.equal(statusInitial.app_name, "concave-monitor-test");
   assert.equal(statusInitial.storage_backend, "wal");
 
-  // 6. Connect reactive WebSocket client and instantiate `createMonitor`.
-  const client = new ConcaveClient(serverUrl);
-  t.after(() => client.close());
+  // Internal-only monitor mutations (`monitor.evaluateAlerts`) MUST be rejected on public HTTP API.
+  const internalCallRes = await fetch(`${serverUrl}/api/mutation/monitor.evaluateAlerts`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer dev:admin:Admin:admin" },
+    body: "{}",
+  });
+  assert.equal(internalCallRes.status, 400);
+  const internalCallJson = await internalCallRes.json();
+  assert.equal(internalCallJson.ok, false);
+  assert.match(internalCallJson.error, /internal/);
+
+  // 6. Connect admin and unauthenticated reactive WebSocket clients.
+  const client = new ConcaveClient(serverUrl, { authToken: "dev:admin:Admin:admin" });
+  const anonClient = new ConcaveClient(serverUrl);
+  t.after(() => {
+    client.close();
+    anonClient.close();
+  });
   await waitForCondition(() => client.status() === "connected", 5000, "ws connected");
+  await waitForCondition(() => anonClient.status() === "connected", 5000, "anon ws connected");
 
   const monitor = createMonitor(client, api.monitor, {
     service: "web",
@@ -202,6 +226,7 @@ test("end-to-end Observability: Layer 1 Zig operator telemetry + Layer 2 pure-Ro
     environment: "test",
   });
   const opsMonitor = createMonitor(client, api.ops_monitor, { service: "ops" });
+  const anonOpsMonitor = createMonitor(anonClient, api.ops_monitor, { service: "ops" });
 
   // Live reactive subscriptions for issues, overview, search, and alerts.
   const openIssuesSub = monitor.subscribeIssues({ status: "open" });
@@ -443,19 +468,30 @@ test("end-to-end Observability: Layer 1 Zig operator telemetry + Layer 2 pure-Ro
   assert.ok(pruned.deleted_logs >= 1);
   assert.ok(pruned.deleted_metrics >= 1);
 
-  // 13. Strict namespace isolation + `require_auth_for_admin` + `max_batch_size` on `ops_monitor`.
+  // 13. Strict namespace isolation + `require_auth_for_admin` + HTTPS webhook check + `max_batch_size` on `ops_monitor`.
   const opsIssuesSub = opsMonitor.subscribeIssues();
   t.after(() => opsIssuesSub.dispose());
   await waitForCondition(() => opsIssuesSub().status === "ready", 5000, "ops_monitor ready");
   assert.equal(opsIssuesSub().data.length, 0, "ops_monitor must be strictly isolated from monitor");
 
   await assert.rejects(
-    opsMonitor.upsertAlertRule({
+    anonOpsMonitor.upsertAlertRule({
       key: "unauth-rule",
       kind: "error_count",
       threshold: 1,
     }),
     /Unauthenticated/,
+  );
+
+  // `ops_monitor` enforces https:// webhooks by default (unlike `app_monitor` which opted in for local test).
+  await assert.rejects(
+    opsMonitor.upsertAlertRule({
+      key: "insecure-webhook-rule",
+      kind: "error_count",
+      threshold: 1,
+      webhook_url: "http://127.0.0.1:9999/hook",
+    }),
+    /https:\/\//,
   );
 
   await assert.rejects(

@@ -15,6 +15,8 @@ pub const StorageError = error{
     InvalidJson,
     SchemaViolation,
     InvalidKey,
+    UnknownTable,
+    AccessDenied,
     StorageFailure,
     OutOfMemory,
 };
@@ -290,8 +292,8 @@ pub fn stringifyJsonValue(allocator: Allocator, value: std.json.Value) ![]u8 {
 
 /// Zero-allocation check: validates `body_json` is valid JSON and reports whether it is an object
 /// containing any protected system key (`id`, `created_at`, `_id`, `_creationTime`) at top level.
-fn jsonHasSystemField(body_json: []const u8) !bool {
-    var scanner = std.json.Scanner.initCompleteInput(std.heap.page_allocator, body_json);
+fn jsonHasSystemField(allocator: Allocator, body_json: []const u8) !bool {
+    var scanner = std.json.Scanner.initCompleteInput(allocator, body_json);
     defer scanner.deinit();
 
     const first = scanner.next() catch return error.InvalidJson;
@@ -376,7 +378,7 @@ fn jsonHasSystemField(body_json: []const u8) !bool {
 
 /// Remove system fields (`id`, `created_at`, `_id`, `_creationTime`) from a JSON object string.
 pub fn stripSystemFields(allocator: Allocator, body_json: []const u8) ![]u8 {
-    if (!(try jsonHasSystemField(body_json))) {
+    if (!(try jsonHasSystemField(allocator, body_json))) {
         return try allocator.dupe(u8, std.mem.trim(u8, body_json, " \t\r\n"));
     }
 

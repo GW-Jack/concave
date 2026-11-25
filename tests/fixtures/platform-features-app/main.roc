@@ -84,6 +84,19 @@ SearchArgs : {
     limit : U64,
 }
 
+SecretNameArgs : {
+    name : Str,
+}
+
+FailJobArgs : {
+    reason : Str,
+}
+
+ScheduleFailArgs : {
+    delay_ms : I64,
+    reason : Str,
+}
+
 notes_create! : Ctx.MutationCtx, CreateNoteArgs => Try(Str, Str)
 notes_create! = |ctx, args|
     Db.insert!(ctx.db, notes_table, {
@@ -135,6 +148,21 @@ jobs_cancel! = |ctx, args| {
     Ok(Bool.True)
 }
 
+jobs_always_fail! : Ctx.MutationCtx, FailJobArgs => Try(Bool, Str)
+jobs_always_fail! = |_, args|
+    Err("always_fail: ${args.reason}")
+
+jobs_schedule_failing! : Ctx.MutationCtx, ScheduleFailArgs => Try(Str, Str)
+jobs_schedule_failing! = |ctx, args| {
+    run_after! = ctx.scheduler.run_after!
+    payload = "{\"reason\":${Json.to_str(args.reason)}}"
+    run_after!(args.delay_ms, "jobs.always_fail", payload)
+}
+
+secrets_read! : Ctx.ActionCtx, SecretNameArgs => Try(Str, Str)
+secrets_read! = |ctx, args|
+    Ctx.secret_get!(ctx, args.name)
+
 files_upload_url! : Ctx.MutationCtx, EmptyArgs => Try(Str, Str)
 files_upload_url! = |ctx, _| {
     gen! = ctx.storage.generate_upload_url!
@@ -176,6 +204,7 @@ webhook_echo! = |_, req|
 concave_app : () -> App
 concave_app = ||
     App.new("platform-features-test")
+    |> App.with_secret("VAULT_TEST_KEY")
     |> App.table(notes_table)
     |> App.table(events_table)
     |> App.mutation("notes.create", Schema.any, Schema.str, notes_create!)
@@ -186,6 +215,9 @@ concave_app = ||
     |> App.mutation("jobs.schedule_commit", Schema.any, Schema.str, jobs_schedule_commit!)
     |> App.mutation("jobs.schedule_abort", Schema.any, Schema.str, jobs_schedule_abort!)
     |> App.mutation("jobs.cancel", Schema.any, Schema.bool, jobs_cancel!)
+    |> App.internal_mutation("jobs.always_fail", Schema.any, Schema.bool, jobs_always_fail!)
+    |> App.mutation("jobs.schedule_failing", Schema.any, Schema.str, jobs_schedule_failing!)
+    |> App.action("secrets.read", Schema.any, Schema.str, secrets_read!)
     |> App.mutation("files.upload_url", Schema.any, Schema.str, files_upload_url!)
     |> App.query("files.download_url", Schema.any, Schema.str, files_download_url!)
     |> App.mutation("files.delete", Schema.any, Schema.bool, files_delete!)

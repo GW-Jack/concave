@@ -19,6 +19,8 @@ pub fn build(b: *std.Build) void {
     run_assets.addFileArg(b.path("client/concave-client/src/signals.js"));
     run_assets.addFileArg(b.path("client/concave-client/src/client.js"));
     run_assets.addFileArg(b.path("client/concave-client/src/dom.js"));
+    run_assets.addFileArg(b.path("client/concave-client/src/router.js"));
+    run_assets.addFileArg(b.path("packages/auth/client.js"));
     run_assets.addFileArg(b.path("packages/analytics/client.js"));
     run_assets.addFileArg(b.path("packages/monitor/client.js"));
     run_assets.addFileArg(b.path("client/concave-dashboard/index.html"));
@@ -84,6 +86,29 @@ pub fn build(b: *std.Build) void {
         .root_module = test_mod,
     });
     const run_tests = b.addRunArtifact(unit_tests);
+
+    const secrets_test_mod = b.createModule(.{
+        .root_source_file = b.path("zig/core/secrets.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const secrets_tests = b.addTest(.{
+        .root_module = secrets_test_mod,
+    });
+    const run_secrets_tests = b.addRunArtifact(secrets_tests);
+
+    const rate_limit_test_mod = b.createModule(.{
+        .root_source_file = b.path("zig/runtime/rate_limit.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const rate_limit_tests = b.addTest(.{
+        .root_module = rate_limit_test_mod,
+    });
+    const run_rate_limit_tests = b.addRunArtifact(rate_limit_tests);
+
     const test_step = b.step("test", "Run all Concave Zig unit tests");
     test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_secrets_tests.step);
+    test_step.dependOn(&run_rate_limit_tests.step);
 }

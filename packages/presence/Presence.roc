@@ -59,10 +59,14 @@ Presence := [Presence].{
     sessions_table =
         Table.define("sessions", sessions_schema)
         |> Table.with_index("by_room", ["room_id"])
+        |> Table.with_index("by_room_last_seen", ["room_id", "last_seen_ms"])
         |> Table.with_index("by_room_user", ["room_id", "user_id"])
 
     by_room : Table.Index(SessionDoc)
     by_room = Table.index_ref(sessions_table, "by_room")
+
+    by_room_last_seen : Table.Index(SessionDoc)
+    by_room_last_seen = Table.index_ref(sessions_table, "by_room_last_seen")
 
     by_room_user : Table.Index(SessionDoc)
     by_room_user = Table.index_ref(sessions_table, "by_room_user")
@@ -91,11 +95,23 @@ Presence := [Presence].{
         Schema.field("last_seen_ms", Schema.int),
     ])
 
+    validate_room_id : Str -> Try(Str, Str)
+    validate_room_id = |raw| {
+        trimmed = Str.trim(raw)
+        if Str.is_empty(trimmed) {
+            Err("room_id cannot be empty")
+        } else if Str.count_utf8_bytes(trimmed) > 128 {
+            Err("room_id exceeds maximum length of 128 bytes")
+        } else {
+            Ok(trimmed)
+        }
+    }
+
     ## Mount an isolated instance of the Presence component under `namespace`.
     mount : Str, I64 -> Mount
     mount = |namespace, ttl_ms| {
         namespace,
-        ttl_ms,
+        ttl_ms: if ttl_ms < 1000 { 1000 } else { ttl_ms },
         spec: Component.define(
             namespace,
             "concave-presence",
@@ -107,12 +123,13 @@ Presence := [Presence].{
     heartbeat! : Ctx.MutationCtx, HeartbeatArgs => Try(Bool, Str)
     heartbeat! = |ctx, args| {
         user = Ctx.require_auth!(ctx.auth!)?
+        room_id = validate_room_id(args.room_id)?
         now_ms! = ctx.now_ms!
         now = now_ms!()
 
         existing =
             Db.from_index(by_room_user)
-            |> Db.eq([Key.str(args.room_id), Key.str(user.subject)])
+            |> Db.eq([Key.str(room_id), Key.str(user.subject)])
             |> Db.first!(Ctx.as_reader(ctx.db))?
 
         match existing {
@@ -126,7 +143,7 @@ Presence := [Presence].{
             }
             NotFound => {
                 _ = Db.insert!(ctx.db, sessions_table, {
-                    room_id: args.room_id,
+                    room_id,
                     user_id: user.subject,
                     user_name: user.name,
                     typing: args.typing,
@@ -141,9 +158,10 @@ Presence := [Presence].{
     leave! : Ctx.MutationCtx, LeaveArgs => Try(Bool, Str)
     leave! = |ctx, args| {
         user = Ctx.require_auth!(ctx.auth!)?
+        room_id = validate_room_id(args.room_id)?
         existing =
             Db.from_index(by_room_user)
-            |> Db.eq([Key.str(args.room_id), Key.str(user.subject)])
+            |> Db.eq([Key.str(room_id), Key.str(user.subject)])
             |> Db.first!(Ctx.as_reader(ctx.db))?
 
         match existing {
@@ -155,14 +173,19 @@ Presence := [Presence].{
         }
     }
 
-    ## List active (non-stale) users in a room.
+    ## List active (non-stale) users in a room (requires authentication, bounded to 200 users).
     list_online! : I64, Ctx.QueryCtx, ListArgs => Try(List(OnlineUser), Str)
     list_online! = |ttl_ms, ctx, args| {
+        _ = Ctx.require_auth!(ctx.auth!)?
+        room_id = validate_room_id(args.room_id)?
         now_ms! = ctx.now_ms!
         cutoff = now_ms!() - ttl_ms
         docs =
-            Db.from_index(by_room)
-            |> Db.eq([Key.str(args.room_id)])
+            Db.from_index(by_room_last_seen)
+            |> Db.eq([Key.str(room_id)])
+            |> Db.gte([Key.str(room_id), Key.int(cutoff)])
+            |> Db.desc()
+            |> Db.take(200)
             |> Db.collect!(ctx.db)?
 
         active =

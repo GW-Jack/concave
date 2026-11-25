@@ -53,6 +53,11 @@ test("Wave 3 Roc 0.1.0_RC1 + Zig FFI concurrency stress: 12 WS clients, OCC burs
   const url = `http://127.0.0.1:${port}`;
   const proc = spawn(binPath, ["--serve", "--host", "127.0.0.1", "--port", String(port), "--db", walPath], {
     stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      CONCAVE_ALLOW_DEV_TOKENS: "true",
+      CONCAVE_ALLOW_PRIVATE_HTTP: "true",
+    },
   });
   let stderr = "";
   proc.stderr.on("data", (d) => {

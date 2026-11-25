@@ -105,6 +105,19 @@ Insights := [Insights].{
         }
     }
 
+    ## Saturating non-negative subtraction `max(0, a - b)` that never overflows `I64`
+    ## even when `b` is near `I64.min` and `a` is positive.
+    safe_sub_nonneg_i64 : I64, I64 -> I64
+    safe_sub_nonneg_i64 = |a, b| {
+        if a <= b {
+            0
+        } else if b < 0 and a > max_i64 + b {
+            max_i64
+        } else {
+            a - b
+        }
+    }
+
     ## Count list length as `I64`.
     list_len_i64 : List(a) -> I64
     list_len_i64 = |items| {
@@ -299,7 +312,7 @@ Insights := [Insights].{
         # Build contiguous time buckets partitioning `[from_ms, to_ms]` in at most 500 buckets.
         var $buckets = []
         if to_ms >= from_ms {
-            span = to_ms - from_ms
+            span = safe_sub_nonneg_i64(to_ms, from_ms)
             min_step = (span // 500) + 1
             bucket_ms = if req_bucket_ms < min_step { min_step } else { req_bucket_ms }
 
@@ -397,7 +410,8 @@ Insights := [Insights].{
     ## Each person's best progression starting from step 0 within `[from_ms, to_ms]`
     ## and completing subsequent steps within `conversion_window_ms` is counted.
     compute_funnel : List(Str), List(EventRecord), List(AliasEntry), I64, I64, I64, List(Props.Filter) -> FunnelResult
-    compute_funnel = |steps, events, aliases, from_ms, to_ms, raw_window_ms, filters| {
+    compute_funnel = |raw_steps, events, aliases, from_ms, to_ms, raw_window_ms, filters| {
+        steps = take_i64(raw_steps, 20)
         num_steps = list_len_i64(steps)
         if num_steps == 0 {
             return {
@@ -595,7 +609,7 @@ Insights := [Insights].{
         for ev in events {
             if ev.timestamp_ms >= from_ms and ev.timestamp_ms < end_ms {
                 canon = resolve_id(aliases, ev.distinct_id)
-                period_idx = (ev.timestamp_ms - from_ms) // period_ms
+                period_idx = safe_sub_nonneg_i64(ev.timestamp_ms, from_ms) // period_ms
                 if ev.event == cohort_event {
                     $cohort_members = upsert_earliest_period($cohort_members, canon, period_idx)
                 }

@@ -14,12 +14,23 @@ function _writeI64(dv, off, val) {
   dv.setUint32(off + 4, lo, false);
 }
 
+const MAX_U16 = 0xffff;
+const MAX_U32 = 0xffffffff;
+const MAX_OUTBOUND_QUEUE = 256;
+
+function _assertLen(len, max, label) {
+  if (len > max) {
+    throw new RangeError(`${label} length ${len} exceeds maximum ${max}`);
+  }
+}
+
 function encodeBinaryFrame(msg) {
   if (msg.type === "authenticate") {
     if (msg.token === null || msg.token === undefined) {
       return new Uint8Array([0x01, 0]);
     }
     const tb = _te.encode(msg.token);
+    _assertLen(tb.length, MAX_U16, "auth token");
     const out = new Uint8Array(4 + tb.length);
     out[0] = 0x01;
     out[1] = 1;
@@ -29,6 +40,7 @@ function encodeBinaryFrame(msg) {
   }
   if (msg.type === "unsubscribe") {
     const sb = _te.encode(msg.sub_id);
+    _assertLen(sb.length, MAX_U16, "sub_id");
     const out = new Uint8Array(3 + sb.length);
     out[0] = 0x03;
     new DataView(out.buffer).setUint16(1, sb.length, false);
@@ -50,6 +62,9 @@ function encodeBinaryFrame(msg) {
   const idB = _te.encode(idStr);
   const nameB = _te.encode(msg.name);
   const argsB = _te.encode(JSON.stringify(msg.args ?? {}));
+  _assertLen(idB.length, MAX_U16, "frame id");
+  _assertLen(nameB.length, MAX_U16, "function name");
+  _assertLen(argsB.length, MAX_U32, "args payload");
   const out = new Uint8Array(1 + 2 + idB.length + 2 + nameB.length + 4 + argsB.length);
   const dv = new DataView(out.buffer);
   let p = 0;
@@ -65,26 +80,36 @@ function encodeBinaryFrame(msg) {
 
 function decodeBinaryFrame(buf) {
   const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  if (bytes.byteLength < 1) {
+    return { type: "error", message: "truncated binary frame" };
+  }
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let p = 0;
+  const has = (n) => n >= 0 && p + n <= bytes.byteLength;
   const tag = bytes[p++];
   if (tag === 0x81) {
+    if (!has(5)) return { type: "error", message: "truncated binary frame" };
     const ok = bytes[p++] !== 0;
     const len = dv.getUint32(p, false); p += 4;
+    if (!has(len)) return { type: "error", message: "truncated binary frame" };
     const txt = len > 0 ? _td.decode(bytes.subarray(p, p + len)) : "";
     return ok
       ? { type: "auth_result", ok: true, identity: txt ? JSON.parse(txt) : null }
       : { type: "auth_result", ok: false, error: txt };
   }
   if (tag === 0x83) {
+    if (!has(10)) return { type: "error", message: "truncated binary frame" };
     const toTs = _readI64(dv, p); p += 8;
     const count = dv.getUint16(p, false); p += 2;
     const updates = [];
     for (let i = 0; i < count; i++) {
+      if (!has(2)) return { type: "error", message: "truncated binary frame" };
       const sLen = dv.getUint16(p, false); p += 2;
+      if (!has(sLen + 5)) return { type: "error", message: "truncated binary frame" };
       const subId = _td.decode(bytes.subarray(p, p + sLen)); p += sLen;
       const ok = bytes[p++] !== 0;
       const pLen = dv.getUint32(p, false); p += 4;
+      if (!has(pLen)) return { type: "error", message: "truncated binary frame" };
       const payload = _td.decode(bytes.subarray(p, p + pLen)); p += pLen;
       updates.push(
         ok
@@ -95,12 +120,16 @@ function decodeBinaryFrame(buf) {
     return { type: "transition", to_ts: toTs, updates };
   }
   if (tag === 0x84 || tag === 0x85 || tag === 0x87) {
+    if (!has(2)) return { type: "error", message: "truncated binary frame" };
     const rLen = dv.getUint16(p, false); p += 2;
+    const headerExtra = tag === 0x84 ? 13 : 5;
+    if (!has(rLen + headerExtra)) return { type: "error", message: "truncated binary frame" };
     const reqId = _td.decode(bytes.subarray(p, p + rLen)); p += rLen;
     const ok = bytes[p++] !== 0;
     const commitTs = tag === 0x84 ? _readI64(dv, p) : undefined;
     if (tag === 0x84) p += 8;
     const pLen = dv.getUint32(p, false); p += 4;
+    if (!has(pLen)) return { type: "error", message: "truncated binary frame" };
     const payload = _td.decode(bytes.subarray(p, p + pLen));
     const type = tag === 0x84 ? "mutation_result" : tag === 0x85 ? "action_result" : "query_result";
     return ok
@@ -108,10 +137,13 @@ function decodeBinaryFrame(buf) {
       : { type, req_id: reqId, ok: false, error: payload };
   }
   if (tag === 0x86) {
+    if (!has(8)) return { type: "error", message: "truncated binary frame" };
     return { type: "pong", ts: _readI64(dv, p) };
   }
   if (tag === 0x8f) {
+    if (!has(4)) return { type: "error", message: "truncated binary frame" };
     const mLen = dv.getUint32(p, false); p += 4;
+    if (!has(mLen)) return { type: "error", message: "truncated binary frame" };
     return { type: "error", message: _td.decode(bytes.subarray(p, p + mLen)) };
   }
   return { type: "error", message: `unknown binary tag ${tag}` };
@@ -157,11 +189,53 @@ function applyLiveReload(reason) {
   globalThis.location?.reload?.();
 }
 
+function _parseJwtPayload(token) {
+  if (typeof token !== "string") return null;
+  const parts = token.split(".");
+  if (parts.length !== 3 || !parts[1]) return null;
+  try {
+    const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    let jsonStr;
+    if (typeof atob === "function") {
+      const bin = atob(padded);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+      jsonStr = _td.decode(bytes);
+    } else if (typeof Buffer !== "undefined") {
+      jsonStr = Buffer.from(padded, "base64").toString("utf8");
+    } else {
+      return null;
+    }
+    const payload = JSON.parse(jsonStr);
+    return payload && typeof payload === "object" ? payload : null;
+  } catch {
+    return null;
+  }
+}
+
+function _parseJwtExpMs(token) {
+  const payload = _parseJwtPayload(token);
+  return payload && typeof payload.exp === "number" && Number.isFinite(payload.exp)
+    ? payload.exp * 1000
+    : null;
+}
+
+function _isSameJwtUser(prevToken, nextToken) {
+  if (!prevToken || !nextToken) return false;
+  const p1 = _parseJwtPayload(prevToken);
+  const p2 = _parseJwtPayload(nextToken);
+  if (!p1 || !p2) return false;
+  if (typeof p1.sub !== "string" || !p1.sub || p1.sub !== p2.sub) return false;
+  return (p1.iss ?? null) === (p2.iss ?? null);
+}
+
 export class ConcaveClient {
   constructor(url, options = {}) {
     this.status = signal("connecting");
     this.commitTs = signal(0);
     this.identity = signal(null);
+    this.isAuthenticated = signal(false);
 
     this._binary = options.protocol ? options.protocol === "binary" : !options.webSocketImpl;
     this._wsUrl = normalizeWsUrl(url, this._binary);
@@ -173,6 +247,18 @@ export class ConcaveClient {
     this._nextId = 1;
 
     this._authToken = options.authToken ?? null;
+    this._fetchToken = typeof options.fetchToken === "function" ? options.fetchToken : null;
+    this._refreshMarginMs = options.refreshMarginMs ?? 30_000;
+    this._refreshTimer = null;
+    this._refreshPromise = null;
+    this._refreshPromiseForced = false;
+    this._authRejectionRetried = false;
+    this._authGen = 0;
+    this._hasOpenedOnce = false;
+    this._warnIfInsecureAuth(this._authToken);
+    if (this._authToken && this._fetchToken) {
+      this._scheduleTokenRefresh();
+    }
     this._liveReload = options.liveReload ?? true;
     this._onReload = options.onReload ?? null;
     this._subsByKey = new Map();
@@ -198,25 +284,38 @@ export class ConcaveClient {
     ws.addEventListener("open", () => {
       if (this._ws !== ws) return;
       this._reconnectAttempt = 0;
+      this._authRejectionRetried = false;
       this.status.set("connected");
 
-      if (this._authToken !== null) {
-        this._sendRaw({ type: "authenticate", token: this._authToken });
-      }
+      const flushOnOpen = () => {
+        if (this._ws !== ws || ws.readyState !== this._WsCtor.OPEN) return;
 
-      for (const entry of this._subsByKey.values()) {
-        this._sendRaw({
-          type: "subscribe",
-          sub_id: entry.subId,
-          name: entry.name,
-          args: entry.args,
-        });
-      }
+        if (this._authToken !== null) {
+          this._sendRaw({ type: "authenticate", token: this._authToken });
+        }
 
-      while (this._outboundQueue.length > 0) {
-        const frame = this._outboundQueue.shift();
-        if (frame.req_id) this._inFlight.add(frame.req_id);
-        ws.send(this._binary ? encodeBinaryFrame(frame) : JSON.stringify(frame));
+        for (const entry of this._subsByKey.values()) {
+          this._sendRaw({
+            type: "subscribe",
+            sub_id: entry.subId,
+            name: entry.name,
+            args: entry.args,
+          });
+        }
+
+        while (this._outboundQueue.length > 0) {
+          const frame = this._outboundQueue.shift();
+          if (frame.req_id) this._inFlight.add(frame.req_id);
+          ws.send(this._binary ? encodeBinaryFrame(frame) : JSON.stringify(frame));
+        }
+      };
+
+      const isBootstrap = !this._hasOpenedOnce;
+      this._hasOpenedOnce = true;
+      if (this._fetchToken) {
+        this._refreshAuthToken(false, { send: false, bootstrap: isBootstrap }).finally(flushOnOpen);
+      } else {
+        flushOnOpen();
       }
     });
 
@@ -226,9 +325,14 @@ export class ConcaveClient {
         if (event.data instanceof ArrayBuffer || ArrayBuffer.isView(event.data)) {
           this._handleServerFrame(decodeBinaryFrame(event.data));
         } else if (typeof Blob !== "undefined" && event.data instanceof Blob) {
-          event.data.arrayBuffer().then((ab) => {
-            if (this._ws === ws) this._handleServerFrame(decodeBinaryFrame(ab));
-          });
+          event.data
+            .arrayBuffer()
+            .then((ab) => {
+              if (this._ws === ws) this._handleServerFrame(decodeBinaryFrame(ab));
+            })
+            .catch((err) => {
+              console.error("[concave-client] malformed binary blob frame:", err);
+            });
         } else {
           const raw = typeof event.data === "string" ? event.data : String(event.data);
           this._handleServerFrame(JSON.parse(raw));
@@ -252,9 +356,20 @@ export class ConcaveClient {
     });
   }
 
+  _warnIfInsecureAuth(token) {
+    if (!token || !this._wsUrl.startsWith("ws://")) return;
+    try {
+      const host = new URL(this._wsUrl).hostname;
+      if (host !== "localhost" && host !== "127.0.0.1" && host !== "::1" && host !== "[::1]") {
+        console.warn("[concave-client] sending auth token over unencrypted ws:// connection");
+      }
+    } catch {}
+  }
+
   _scheduleReconnect() {
     this.status.set("reconnecting");
-    const delayMs = Math.min(5000, 200 * 2 ** Math.min(this._reconnectAttempt, 5));
+    const baseMs = Math.min(5000, 200 * 2 ** Math.min(this._reconnectAttempt, 5));
+    const delayMs = Math.round(baseMs * (0.75 + Math.random() * 0.5));
     this._reconnectAttempt += 1;
     this._reconnectTimer = setTimeout(() => {
       this._reconnectTimer = null;
@@ -285,6 +400,13 @@ export class ConcaveClient {
       if (payload.req_id) this._inFlight.add(payload.req_id);
       this._ws.send(this._binary ? encodeBinaryFrame(payload) : JSON.stringify(payload));
     } else if (payload.req_id) {
+      if (this._outboundQueue.length >= MAX_OUTBOUND_QUEUE) {
+        const pending = this._pending.get(payload.req_id);
+        this._pending.delete(payload.req_id);
+        this._removeOptimistic(payload.req_id);
+        pending?.reject(new Error("Outbound RPC queue full"));
+        return;
+      }
       // Only queue RPCs; `authenticate` and active `subscribe` frames are re-emitted cleanly on `open`
       // without duplicating subscriptions or sending stale auth frames.
       this._outboundQueue.push(payload);
@@ -295,10 +417,18 @@ export class ConcaveClient {
     switch (frame.type) {
       case "auth_result": {
         if (frame.ok) {
-          this.identity.set(frame.identity ?? null);
+          this._authRejectionRetried = false;
+          this._setIdentity(frame.identity ?? null);
+        } else if (this._fetchToken && !this._authRejectionRetried) {
+          this._authRejectionRetried = true;
+          this._refreshAuthToken(true, { send: true }).then((nextToken) => {
+            if (this._closed) return;
+            if (!nextToken) {
+              this._clearAuthOnFailure(frame.error);
+            }
+          });
         } else {
-          this.identity.set(null);
-          console.warn("[concave-client] auth rejected:", frame.error);
+          this._clearAuthOnFailure(frame.error);
         }
         break;
       }
@@ -406,12 +536,148 @@ export class ConcaveClient {
     });
   }
 
-  setAuth(token) {
-    this._authToken = token;
-    if (token === null) {
-      this.identity.set(null);
+  _parseJwtExpMs(token) {
+    return _parseJwtExpMs(token);
+  }
+
+  _setIdentity(identity) {
+    batch(() => {
+      this.identity.set(identity);
+      this.isAuthenticated.set(identity !== null);
+    });
+  }
+
+  _clearRefreshTimer() {
+    if (this._refreshTimer !== null) {
+      clearTimeout(this._refreshTimer);
+      this._refreshTimer = null;
     }
-    this._sendRaw({ type: "authenticate", token });
+  }
+
+  _scheduleTokenRefresh() {
+    this._clearRefreshTimer();
+    if (this._closed || !this._fetchToken || !this._authToken) return;
+    const expMs = this._parseJwtExpMs(this._authToken);
+    if (expMs === null) return;
+    const delayMs = Math.max(1000, expMs - Date.now() - this._refreshMarginMs);
+    this._refreshTimer = setTimeout(() => {
+      this._refreshTimer = null;
+      if (this._closed || !this._fetchToken) return;
+      void this._refreshAuthToken(true, { send: true });
+    }, delayMs);
+  }
+
+  async _refreshAuthToken(forceRefresh = false, { send = true, bootstrap = false } = {}) {
+    if (!this._fetchToken || this._closed) return null;
+    if (this._refreshPromise && (!forceRefresh || this._refreshPromiseForced)) {
+      return this._refreshPromise;
+    }
+    const fetcher = this._fetchToken;
+    const gen = this._authGen;
+    const run = (async () => {
+      try {
+        const token = await fetcher({ forceRefresh });
+        if (this._closed || this._fetchToken !== fetcher || this._authGen !== gen) return null;
+        const next = token ?? null;
+        this._applyAuthToken(next, { send, bootstrap, resetRetry: false, bumpGen: false });
+        return next;
+      } catch (err) {
+        console.warn("[concave-client] fetchToken failed:", err);
+        return null;
+      } finally {
+        if (this._refreshPromise === run) {
+          this._refreshPromise = null;
+          this._refreshPromiseForced = false;
+        }
+      }
+    })();
+    this._refreshPromise = run;
+    this._refreshPromiseForced = forceRefresh;
+    return run;
+  }
+
+  _resetAuthContextState() {
+    this._optimisticQueue.length = 0;
+    if (this._outboundQueue.length > 0) {
+      const dropped = this._outboundQueue.splice(0);
+      const err = new Error("Auth context changed");
+      for (const frame of dropped) {
+        if (frame.req_id) {
+          const pending = this._pending.get(frame.req_id);
+          this._pending.delete(frame.req_id);
+          pending?.reject(err);
+        }
+      }
+    }
+    if (this._subsByKey.size > 0) {
+      batch(() => {
+        for (const entry of this._subsByKey.values()) {
+          const loading = { status: "loading", data: undefined, error: undefined };
+          entry.serverState = loading;
+          entry.signal.set(loading);
+        }
+      });
+    }
+  }
+
+  _clearAuthOnFailure(error) {
+    this._authGen += 1;
+    this._clearRefreshTimer();
+    this._authToken = null;
+    this._setIdentity(null);
+    this._resetAuthContextState();
+    console.warn("[concave-client] auth rejected:", error);
+  }
+
+  _applyAuthToken(token, { send = true, bootstrap = false, resetRetry = true, bumpGen = true } = {}) {
+    const nextToken = token ?? null;
+    if (bumpGen) this._authGen += 1;
+    if (resetRetry) this._authRejectionRetried = false;
+    this._warnIfInsecureAuth(nextToken);
+    const prevToken = this._authToken;
+    const changed = prevToken !== nextToken;
+    this._authToken = nextToken;
+
+    if (nextToken === null) {
+      this._clearRefreshTimer();
+    } else {
+      this._scheduleTokenRefresh();
+    }
+
+    if (changed) {
+      const sameUserRotation = _isSameJwtUser(prevToken, nextToken);
+      const initialBootstrap = bootstrap && prevToken === null && nextToken !== null;
+      if (!sameUserRotation && !initialBootstrap) {
+        this._setIdentity(null);
+        this._resetAuthContextState();
+      }
+    }
+
+    if (send) {
+      this._sendRaw({ type: "authenticate", token: nextToken });
+    }
+  }
+
+  getToken() {
+    return this._authToken;
+  }
+
+  setTokenFetcher(fn) {
+    this._fetchToken = typeof fn === "function" ? fn : null;
+    this._authRejectionRetried = false;
+    if (this._fetchToken) {
+      if (this._authToken) {
+        this._scheduleTokenRefresh();
+      } else if (this._ws && this._ws.readyState === this._WsCtor.OPEN) {
+        void this._refreshAuthToken(false, { send: true });
+      }
+    } else {
+      this._clearRefreshTimer();
+    }
+  }
+
+  setAuth(token) {
+    this._applyAuthToken(token, { send: true, bootstrap: false, resetRetry: true, bumpGen: true });
   }
 
   _acquireSub(name, args) {
@@ -519,12 +785,21 @@ export class ConcaveClient {
 
   close() {
     this._closed = true;
+    this._clearRefreshTimer();
     if (this._reconnectTimer !== null) {
       clearTimeout(this._reconnectTimer);
       this._reconnectTimer = null;
     }
     this._ws?.close();
     this._ws = null;
+    const err = new Error("Client closed");
+    for (const pending of this._pending.values()) {
+      pending.reject(err);
+    }
+    this._pending.clear();
+    this._inFlight.clear();
+    this._outboundQueue.length = 0;
+    this._optimisticQueue.length = 0;
     this.status.set("closed");
   }
 }

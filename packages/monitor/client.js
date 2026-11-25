@@ -24,17 +24,20 @@ export function toAttrs(input) {
   return out;
 }
 
+const FORBIDDEN_ATTR_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
 /**
- * Convert `Array<{ key: string, value: string }>` back into a plain JS object.
+ * Convert `Array<{ key: string, value: string }>` back into a null-prototype JS object.
  *
  * @param {Array<{ key: string, value: string }> | null | undefined} attrs
  * @returns {Record<string, string>}
  */
 export function fromAttrs(attrs) {
   /** @type {Record<string, string>} */
-  const out = {};
+  const out = Object.create(null);
   if (!attrs) return out;
   for (const a of attrs) {
+    if (!a || typeof a.key !== "string" || FORBIDDEN_ATTR_KEYS.has(a.key)) continue;
     out[a.key] = a.value;
   }
   return out;
@@ -45,7 +48,25 @@ function randomId(prefix) {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
   }
-  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    const bytes = new Uint8Array(8);
+    crypto.getRandomValues(bytes);
+    let hex = "";
+    for (const b of bytes) hex += b.toString(16).padStart(2, "0");
+    return `${prefix}_${hex}`;
+  }
+  throw new Error("Cryptographically secure random generator is unavailable");
+}
+
+/** @param {string} raw @param {boolean} keepQuery */
+function sanitizeUrl(raw, keepQuery) {
+  if (!raw || keepQuery) return raw;
+  try {
+    const u = new URL(raw);
+    return `${u.origin}${u.pathname}`;
+  } catch {
+    return raw.split(/[?#]/, 1)[0];
+  }
 }
 
 /**
@@ -59,6 +80,7 @@ function randomId(prefix) {
  *   release?: string,
  *   environment?: string,
  *   captureGlobalErrors?: boolean,
+ *   captureQueryParams?: boolean,
  *   maxBreadcrumbs?: number,
  * }} [options]
  */
@@ -66,6 +88,7 @@ export function createMonitor(client, monitorApi, options = {}) {
   const defaultService = options.service ?? "frontend";
   const release = options.release ?? "";
   const environment = options.environment ?? "";
+  const captureQueryParams = options.captureQueryParams === true;
   const maxBreadcrumbs = options.maxBreadcrumbs ?? 20;
 
   /** @type {Array<{ ts: number, category: string, message: string }>} */
@@ -88,7 +111,7 @@ export function createMonitor(client, monitorApi, options = {}) {
     if (release) base.release = release;
     if (environment) base.environment = environment;
     if (typeof window !== "undefined" && window.location) {
-      base.url = window.location.href;
+      base.url = sanitizeUrl(window.location.href, captureQueryParams);
     }
     if (breadcrumbs.length > 0) {
       base.breadcrumbs = breadcrumbs
@@ -420,7 +443,11 @@ export function createMonitor(client, monitorApi, options = {}) {
       const err = ev.error ?? new Error(ev.message || "Uncaught window error");
       captureException(err, {
         source: defaultService,
-        attrs: { filename: ev.filename ?? "", lineno: ev.lineno ?? 0, colno: ev.colno ?? 0 },
+        attrs: {
+          filename: sanitizeUrl(ev.filename ?? "", captureQueryParams),
+          lineno: ev.lineno ?? 0,
+          colno: ev.colno ?? 0,
+        },
       }).catch(() => {});
     };
     /** @param {PromiseRejectionEvent} ev */

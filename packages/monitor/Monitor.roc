@@ -316,6 +316,8 @@ Monitor := [Monitor].{
     Mount : {
         namespace : Str,
         require_auth_for_admin : Bool,
+        admin_roles : List(Str),
+        allow_insecure_webhooks : Bool,
         max_batch_size : I64,
         default_retention_ms : I64,
         spec : Component.ComponentSpec,
@@ -772,12 +774,12 @@ Monitor := [Monitor].{
 
     default_config : Config
     default_config = {
-        require_auth_for_admin: False,
+        require_auth_for_admin: True,
         max_batch_size: 100,
         default_retention_ms: 604800000, # 7 days
     }
 
-    ## Mount an isolated Monitor component under `namespace` with default config.
+    ## Mount an isolated Monitor component under `namespace` with secure defaults.
     mount : Str -> Mount
     mount = |namespace| mount_with(namespace, default_config)
 
@@ -786,7 +788,9 @@ Monitor := [Monitor].{
     mount_with = |namespace, cfg| {
         namespace,
         require_auth_for_admin: cfg.require_auth_for_admin,
-        max_batch_size: if cfg.max_batch_size <= 0 { 100 } else { cfg.max_batch_size },
+        admin_roles: ["admin"],
+        allow_insecure_webhooks: False,
+        max_batch_size: if cfg.max_batch_size <= 0 { 100 } else if cfg.max_batch_size > 500 { 500 } else { cfg.max_batch_size },
         default_retention_ms: if cfg.default_retention_ms <= 0 { 604800000 } else { cfg.default_retention_ms },
         spec: Component.define(
             namespace,
@@ -799,6 +803,30 @@ Monitor := [Monitor].{
                 Table.spec(incidents_table),
             ],
         ),
+    }
+
+    ## Override the roles permitted to access Monitor admin/read endpoints (default: `["admin"]`; empty allows any authenticated user).
+    with_admin_roles : Mount, List(Str) -> Mount
+    with_admin_roles = |m, roles| {
+        namespace: m.namespace,
+        require_auth_for_admin: m.require_auth_for_admin,
+        admin_roles: roles,
+        allow_insecure_webhooks: m.allow_insecure_webhooks,
+        max_batch_size: m.max_batch_size,
+        default_retention_ms: m.default_retention_ms,
+        spec: m.spec,
+    }
+
+    ## Opt in to plaintext `http://` alert webhook URLs (e.g. for local testing; production should keep `False` for HTTPS-only).
+    with_insecure_webhooks : Mount, Bool -> Mount
+    with_insecure_webhooks = |m, allow| {
+        namespace: m.namespace,
+        require_auth_for_admin: m.require_auth_for_admin,
+        admin_roles: m.admin_roles,
+        allow_insecure_webhooks: allow,
+        max_batch_size: m.max_batch_size,
+        default_retention_ms: m.default_retention_ms,
+        spec: m.spec,
     }
 
     # -------------------------------------------------------------------------
@@ -832,14 +860,73 @@ Monitor := [Monitor].{
         $out
     }
 
-    require_admin_if_needed! : Bool, (() => Try(Ctx.AuthIdentity, [Unauthenticated])) => Try({}, Str)
-    require_admin_if_needed! = |req_auth, auth!|
+    is_admin_identity : Ctx.AuthIdentity, List(Str) -> Bool
+    is_admin_identity = |id, admin_roles|
+        if List.is_empty(admin_roles) {
+            True
+        } else {
+            Ctx.has_any_role(id, admin_roles)
+        }
+
+    require_admin_if_needed! : Bool, List(Str), (() => Try(Ctx.AuthIdentity, [Unauthenticated])) => Try({}, Str)
+    require_admin_if_needed! = |req_auth, admin_roles, auth!|
         if req_auth {
-            _ = Ctx.require_auth!(auth!)?
-            Ok({})
+            id = Ctx.require_auth!(auth!)?
+            if is_admin_identity(id, admin_roles) {
+                Ok({})
+            } else {
+                Err("Forbidden: admin role required")
+            }
         } else {
             Ok({})
         }
+
+    clamp_attrs : List(Attrs.Attr) -> List(Attrs.Attr)
+    clamp_attrs = |items| {
+        var $out = []
+        var $n = 0.I64
+        for item in items {
+            if $n < 64 {
+                $out = List.append($out, item)
+                $n = $n + 1
+            }
+        }
+        $out
+    }
+
+    clamp_ingest_ts : I64, I64, Bool -> I64
+    clamp_ingest_ts = |raw_ts, now, allow_historical| {
+        if raw_ts <= 0 {
+            return now
+        }
+        max_future = now + 300000 # 5 minutes
+        if raw_ts > max_future {
+            return now
+        }
+        if allow_historical {
+            return raw_ts
+        }
+        max_past = now - 2592000000 # 30 days
+        if raw_ts < max_past {
+            now
+        } else {
+            raw_ts
+        }
+    }
+
+    validate_webhook_url : Bool, Str -> Try(Str, Str)
+    validate_webhook_url = |allow_http, raw| {
+        trimmed = Str.trim(raw)
+        if Str.is_empty(trimmed) {
+            Ok("")
+        } else if Str.starts_with(trimmed, "https://") {
+            Ok(trimmed)
+        } else if allow_http and Str.starts_with(trimmed, "http://") {
+            Ok(trimmed)
+        } else {
+            Err("webhook_url must use https://")
+        }
+    }
 
     is_valid_issue_status : Str -> Bool
     is_valid_issue_status = |s| s == "open" or s == "resolved" or s == "ignored"
@@ -870,8 +957,10 @@ Monitor := [Monitor].{
 
     ## Capture an application or client error, auto-grouping into an Issue by deterministic
     ## fingerprint, auto-reopening regressions, and recording a correlated error log entry.
-    capture_error_inner! : Ctx.MutationCtx, CaptureErrorArgs => Try(CaptureErrorResult, Str)
-    capture_error_inner! = |ctx, args| {
+    ## When `trusted_caller` is False (public endpoint), untrusted client fingerprint overrides
+    ## are ignored unless the caller holds an admin role, and authenticated `user_id` is bound to `id.subject`.
+    capture_error_inner! : Bool, List(Str), Ctx.MutationCtx, CaptureErrorArgs => Try(CaptureErrorResult, Str)
+    capture_error_inner! = |trusted_caller, admin_roles, ctx, args| {
         message = Str.trim(args.message)
         if Str.is_empty(message) {
             return Err("Error message cannot be empty")
@@ -884,21 +973,34 @@ Monitor := [Monitor].{
             } else {
                 Attrs.normalize_level(args.level)
             }
-        fp = Fingerprint.compute(args.fingerprint, source, error_type, message)
+
+        auth! = ctx.auth!
+        caller_auth = auth!()
+        is_privileged =
+            trusted_caller or match caller_auth {
+                Ok(id) => is_admin_identity(id, admin_roles)
+                Err(Unauthenticated) => False
+            }
+
+        fp_override = if is_privileged { args.fingerprint } else { "" }
+        fp = Fingerprint.compute(fp_override, source, error_type, message)
 
         now_ms! = ctx.now_ms!
-        ts = if args.timestamp_ms > 0 { args.timestamp_ms } else { now_ms!() }
+        now = now_ms!()
+        ts = clamp_ingest_ts(args.timestamp_ms, now, is_privileged)
 
         user_id =
-            if !Str.is_empty(Str.trim(args.user_id)) {
-                Str.trim(args.user_id)
-            } else {
-                auth! = ctx.auth!
-                match auth!() {
-                    Ok(id) => id.subject
-                    Err(Unauthenticated) => ""
-                }
+            match caller_auth {
+                Ok(id) =>
+                    if is_privileged and !Str.is_empty(Str.trim(args.user_id)) {
+                        Str.trim(args.user_id)
+                    } else {
+                        id.subject
+                    }
+                Err(Unauthenticated) => Str.trim(args.user_id)
             }
+
+        safe_attrs = clamp_attrs(args.attrs)
 
         reader = Ctx.as_reader(ctx.db)
         existing =
@@ -911,7 +1013,7 @@ Monitor := [Monitor].{
 
         # Record a correlated structured log entry so sliding-window alerts, trace timelines,
         # and full-text log search see every occurrence automatically.
-        log_attrs = Attrs.merge(args.attrs, [
+        log_attrs = Attrs.merge(safe_attrs, [
             Attrs.attr("fingerprint", fp),
             Attrs.attr("error_type", error_type),
         ])
@@ -945,7 +1047,7 @@ Monitor := [Monitor].{
                     last_stack: args.stack,
                     last_trace_id: trace_id,
                     last_user_id: user_id,
-                    attrs: args.attrs,
+                    attrs: safe_attrs,
                     resolved_at_ms: 0,
                 })?
                 Ok({
@@ -963,7 +1065,7 @@ Monitor := [Monitor].{
                 next_resolved_at = if reopened { 0 } else { doc.resolved_at_ms }
                 next_last_seen = if ts > doc.last_seen_ms { ts } else { doc.last_seen_ms }
                 next_first_seen = if doc.first_seen_ms == 0 or ts < doc.first_seen_ms { ts } else { doc.first_seen_ms }
-                merged_attrs = Attrs.merge(doc.attrs, args.attrs)
+                merged_attrs = Attrs.merge(doc.attrs, safe_attrs) |> clamp_attrs
 
                 Db.patch!(ctx.db, issues_table, doc.id, {
                     status: next_status,
@@ -990,9 +1092,9 @@ Monitor := [Monitor].{
     }
 
     ## Update an Issue's lifecycle status (`open`, `resolved`, or `ignored`).
-    update_issue_status_inner! : Bool, Ctx.MutationCtx, UpdateIssueStatusArgs => Try(Bool, Str)
-    update_issue_status_inner! = |req_auth, ctx, args| {
-        _ = require_admin_if_needed!(req_auth, ctx.auth!)?
+    update_issue_status_inner! : Bool, List(Str), Ctx.MutationCtx, UpdateIssueStatusArgs => Try(Bool, Str)
+    update_issue_status_inner! = |req_auth, admin_roles, ctx, args| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         next_status = Str.trim(args.status)
         if !is_valid_issue_status(next_status) {
             return Err("Issue status must be `open`, `resolved`, or `ignored`")
@@ -1013,15 +1115,20 @@ Monitor := [Monitor].{
     }
 
     ## Write a structured log entry or operation span.
-    log_inner! : Ctx.MutationCtx, LogArgs => Try(Str, Str)
-    log_inner! = |ctx, args| {
+    log_inner! : List(Str), Ctx.MutationCtx, LogArgs => Try(Str, Str)
+    log_inner! = |admin_roles, ctx, args| {
         msg = Str.trim(args.message)
         if Str.is_empty(msg) {
             return Err("Log message cannot be empty")
         }
         level = Attrs.normalize_level(args.level)
+        auth! = ctx.auth!
+        is_admin = match auth!() {
+            Ok(id) => is_admin_identity(id, admin_roles)
+            Err(Unauthenticated) => False
+        }
         now_ms! = ctx.now_ms!
-        ts = if args.timestamp_ms > 0 { args.timestamp_ms } else { now_ms!() }
+        ts = clamp_ingest_ts(args.timestamp_ms, now_ms!(), is_admin)
 
         Db.insert!(ctx.db, logs_table, {
             timestamp_ms: ts,
@@ -1034,34 +1141,39 @@ Monitor := [Monitor].{
             duration_ms: if args.duration_ms < 0 { 0 } else { args.duration_ms },
             status: if Str.is_empty(Str.trim(args.status)) { "ok" } else { Str.trim(args.status) },
             message: msg,
-            attrs: args.attrs,
+            attrs: clamp_attrs(args.attrs),
         })
     }
 
     ## Atomically write a batch of structured logs/spans (bounded by `max_batch_size`).
-    log_batch_inner! : I64, Ctx.MutationCtx, LogBatchArgs => Try(BatchResult, Str)
-    log_batch_inner! = |max_batch, ctx, args| {
+    log_batch_inner! : List(Str), I64, Ctx.MutationCtx, LogBatchArgs => Try(BatchResult, Str)
+    log_batch_inner! = |admin_roles, max_batch, ctx, args| {
         count = Rollups.list_len_i64(args.entries)
         if count > max_batch {
             return Err("Log batch size ${count.to_str()} exceeds max_batch_size (${max_batch.to_str()})")
         }
         var $ids = []
         for entry in args.entries {
-            id = log_inner!(ctx, entry)?
+            id = log_inner!(admin_roles, ctx, entry)?
             $ids = List.append($ids, id)
         }
         Ok({ accepted: count, ids: $ids })
     }
 
     ## Record a single custom application metric (`counter`, `gauge`, or `timing`).
-    record_metric_inner! : Ctx.MutationCtx, RecordMetricArgs => Try(Str, Str)
-    record_metric_inner! = |ctx, args| {
+    record_metric_inner! : List(Str), Ctx.MutationCtx, RecordMetricArgs => Try(Str, Str)
+    record_metric_inner! = |admin_roles, ctx, args| {
         name = Str.trim(args.name)
         if Str.is_empty(name) {
             return Err("Metric name cannot be empty")
         }
+        auth! = ctx.auth!
+        is_admin = match auth!() {
+            Ok(id) => is_admin_identity(id, admin_roles)
+            Err(Unauthenticated) => False
+        }
         now_ms! = ctx.now_ms!
-        ts = if args.timestamp_ms > 0 { args.timestamp_ms } else { now_ms!() }
+        ts = clamp_ingest_ts(args.timestamp_ms, now_ms!(), is_admin)
 
         Db.insert!(ctx.db, metrics_table, {
             timestamp_ms: ts,
@@ -1069,39 +1181,40 @@ Monitor := [Monitor].{
             kind: normalize_metric_kind(args.kind),
             value: args.value,
             service: if Str.is_empty(Str.trim(args.service)) { "app" } else { Str.trim(args.service) },
-            attrs: args.attrs,
+            attrs: clamp_attrs(args.attrs),
         })
     }
 
     ## Atomically record a batch of application metrics (bounded by `max_batch_size`).
-    record_metric_batch_inner! : I64, Ctx.MutationCtx, RecordMetricBatchArgs => Try(BatchResult, Str)
-    record_metric_batch_inner! = |max_batch, ctx, args| {
+    record_metric_batch_inner! : List(Str), I64, Ctx.MutationCtx, RecordMetricBatchArgs => Try(BatchResult, Str)
+    record_metric_batch_inner! = |admin_roles, max_batch, ctx, args| {
         count = Rollups.list_len_i64(args.metrics)
         if count > max_batch {
             return Err("Metric batch size ${count.to_str()} exceeds max_batch_size (${max_batch.to_str()})")
         }
         var $ids = []
         for m in args.metrics {
-            id = record_metric_inner!(ctx, m)?
+            id = record_metric_inner!(admin_roles, ctx, m)?
             $ids = List.append($ids, id)
         }
         Ok({ accepted: count, ids: $ids })
     }
 
     ## Create or update an alert rule by `key`.
-    upsert_alert_rule_inner! : Bool, Ctx.MutationCtx, UpsertAlertRuleArgs => Try(Str, Str)
-    upsert_alert_rule_inner! = |req_auth, ctx, args| {
-        _ = require_admin_if_needed!(req_auth, ctx.auth!)?
+    upsert_alert_rule_inner! : Bool, List(Str), Bool, Ctx.MutationCtx, UpsertAlertRuleArgs => Try(Str, Str)
+    upsert_alert_rule_inner! = |req_auth, admin_roles, allow_http, ctx, args| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         key = Str.trim(args.key)
         if Str.is_empty(key) {
             return Err("Alert rule key cannot be empty")
         }
+        webhook_url = validate_webhook_url(allow_http, args.webhook_url)?
         now_ms! = ctx.now_ms!
         now = now_ms!()
 
         kind = normalize_rule_kind(args.kind)
         name = if Str.is_empty(Str.trim(args.name)) { key } else { Str.trim(args.name) }
-        window_ms = if args.window_ms <= 0 { 300000 } else { args.window_ms }
+        window_ms = if args.window_ms <= 0 { 300000 } else if args.window_ms > 2592000000 { 2592000000 } else { args.window_ms }
         cooldown_ms = if args.cooldown_ms < 0 { 0 } else { args.cooldown_ms }
         agg = if Str.is_empty(Str.trim(args.aggregation)) { "count" } else { Str.trim(args.aggregation) }
         op = if Str.is_empty(Str.trim(args.op)) { "gte" } else { Str.trim(args.op) }
@@ -1124,7 +1237,7 @@ Monitor := [Monitor].{
                     threshold: args.threshold,
                     window_ms,
                     cooldown_ms,
-                    webhook_url: Str.trim(args.webhook_url),
+                    webhook_url,
                     updated_at_ms: now,
                 })?
                 Ok(doc.id)
@@ -1141,7 +1254,7 @@ Monitor := [Monitor].{
                     threshold: args.threshold,
                     window_ms,
                     cooldown_ms,
-                    webhook_url: Str.trim(args.webhook_url),
+                    webhook_url,
                     status: "ok",
                     last_value: 0.0,
                     last_eval_ms: 0,
@@ -1152,9 +1265,9 @@ Monitor := [Monitor].{
     }
 
     ## Delete an alert rule by `key`.
-    delete_alert_rule_inner! : Bool, Ctx.MutationCtx, DeleteAlertRuleArgs => Try(Bool, Str)
-    delete_alert_rule_inner! = |req_auth, ctx, args| {
-        _ = require_admin_if_needed!(req_auth, ctx.auth!)?
+    delete_alert_rule_inner! : Bool, List(Str), Ctx.MutationCtx, DeleteAlertRuleArgs => Try(Bool, Str)
+    delete_alert_rule_inner! = |req_auth, admin_roles, ctx, args| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         existing =
             Db.from_index(alert_rules_by_key)
             |> Db.eq([Key.str(Str.trim(args.key))])
@@ -1169,9 +1282,9 @@ Monitor := [Monitor].{
     }
 
     ## Acknowledge a firing incident (and silence its alert rule until resolved).
-    acknowledge_incident_inner! : Bool, Ctx.MutationCtx, AcknowledgeIncidentArgs => Try(Bool, Str)
-    acknowledge_incident_inner! = |req_auth, ctx, args| {
-        _ = require_admin_if_needed!(req_auth, ctx.auth!)?
+    acknowledge_incident_inner! : Bool, List(Str), Ctx.MutationCtx, AcknowledgeIncidentArgs => Try(Bool, Str)
+    acknowledge_incident_inner! = |req_auth, admin_roles, ctx, args| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         reader = Ctx.as_reader(ctx.db)
         lookup = Db.get!(reader, incidents_table, args.incident_id)?
         match lookup {
@@ -1208,6 +1321,7 @@ Monitor := [Monitor].{
                 |> Db.gte([Key.str(rule.target), Key.int(from_ms)])
                 |> Db.lte([Key.str(rule.target), Key.int(now_ms)])
                 |> Db.asc()
+                |> Db.take(2000)
                 |> Db.collect!(db)?
             vals = docs |> List.map(|d| d.value)
             st = Rollups.compute_stats(vals)
@@ -1220,16 +1334,19 @@ Monitor := [Monitor].{
                     Db.from_index(logs_by_timestamp)
                     |> Db.gte([Key.int(from_ms)])
                     |> Db.lte([Key.int(now_ms)])
+                    |> Db.take(2000)
                     |> Db.collect!(db)?
                 } else if target == "debug" or target == "info" or target == "warn" or target == "error" or target == "fatal" {
                     Db.from_index(logs_by_level_time)
                     |> Db.gte([Key.str(target), Key.int(from_ms)])
                     |> Db.lte([Key.str(target), Key.int(now_ms)])
+                    |> Db.take(2000)
                     |> Db.collect!(db)?
                 } else {
                     Db.from_index(logs_by_service_time)
                     |> Db.gte([Key.str(target), Key.int(from_ms)])
                     |> Db.lte([Key.str(target), Key.int(now_ms)])
+                    |> Db.take(2000)
                     |> Db.collect!(db)?
                 }
             Ok(Rollups.list_len_i64(docs).to_f64())
@@ -1240,6 +1357,7 @@ Monitor := [Monitor].{
                 Db.from_index(logs_by_timestamp)
                 |> Db.gte([Key.int(from_ms)])
                 |> Db.lte([Key.int(now_ms)])
+                |> Db.take(2000)
                 |> Db.collect!(db)?
             target = Str.trim(rule.target)
             var $errs = 0.I64
@@ -1386,9 +1504,9 @@ Monitor := [Monitor].{
     }
 
     ## Delete logs, metrics, and resolved incidents older than `retention_ms`.
-    prune_inner! : Bool, I64, Ctx.MutationCtx, PruneArgs => Try(PruneResult, Str)
-    prune_inner! = |req_auth, default_retention_ms, ctx, args| {
-        _ = require_admin_if_needed!(req_auth, ctx.auth!)?
+    prune_inner! : Bool, List(Str), I64, Ctx.MutationCtx, PruneArgs => Try(PruneResult, Str)
+    prune_inner! = |req_auth, admin_roles, default_retention_ms, ctx, args| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         now_ms! = ctx.now_ms!
         ret_ms = if args.retention_ms > 0 { args.retention_ms } else { default_retention_ms }
         cutoff = now_ms!() - ret_ms
@@ -1444,8 +1562,9 @@ Monitor := [Monitor].{
     # Action: Evaluate Alert Rules & Deliver Webhooks
     # -------------------------------------------------------------------------
 
-    evaluate_and_notify_action! : Str, Ctx.ActionCtx, {} => Try(EvaluateAndNotifyResult, Str)
-    evaluate_and_notify_action! = |ns, ctx, _| {
+    evaluate_and_notify_action! : Bool, List(Str), Str, Ctx.ActionCtx, {} => Try(EvaluateAndNotifyResult, Str)
+    evaluate_and_notify_action! = |req_auth, admin_roles, ns, ctx, _| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         run_mutation! = ctx.run_mutation!
         eval_json = run_mutation!("${ns}.evaluateAlerts", "{}")?
         eval_res : EvaluateAlertsResult
@@ -1513,9 +1632,10 @@ Monitor := [Monitor].{
     # Reactive Queries (Live WebSocket Subscriptions)
     # -------------------------------------------------------------------------
 
-    ## Reactive issue inbox, filterable by `status` (`open|resolved|ignored`) or `source`.
-    list_issues_inner! : Ctx.QueryCtx, ListIssuesArgs => Try(List(IssueDoc), Str)
-    list_issues_inner! = |ctx, args| {
+    ## Reactive issue inbox (admin-gated when `req_auth` is True).
+    list_issues_inner! : Bool, List(Str), Ctx.QueryCtx, ListIssuesArgs => Try(List(IssueDoc), Str)
+    list_issues_inner! = |req_auth, admin_roles, ctx, args| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         lim = clamp_limit_u64(args.limit, 50, 200)
         status = Str.trim(args.status)
         source = Str.trim(args.source)
@@ -1546,9 +1666,10 @@ Monitor := [Monitor].{
         }
     }
 
-    ## Fetch a single issue by `issue_id` or `fingerprint`.
-    get_issue_inner! : Ctx.QueryCtx, GetIssueArgs => Try(GetIssueResult, Str)
-    get_issue_inner! = |ctx, args| {
+    ## Fetch a single issue by `issue_id` or `fingerprint` (admin-gated when `req_auth` is True).
+    get_issue_inner! : Bool, List(Str), Ctx.QueryCtx, GetIssueArgs => Try(GetIssueResult, Str)
+    get_issue_inner! = |req_auth, admin_roles, ctx, args| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         id = Str.trim(args.issue_id)
         fp = Str.trim(args.fingerprint)
         lookup =
@@ -1606,10 +1727,10 @@ Monitor := [Monitor].{
         }
     }
 
-    ## Reactive live log tail, optionally scoped by `service`, `level`, or `fn_name`
-    ## for surgical ReadSet reactivity.
-    recent_logs_inner! : Ctx.QueryCtx, RecentLogsArgs => Try(List(LogDoc), Str)
-    recent_logs_inner! = |ctx, args| {
+    ## Reactive live log tail (admin-gated when `req_auth` is True).
+    recent_logs_inner! : Bool, List(Str), Ctx.QueryCtx, RecentLogsArgs => Try(List(LogDoc), Str)
+    recent_logs_inner! = |req_auth, admin_roles, ctx, args| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         lim = clamp_limit_u64(args.limit, 50, 200)
         service = Str.trim(args.service)
         level = Str.trim(args.level)
@@ -1651,9 +1772,10 @@ Monitor := [Monitor].{
         }
     }
 
-    ## Reactive case-insensitive full-text search across log messages (`Db.search!`).
-    search_logs_inner! : Ctx.QueryCtx, SearchLogsArgs => Try(List(LogDoc), Str)
-    search_logs_inner! = |ctx, args| {
+    ## Reactive case-insensitive full-text search across log messages (admin-gated when `req_auth` is True).
+    search_logs_inner! : Bool, List(Str), Ctx.QueryCtx, SearchLogsArgs => Try(List(LogDoc), Str)
+    search_logs_inner! = |req_auth, admin_roles, ctx, args| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         q = Str.trim(args.query)
         if Str.is_empty(q) {
             return Ok([])
@@ -1662,9 +1784,10 @@ Monitor := [Monitor].{
         Db.search!(ctx.db, logs_table, "message", q, lim)
     }
 
-    ## Chronological log & span timeline for a single `trace_id`.
-    trace_logs_inner! : Ctx.QueryCtx, TraceLogsArgs => Try(List(LogDoc), Str)
-    trace_logs_inner! = |ctx, args| {
+    ## Chronological log & span timeline for a single `trace_id` (admin-gated when `req_auth` is True).
+    trace_logs_inner! : Bool, List(Str), Ctx.QueryCtx, TraceLogsArgs => Try(List(LogDoc), Str)
+    trace_logs_inner! = |req_auth, admin_roles, ctx, args| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         tid = Str.trim(args.trace_id)
         if Str.is_empty(tid) {
             return Ok([])
@@ -1677,9 +1800,10 @@ Monitor := [Monitor].{
         |> Db.collect!(ctx.db)
     }
 
-    ## Time-bucketed metric rollup with count/sum/min/max/avg/p50/p95/p99.
-    metric_series_inner! : Ctx.QueryCtx, MetricSeriesArgs => Try(Rollups.MetricSeriesResult, Str)
-    metric_series_inner! = |ctx, args| {
+    ## Time-bucketed metric rollup (admin-gated when `req_auth` is True, bounded scan).
+    metric_series_inner! : Bool, List(Str), Ctx.QueryCtx, MetricSeriesArgs => Try(Rollups.MetricSeriesResult, Str)
+    metric_series_inner! = |req_auth, admin_roles, ctx, args| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         name = Str.trim(args.name)
         if Str.is_empty(name) {
             return Err("Metric name is required")
@@ -1693,6 +1817,7 @@ Monitor := [Monitor].{
             |> Db.gte([Key.str(name), Key.int(from_ms)])
             |> Db.lte([Key.str(name), Key.int(to_ms)])
             |> Db.asc()
+            |> Db.take(2000)
             |> Db.collect!(ctx.db)?
 
         service = Str.trim(args.service)
@@ -1707,13 +1832,14 @@ Monitor := [Monitor].{
         Ok(Rollups.compute_series(name, samples, args.bucket_ms))
     }
 
-    ## Live application health overview KPIs (`open_issues`, `firing_alerts`, `top_issues`, `services`).
-    overview_inner! : Ctx.QueryCtx, OverviewArgs => Try(Rollups.OverviewResult, Str)
-    overview_inner! = |ctx, args| {
+    ## Live application health overview KPIs (admin-gated when `req_auth` is True, bounded scan).
+    overview_inner! : Bool, List(Str), Ctx.QueryCtx, OverviewArgs => Try(Rollups.OverviewResult, Str)
+    overview_inner! = |req_auth, admin_roles, ctx, args| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         now_ms! = ctx.now_ms!
         now = now_ms!()
-        win_ms = if args.window_ms > 0 { args.window_ms } else { 3600000 }
-        top_n = if args.top_n > 0 { args.top_n } else { 5 }
+        win_ms = if args.window_ms <= 0 { 3600000 } else if args.window_ms > 2592000000 { 2592000000 } else { args.window_ms }
+        top_n = if args.top_n <= 0 { 5 } else if args.top_n > 100 { 100 } else { args.top_n }
         from_ms = now - win_ms
 
         all_issues =
@@ -1753,6 +1879,7 @@ Monitor := [Monitor].{
             Db.from_index(logs_by_timestamp)
             |> Db.gte([Key.int(from_ms)])
             |> Db.lte([Key.int(now)])
+            |> Db.take(2000)
             |> Db.collect!(ctx.db)?
 
         var $err_events = 0.I64
@@ -1767,7 +1894,7 @@ Monitor := [Monitor].{
             }
         }
 
-        rules = Db.query(alert_rules_table) |> Db.asc() |> Db.collect!(ctx.db)?
+        rules = Db.query(alert_rules_table) |> Db.asc() |> Db.take(500) |> Db.collect!(ctx.db)?
         var $active_rules = 0.I64
         var $firing_alerts = 0.I64
         for r in rules {
@@ -1791,14 +1918,44 @@ Monitor := [Monitor].{
         })
     }
 
-    ## List all configured alert rules and their live states (`ok`, `firing`, `acked`).
-    list_alert_rules_inner! : Ctx.QueryCtx, {} => Try(List(AlertRuleDoc), Str)
-    list_alert_rules_inner! = |ctx, _|
-        Db.query(alert_rules_table) |> Db.asc() |> Db.collect!(ctx.db)
+    redact_alert_rule : AlertRuleDoc -> AlertRuleDoc
+    redact_alert_rule = |r| {
+        id: r.id,
+        created_at: r.created_at,
+        key: r.key,
+        name: r.name,
+        active: r.active,
+        kind: r.kind,
+        target: r.target,
+        aggregation: r.aggregation,
+        op: r.op,
+        threshold: r.threshold,
+        window_ms: r.window_ms,
+        cooldown_ms: r.cooldown_ms,
+        webhook_url: if Str.is_empty(Str.trim(r.webhook_url)) { "" } else { "[redacted]" },
+        status: r.status,
+        last_value: r.last_value,
+        last_eval_ms: r.last_eval_ms,
+        last_triggered_ms: r.last_triggered_ms,
+        updated_at_ms: r.updated_at_ms,
+    }
 
-    ## List alert incidents (filterable by `status` or `rule_key`, newest first).
-    list_incidents_inner! : Ctx.QueryCtx, ListIncidentsArgs => Try(List(IncidentDoc), Str)
-    list_incidents_inner! = |ctx, args| {
+    ## List all configured alert rules (admin-gated when `req_auth` is True, webhook URLs redacted on public API).
+    list_alert_rules_inner! : Bool, List(Str), Bool, Ctx.QueryCtx, {} => Try(List(AlertRuleDoc), Str)
+    list_alert_rules_inner! = |req_auth, admin_roles, redact_webhooks, ctx, _| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
+        rules = Db.query(alert_rules_table) |> Db.asc() |> Db.take(500) |> Db.collect!(ctx.db)?
+        if redact_webhooks {
+            Ok(rules |> List.map(redact_alert_rule))
+        } else {
+            Ok(rules)
+        }
+    }
+
+    ## List alert incidents (admin-gated when `req_auth` is True).
+    list_incidents_inner! : Bool, List(Str), Ctx.QueryCtx, ListIncidentsArgs => Try(List(IncidentDoc), Str)
+    list_incidents_inner! = |req_auth, admin_roles, ctx, args| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         lim = clamp_limit_u64(args.limit, 50, 200)
         status = Str.trim(args.status)
         rule_key = Str.trim(args.rule_key)
@@ -1837,7 +1994,7 @@ Monitor := [Monitor].{
     capture_error! : Mount, Ctx.MutationCtx, CaptureErrorArgs => Try(CaptureErrorResult, Str)
     capture_error! = |m, parent_ctx, args| {
         scoped = Ctx.scope_mutation(parent_ctx, m.namespace)
-        capture_error_inner!(scoped, args)
+        capture_error_inner!(True, [], scoped, args)
     }
 
     ## Write a structured log inside a parent app mutation's exact same ACID transaction.
@@ -1845,7 +2002,7 @@ Monitor := [Monitor].{
     log! : Mount, Ctx.MutationCtx, LogArgs => Try(Str, Str)
     log! = |m, parent_ctx, args| {
         scoped = Ctx.scope_mutation(parent_ctx, m.namespace)
-        log_inner!(scoped, args)
+        log_inner!(m.admin_roles, scoped, args)
     }
 
     ## Ergonomic one-liner to log an info message inside a parent app mutation.
@@ -1900,7 +2057,7 @@ Monitor := [Monitor].{
     record_metric! : Mount, Ctx.MutationCtx, Str, Str, F64, Str, List(Attrs.Attr) => Try(Str, Str)
     record_metric! = |m, parent_ctx, name, kind, value, service, attrs| {
         scoped = Ctx.scope_mutation(parent_ctx, m.namespace)
-        record_metric_inner!(scoped, {
+        record_metric_inner!(m.admin_roles, scoped, {
             name,
             kind,
             value,
@@ -1914,14 +2071,14 @@ Monitor := [Monitor].{
     upsert_alert_rule_in_tx! : Mount, Ctx.MutationCtx, UpsertAlertRuleArgs => Try(Str, Str)
     upsert_alert_rule_in_tx! = |m, parent_ctx, args| {
         scoped = Ctx.scope_mutation(parent_ctx, m.namespace)
-        upsert_alert_rule_inner!(False, scoped, args)
+        upsert_alert_rule_inner!(False, [], m.allow_insecure_webhooks, scoped, args)
     }
 
-    ## List all alert rules from inside a parent app query or mutation (via `Ctx.as_query_ctx`).
+    ## List all alert rules from inside a parent app query or mutation (trusted server-side caller).
     list_alert_rules_in_query! : Mount, Ctx.QueryCtx => Try(List(AlertRuleDoc), Str)
     list_alert_rules_in_query! = |m, parent_ctx| {
         scoped = Ctx.scope_query(parent_ctx, m.namespace)
-        list_alert_rules_inner!(scoped, {})
+        list_alert_rules_inner!(False, [], False, scoped, {})
     }
 
     # -------------------------------------------------------------------------
@@ -1929,11 +2086,13 @@ Monitor := [Monitor].{
     # -------------------------------------------------------------------------
 
     ## Attach the mounted Monitor component's isolated tables, mutations, reactive queries,
-    ## and webhook alert notification action to `App`.
+    ## internal scheduler helpers, and webhook alert notification action to `App`.
     attach : App, Mount -> App
     attach = |spec, m| {
         ns = m.namespace
         req_auth = m.require_auth_for_admin
+        admin_roles = m.admin_roles
+        allow_http = m.allow_insecure_webhooks
         max_batch = m.max_batch_size
         default_ret = m.default_retention_ms
 
@@ -1950,173 +2109,190 @@ Monitor := [Monitor].{
             "${ns}.captureError",
             capture_error_args_schema,
             capture_error_result_schema,
-            capture_error_inner!,
+            |ctx, args| capture_error_inner!(False, admin_roles, ctx, args),
         )
         |> App.component_mutation(
             ns,
             "${ns}.updateIssueStatus",
             update_issue_status_args_schema,
             Schema.bool,
-            |ctx, args| update_issue_status_inner!(req_auth, ctx, args),
+            |ctx, args| update_issue_status_inner!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_mutation(
             ns,
             "${ns}.log",
             log_args_schema,
             Schema.scoped_id(ns, "logs"),
-            log_inner!,
+            |ctx, args| log_inner!(admin_roles, ctx, args),
         )
         |> App.component_mutation(
             ns,
             "${ns}.logBatch",
             log_batch_args_schema,
             batch_result_schema,
-            |ctx, args| log_batch_inner!(max_batch, ctx, args),
+            |ctx, args| log_batch_inner!(admin_roles, max_batch, ctx, args),
         )
         |> App.component_mutation(
             ns,
             "${ns}.recordMetric",
             record_metric_args_schema,
             Schema.scoped_id(ns, "metrics"),
-            record_metric_inner!,
+            |ctx, args| record_metric_inner!(admin_roles, ctx, args),
         )
         |> App.component_mutation(
             ns,
             "${ns}.recordMetricBatch",
             record_metric_batch_args_schema,
             batch_result_schema,
-            |ctx, args| record_metric_batch_inner!(max_batch, ctx, args),
+            |ctx, args| record_metric_batch_inner!(admin_roles, max_batch, ctx, args),
         )
         |> App.component_mutation(
             ns,
             "${ns}.upsertAlertRule",
             upsert_alert_rule_args_schema,
             Schema.scoped_id(ns, "alert_rules"),
-            |ctx, args| upsert_alert_rule_inner!(req_auth, ctx, args),
+            |ctx, args| upsert_alert_rule_inner!(req_auth, admin_roles, allow_http, ctx, args),
         )
         |> App.component_mutation(
             ns,
             "${ns}.deleteAlertRule",
             delete_alert_rule_args_schema,
             Schema.bool,
-            |ctx, args| delete_alert_rule_inner!(req_auth, ctx, args),
+            |ctx, args| delete_alert_rule_inner!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_mutation(
             ns,
             "${ns}.acknowledgeIncident",
             acknowledge_incident_args_schema,
             Schema.bool,
-            |ctx, args| acknowledge_incident_inner!(req_auth, ctx, args),
+            |ctx, args| acknowledge_incident_inner!(req_auth, admin_roles, ctx, args),
         )
-        |> App.component_mutation(
+        # Internal-only helper mutations (callable by evaluateAndNotify & crons; rejected on public HTTP/WS)
+        |> App.component_internal_mutation(
             ns,
             "${ns}.evaluateAlerts",
             Schema.record([]),
             evaluate_alerts_result_schema,
             evaluate_alerts_inner!,
         )
-        |> App.component_mutation(
+        |> App.component_internal_mutation(
             ns,
             "${ns}.markWebhookDelivered",
             mark_delivered_args_schema,
             Schema.bool,
             mark_delivered_inner!,
         )
+        |> App.component_internal_mutation(
+            ns,
+            "${ns}._cronPrune",
+            prune_args_schema,
+            prune_result_schema,
+            |ctx, args| prune_inner!(False, [], default_ret, ctx, args),
+        )
         |> App.component_mutation(
             ns,
             "${ns}.prune",
             prune_args_schema,
             prune_result_schema,
-            |ctx, args| prune_inner!(req_auth, default_ret, ctx, args),
+            |ctx, args| prune_inner!(req_auth, admin_roles, default_ret, ctx, args),
         )
-        # Action (evaluates rules + sends HTTP webhooks)
+        # Actions (evaluates rules + sends HTTP webhooks)
         |> App.action(
             "${ns}.evaluateAndNotify",
             Schema.record([]),
             evaluate_and_notify_result_schema,
-            |ctx, args| evaluate_and_notify_action!(ns, ctx, args),
+            |ctx, args| evaluate_and_notify_action!(req_auth, admin_roles, ns, ctx, args),
         )
-        # Reactive Queries
+        |> App.component_internal_action(
+            ns,
+            "${ns}._cronEvaluateAndNotify",
+            Schema.record([]),
+            evaluate_and_notify_result_schema,
+            |ctx, args| evaluate_and_notify_action!(False, [], ns, ctx, args),
+        )
+        # Reactive Queries (admin-gated when `req_auth` is True)
         |> App.component_query(
             ns,
             "${ns}.overview",
             overview_args_schema,
             overview_result_schema,
-            overview_inner!,
+            |ctx, args| overview_inner!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_query(
             ns,
             "${ns}.listIssues",
             list_issues_args_schema,
             Schema.list(issue_doc_schema),
-            list_issues_inner!,
+            |ctx, args| list_issues_inner!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_query(
             ns,
             "${ns}.getIssue",
             get_issue_args_schema,
             get_issue_result_schema,
-            get_issue_inner!,
+            |ctx, args| get_issue_inner!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_query(
             ns,
             "${ns}.recentLogs",
             recent_logs_args_schema,
             Schema.list(log_doc_schema),
-            recent_logs_inner!,
+            |ctx, args| recent_logs_inner!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_query(
             ns,
             "${ns}.searchLogs",
             search_logs_args_schema,
             Schema.list(log_doc_schema),
-            search_logs_inner!,
+            |ctx, args| search_logs_inner!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_query(
             ns,
             "${ns}.traceLogs",
             trace_logs_args_schema,
             Schema.list(log_doc_schema),
-            trace_logs_inner!,
+            |ctx, args| trace_logs_inner!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_query(
             ns,
             "${ns}.metricSeries",
             metric_series_args_schema,
             metric_series_result_schema,
-            metric_series_inner!,
+            |ctx, args| metric_series_inner!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_query(
             ns,
             "${ns}.listAlertRules",
             Schema.record([]),
             Schema.list(alert_rule_doc_schema),
-            list_alert_rules_inner!,
+            |ctx, args| list_alert_rules_inner!(req_auth, admin_roles, True, ctx, args),
         )
         |> App.component_query(
             ns,
             "${ns}.listIncidents",
             list_incidents_args_schema,
             Schema.list(incident_doc_schema),
-            list_incidents_inner!,
+            |ctx, args| list_incidents_inner!(req_auth, admin_roles, ctx, args),
         )
     }
 
     ## Attach the Monitor component AND wire recurring `App.cron` schedules for
     ## alert evaluation + webhook delivery (`eval_interval_ms > 0`) and retention pruning (`prune_interval_ms > 0`).
+    ## Crons invoke internal endpoints (`_cronEvaluateAndNotify`, `_cronPrune`) so they continue working
+    ## seamlessly with `require_auth_for_admin: True`.
     attach_with_cron : App, Mount, I64, I64 -> App
     attach_with_cron = |spec, m, eval_interval_ms, prune_interval_ms| {
         ns = m.namespace
         with_comp = attach(spec, m)
         with_eval =
             if eval_interval_ms > 0 {
-                with_comp |> App.cron("${ns}_eval_alerts", eval_interval_ms, "${ns}.evaluateAndNotify", "{}")
+                with_comp |> App.cron("${ns}_eval_alerts", eval_interval_ms, "${ns}._cronEvaluateAndNotify", "{}")
             } else {
                 with_comp
             }
         if prune_interval_ms > 0 {
             prune_args = "{\"retention_ms\":${m.default_retention_ms.to_str()},\"max_delete\":250}"
-            with_eval |> App.cron("${ns}_prune", prune_interval_ms, "${ns}.prune", prune_args)
+            with_eval |> App.cron("${ns}_prune", prune_interval_ms, "${ns}._cronPrune", prune_args)
         } else {
             with_eval
         }
@@ -2126,6 +2302,7 @@ Monitor := [Monitor].{
 expect {
     m = Monitor.mount("monitor")
     m.namespace == "monitor"
+    and m.require_auth_for_admin
     and m.spec.pkg_name == "concave-monitor"
     and List.len(m.spec.tables) == 5
 }
@@ -2141,8 +2318,8 @@ expect {
     and m.require_auth_for_admin
     and m.max_batch_size == 50
     and List.len(spec.components) == 1
-    and List.len(spec.mutations) == 12
-    and List.len(spec.actions) == 1
+    and List.len(spec.mutations) == 13
+    and List.len(spec.actions) == 2
     and List.len(spec.queries) == 9
     and List.len(spec.crons) == 2
 }

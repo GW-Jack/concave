@@ -24,17 +24,20 @@ export function toProps(input) {
   return out;
 }
 
+const FORBIDDEN_PROP_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
 /**
- * Convert `Array<{ key: string, value: string }>` back into a plain JS object.
+ * Convert `Array<{ key: string, value: string }>` back into a null-prototype JS object.
  *
  * @param {Array<{ key: string, value: string }> | null | undefined} props
  * @returns {Record<string, string>}
  */
 export function fromProps(props) {
   /** @type {Record<string, string>} */
-  const out = {};
+  const out = Object.create(null);
   if (!props) return out;
   for (const p of props) {
+    if (!p || typeof p.key !== "string" || FORBIDDEN_PROP_KEYS.has(p.key)) continue;
     out[p.key] = p.value;
   }
   return out;
@@ -45,7 +48,25 @@ function randomId(prefix) {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return `${prefix}_${crypto.randomUUID()}`;
   }
-  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    let hex = "";
+    for (const b of bytes) hex += b.toString(16).padStart(2, "0");
+    return `${prefix}_${hex}`;
+  }
+  throw new Error("Cryptographically secure random generator is unavailable");
+}
+
+/** @param {string} raw @param {boolean} keepQuery */
+function sanitizeUrl(raw, keepQuery) {
+  if (!raw || keepQuery) return raw;
+  try {
+    const u = new URL(raw);
+    return `${u.origin}${u.pathname}`;
+  } catch {
+    return raw.split(/[?#]/, 1)[0];
+  }
 }
 
 /**
@@ -60,10 +81,12 @@ function randomId(prefix) {
  *   storageKeyPrefix?: string,
  *   storage?: Pick<Storage, "getItem" | "setItem" | "removeItem"> | null,
  *   defaultGroup?: { type: string, key: string } | null,
+ *   captureQueryParams?: boolean,
  * }} [options]
  */
 export function createAnalytics(client, analyticsApi, options = {}) {
   const prefix = options.storageKeyPrefix ?? "concave_analytics";
+  const captureQueryParams = options.captureQueryParams === true;
   const storage =
     options.storage !== undefined
       ? options.storage
@@ -118,12 +141,12 @@ export function createAnalytics(client, analyticsApi, options = {}) {
     /** @type {Record<string, unknown>} */
     const autoProps = {};
     if (typeof window !== "undefined" && window.location) {
-      autoProps.$current_url = window.location.href;
+      autoProps.$current_url = sanitizeUrl(window.location.href, captureQueryParams);
       autoProps.$pathname = window.location.pathname;
       autoProps.$host = window.location.host;
     }
     if (typeof document !== "undefined" && document.referrer) {
-      autoProps.$referrer = document.referrer;
+      autoProps.$referrer = sanitizeUrl(document.referrer, captureQueryParams);
     }
     return await capture("$pageview", { ...autoProps, ...extraProps });
   }

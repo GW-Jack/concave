@@ -1,10 +1,12 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const blob_store_mod = @import("../core/blob_store.zig");
+const crypto_mod = @import("../core/crypto.zig");
 const key_mod = @import("../core/key.zig");
 const manifest_mod = @import("../core/manifest.zig");
 const readset_mod = @import("../core/readset.zig");
 const schema_validate = @import("../core/schema_validate.zig");
+const secrets_mod = @import("../core/secrets.zig");
 const storage_mod = @import("../core/storage.zig");
 const auth_mod = @import("auth.zig");
 const http_client = @import("http_client.zig");
@@ -13,6 +15,8 @@ const tx_mod = @import("tx.zig");
 const ws_mod = @import("ws.zig");
 
 const MAX_OCC_RETRIES: usize = 8;
+pub const MAX_SUBS_PER_CLIENT: usize = 128;
+pub const MAX_SUB_ID_LEN: usize = 256;
 
 pub const ExecResult = union(enum) {
     ok: []u8,
@@ -60,6 +64,7 @@ pub const ExecutionEnv = struct {
     io: std.Io,
     auth: ?auth_mod.AuthIdentity,
     blob_store: ?*blob_store_mod.BlobStore = null,
+    caller_namespace: []const u8 = "",
     mode: union(enum) {
         tx: *tx_mod.TxContext,
         action: *ConcaveEngine,
@@ -181,21 +186,53 @@ pub const ExecutionEnv = struct {
 
     pub fn httpFetch(self: *ExecutionEnv, allocator: Allocator, req: http_client.HttpFetchRequest) !http_client.HttpFetchResponse {
         return switch (self.mode) {
-            .action => http_client.fetch(allocator, self.io, req),
+            .action => |eng| blk: {
+                var r = req;
+                if (eng.allow_private_http) {
+                    r.allow_http = true;
+                    r.allow_private_ips = true;
+                }
+                break :blk http_client.fetch(allocator, self.io, r);
+            },
             .tx => error.HttpOnlyAllowedInAction,
+        };
+    }
+
+    pub fn httpRequest(self: *ExecutionEnv, allocator: Allocator, req: http_client.HttpFetchRequest) !http_client.HttpFetchResponse {
+        return self.httpFetch(allocator, req);
+    }
+
+    pub fn getSecret(self: *ExecutionEnv, allocator: Allocator, name: []const u8) ![]u8 {
+        return switch (self.mode) {
+            .action => |eng| blk: {
+                const ref = try secrets_mod.parseSecretRef(name);
+                if (!eng.manifest.isSecretAllowed(self.caller_namespace, ref.name)) {
+                    return error.AccessDenied;
+                }
+                const sp = eng.secret_provider orelse return error.SecretsNotConfigured;
+                break :blk try sp.getSecret(allocator, name);
+            },
+            .tx => error.SecretsOnlyAllowedInAction,
+        };
+    }
+
+    pub fn cryptoOp(self: *ExecutionEnv, allocator: Allocator, req_json: []const u8) ![]u8 {
+        return switch (self.mode) {
+            .action => crypto_mod.executeOpJson(allocator, self.io, req_json),
+            .tx => error.CryptoOnlyAllowedInAction,
         };
     }
 
     pub fn runQuery(self: *ExecutionEnv, allocator: Allocator, name: []const u8, args_json: []const u8) !ExecResult {
         return switch (self.mode) {
-            .action => |eng| eng.executeQuery(allocator, name, args_json, if (self.auth) |*a| a else null),
+            .action => |eng| eng.executeQueryInternal(allocator, name, args_json, if (self.auth) |*a| a else null),
             .tx => error.ActionOnly,
         };
     }
 
     pub fn runMutation(self: *ExecutionEnv, allocator: Allocator, name: []const u8, args_json: []const u8) !MutationExecResult {
         return switch (self.mode) {
-            .action => |eng| eng.executeMutation(allocator, name, args_json, if (self.auth) |*a| a else null),
+            .action => |eng| eng.executeMutationInternal(allocator, name, args_json, if (self.auth) |*a| a else null),
             .tx => error.ActionOnly,
         };
     }
@@ -242,6 +279,8 @@ pub const ClientSink = struct {
     sendFn: *const fn (ptr: *anyopaque, payload: []const u8) void,
     sendBinaryFn: ?*const fn (ptr: *anyopaque, payload: []const u8) void = null,
     closeFn: ?*const fn (ptr: *anyopaque) void = null,
+    retainFn: ?*const fn (ptr: *anyopaque) void = null,
+    releaseFn: ?*const fn (ptr: *anyopaque) void = null,
 
     pub fn send(self: ClientSink, payload: []const u8) void {
         self.sendFn(self.ptr, payload);
@@ -259,6 +298,14 @@ pub const ClientSink = struct {
         if (self.closeFn) |f| f(self.ptr);
     }
 
+    pub fn retain(self: ClientSink) void {
+        if (self.retainFn) |f| f(self.ptr);
+    }
+
+    pub fn release(self: ClientSink) void {
+        if (self.releaseFn) |f| f(self.ptr);
+    }
+
     pub fn fromWsSender(sender: *ws_mod.WsSender) ClientSink {
         const Wrapper = struct {
             fn sendText(ptr: *anyopaque, payload: []const u8) void {
@@ -273,15 +320,128 @@ pub const ClientSink = struct {
                 const ws: *ws_mod.WsSender = @ptrCast(@alignCast(ptr));
                 ws.sendClose();
             }
+            fn retainWs(ptr: *anyopaque) void {
+                const ws: *ws_mod.WsSender = @ptrCast(@alignCast(ptr));
+                ws.retain();
+            }
+            fn releaseWs(ptr: *anyopaque) void {
+                const ws: *ws_mod.WsSender = @ptrCast(@alignCast(ptr));
+                ws.release();
+            }
         };
         return .{
             .ptr = @ptrCast(sender),
             .sendFn = &Wrapper.sendText,
             .sendBinaryFn = &Wrapper.sendBin,
             .closeFn = &Wrapper.closeWs,
+            .retainFn = &Wrapper.retainWs,
+            .releaseFn = &Wrapper.releaseWs,
         };
     }
 };
+
+const QueuedFrame = struct {
+    payload: []u8,
+    binary: bool,
+};
+
+/// Per-client ordered delivery queue decoupling global `clients_mutex`/`sync_mutex` from
+/// blocking socket I/O while strictly preserving per-client FIFO monotonic `to_ts` ordering.
+const ClientDelivery = struct {
+    allocator: Allocator,
+    sink: ClientSink,
+    ref_count: std.atomic.Value(usize) = .init(1),
+    closed: std.atomic.Value(bool) = .init(false),
+    queue_mutex: std.Io.Mutex = .init,
+    flush_mutex: std.Io.Mutex = .init,
+    queue: std.ArrayListUnmanaged(QueuedFrame) = .empty,
+
+    const MAX_QUEUED_FRAMES: usize = 512;
+
+    fn create(allocator: Allocator, sink: ClientSink) !*ClientDelivery {
+        const self = try allocator.create(ClientDelivery);
+        sink.retain();
+        self.* = .{
+            .allocator = allocator,
+            .sink = sink,
+        };
+        return self;
+    }
+
+    fn retain(self: *ClientDelivery) void {
+        _ = self.ref_count.fetchAdd(1, .monotonic);
+    }
+
+    fn release(self: *ClientDelivery) void {
+        if (self.ref_count.fetchSub(1, .acq_rel) == 1) {
+            for (self.queue.items) |item| self.allocator.free(item.payload);
+            self.queue.deinit(self.allocator);
+            self.sink.release();
+            self.allocator.destroy(self);
+        }
+    }
+
+    /// Enqueue a serialized frame while the caller holds `clients_mutex` (pure in-memory push, no I/O).
+    /// Takes ownership of `payload` on both success and failure.
+    fn enqueue(self: *ClientDelivery, io: std.Io, payload: []u8, binary: bool) bool {
+        self.queue_mutex.lockUncancelable(io);
+        defer self.queue_mutex.unlock(io);
+        if (self.closed.load(.acquire) or self.queue.items.len >= MAX_QUEUED_FRAMES) {
+            self.allocator.free(payload);
+            return false;
+        }
+        self.queue.append(self.allocator, .{ .payload = payload, .binary = binary }) catch {
+            self.allocator.free(payload);
+            return false;
+        };
+        return true;
+    }
+
+    /// Drain all queued frames for this client in strict FIFO order without holding any global mutex.
+    fn flush(self: *ClientDelivery, io: std.Io) void {
+        self.flush_mutex.lockUncancelable(io);
+        defer self.flush_mutex.unlock(io);
+
+        while (true) {
+            var batch: std.ArrayListUnmanaged(QueuedFrame) = .empty;
+            {
+                self.queue_mutex.lockUncancelable(io);
+                defer self.queue_mutex.unlock(io);
+                if (self.queue.items.len == 0) break;
+                batch = self.queue;
+                self.queue = .empty;
+            }
+            defer {
+                for (batch.items) |item| self.allocator.free(item.payload);
+                batch.deinit(self.allocator);
+            }
+            for (batch.items) |item| {
+                if (self.closed.load(.acquire)) break;
+                if (item.binary) {
+                    self.sink.sendBinary(item.payload);
+                } else {
+                    self.sink.send(item.payload);
+                }
+            }
+        }
+    }
+
+    fn close(self: *ClientDelivery, io: std.Io) void {
+        self.closed.store(true, .release);
+        self.queue_mutex.lockUncancelable(io);
+        defer self.queue_mutex.unlock(io);
+        for (self.queue.items) |item| self.allocator.free(item.payload);
+        self.queue.clearRetainingCapacity();
+    }
+};
+
+fn flushPendingDeliveries(allocator: Allocator, io: std.Io, deliveries: *std.ArrayList(*ClientDelivery)) void {
+    for (deliveries.items) |d| {
+        d.flush(io);
+        d.release();
+    }
+    deliveries.deinit(allocator);
+}
 
 pub const EngineStats = struct {
     commit_ts: i64,
@@ -309,11 +469,15 @@ const ActiveSubscription = struct {
 const ClientSession = struct {
     id: u64,
     sink: ClientSink,
+    delivery: *ClientDelivery,
     binary_protocol: bool = false,
     auth: ?auth_mod.AuthIdentity = null,
     subscriptions: std.StringHashMapUnmanaged(ActiveSubscription) = .empty,
 
-    fn deinit(self: *ClientSession, allocator: Allocator) void {
+    fn deinit(self: *ClientSession, allocator: Allocator, io: std.Io) void {
+        self.delivery.close(io);
+        self.delivery.release();
+        self.sink.release();
         if (self.auth) |*a| a.deinit(allocator);
         var it = self.subscriptions.iterator();
         while (it.next()) |entry| {
@@ -332,6 +496,16 @@ pub const ConcaveEngine = struct {
     manifest: *const manifest_mod.AppManifest,
     auth_config: auth_mod.AuthConfig,
     blob_store: ?*blob_store_mod.BlobStore = null,
+    secret_provider: ?*secrets_mod.SecretProvider = null,
+    /// Explicit opt-in (for local dev/tests) to allow `httpFetch` to reach plaintext HTTP / private IPs.
+    allow_private_http: bool = false,
+    /// Lease duration for claimed scheduled jobs before another replica reaps & retries them.
+    job_lease_ms: i64 = 60_000,
+    /// Maximum attempts for non-cron scheduled jobs before moving to dead-letter (`dead`).
+    job_max_attempts: i64 = 5,
+    /// Number of recent Postgres `commit_log` rows retained during periodic background pruning (`0` disables).
+    pg_commit_log_keep: usize = 50_000,
+    pg_prune_tick: usize = 0,
 
     clients_mutex: std.Io.Mutex = .init,
     clients: std.AutoHashMapUnmanaged(u64, *ClientSession) = .empty,
@@ -374,7 +548,7 @@ pub const ConcaveEngine = struct {
         self.clients_mutex.lockUncancelable(self.io);
         var it = self.clients.valueIterator();
         while (it.next()) |sess| {
-            sess.*.deinit(self.allocator);
+            sess.*.deinit(self.allocator, self.io);
             self.allocator.destroy(sess.*);
         }
         self.clients.deinit(self.allocator);
@@ -509,26 +683,146 @@ pub const ConcaveEngine = struct {
         });
     }
 
+    /// Admin document patch (rejects `_system` tables to preserve scheduler/migration invariants).
+    pub fn adminPatchDoc(
+        self: *ConcaveEngine,
+        ns: []const u8,
+        table: []const u8,
+        doc_id: []const u8,
+        patch_json: []const u8,
+    ) !void {
+        if (std.mem.eql(u8, ns, "_system")) return storage_mod.StorageError.AccessDenied;
+        for (0..MAX_OCC_RETRIES) |_| {
+            const snap_ts = try self.storage.latestCommitTs();
+            var tx = tx_mod.TxContext.init(self.allocator, self.io, self.storage, self.manifest, snap_ts, false);
+            defer tx.deinit();
+            try tx.patch(ns, table, doc_id, patch_json);
+            var commit = self.storage.commitTx(self.allocator, self.manifest, snap_ts, &tx.read_set, tx.writes.items) catch |err| {
+                if (err == storage_mod.StorageError.Conflict) continue;
+                return err;
+            };
+            defer commit.deinit(self.allocator);
+            if (!commit.write_set.isEmpty()) self.handleLocalCommit(commit.commit_ts, &commit.write_set);
+            return;
+        }
+        return storage_mod.StorageError.Conflict;
+    }
+
+    /// Admin document delete (rejects `_system` tables).
+    pub fn adminDeleteDoc(self: *ConcaveEngine, ns: []const u8, table: []const u8, doc_id: []const u8) !void {
+        if (std.mem.eql(u8, ns, "_system")) return storage_mod.StorageError.AccessDenied;
+        for (0..MAX_OCC_RETRIES) |_| {
+            const snap_ts = try self.storage.latestCommitTs();
+            var tx = tx_mod.TxContext.init(self.allocator, self.io, self.storage, self.manifest, snap_ts, false);
+            defer tx.deinit();
+            try tx.delete(ns, table, doc_id);
+            var commit = self.storage.commitTx(self.allocator, self.manifest, snap_ts, &tx.read_set, tx.writes.items) catch |err| {
+                if (err == storage_mod.StorageError.Conflict) continue;
+                return err;
+            };
+            defer commit.deinit(self.allocator);
+            if (!commit.write_set.isEmpty()) self.handleLocalCommit(commit.commit_ts, &commit.write_set);
+            return;
+        }
+        return storage_mod.StorageError.Conflict;
+    }
+
+    /// Requeue a `failed` or `dead` scheduled job immediately for operator replay.
+    pub fn adminRetryJob(self: *ConcaveEngine, job_id: []const u8) !bool {
+        for (0..MAX_OCC_RETRIES) |_| {
+            const snap_ts = try self.storage.latestCommitTs();
+            var tx = tx_mod.TxContext.init(self.allocator, self.io, self.storage, self.manifest, snap_ts, false);
+            tx.allow_system_access = true;
+            defer tx.deinit();
+            const fresh = (try tx.get(self.allocator, "_system", "_scheduled_jobs", job_id)) orelse return false;
+            defer fresh.deinit(self.allocator);
+            const now_ms = storage_mod.nowMillis(self.io);
+            const patch_json = try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"status\":\"pending\",\"run_at_ms\":{d},\"attempts\":0,\"last_error\":\"\"}}",
+                .{now_ms},
+            );
+            defer self.allocator.free(patch_json);
+            try tx.patch("_system", "_scheduled_jobs", job_id, patch_json);
+            var commit = self.storage.commitTx(self.allocator, self.manifest, snap_ts, &tx.read_set, tx.writes.items) catch |err| {
+                if (err == storage_mod.StorageError.Conflict) continue;
+                return err;
+            };
+            defer commit.deinit(self.allocator);
+            if (!commit.write_set.isEmpty()) self.handleLocalCommit(commit.commit_ts, &commit.write_set);
+            return true;
+        }
+        return storage_mod.StorageError.Conflict;
+    }
+
+    /// Cancel a `pending` scheduled job from the operator dashboard.
+    pub fn adminCancelJob(self: *ConcaveEngine, job_id: []const u8) !bool {
+        for (0..MAX_OCC_RETRIES) |_| {
+            const snap_ts = try self.storage.latestCommitTs();
+            var tx = tx_mod.TxContext.init(self.allocator, self.io, self.storage, self.manifest, snap_ts, false);
+            tx.allow_system_access = true;
+            defer tx.deinit();
+            const fresh = (try tx.get(self.allocator, "_system", "_scheduled_jobs", job_id)) orelse return false;
+            defer fresh.deinit(self.allocator);
+            try tx.patch("_system", "_scheduled_jobs", job_id, "{\"status\":\"canceled\"}");
+            var commit = self.storage.commitTx(self.allocator, self.manifest, snap_ts, &tx.read_set, tx.writes.items) catch |err| {
+                if (err == storage_mod.StorageError.Conflict) continue;
+                return err;
+            };
+            defer commit.deinit(self.allocator);
+            if (!commit.write_set.isEmpty()) self.handleLocalCommit(commit.commit_ts, &commit.write_set);
+            return true;
+        }
+        return storage_mod.StorageError.Conflict;
+    }
+
     /// Gracefully send WebSocket Close frames to every connected client during shutdown drain.
     pub fn closeAllClients(self: *ConcaveEngine) void {
-        self.clients_mutex.lockUncancelable(self.io);
-        defer self.clients_mutex.unlock(self.io);
-        var it = self.clients.valueIterator();
-        while (it.next()) |sess| {
-            sess.*.sink.close();
+        var sinks: std.ArrayList(ClientSink) = .empty;
+        defer {
+            for (sinks.items) |s| s.release();
+            sinks.deinit(self.allocator);
         }
+        {
+            self.clients_mutex.lockUncancelable(self.io);
+            defer self.clients_mutex.unlock(self.io);
+            var it = self.clients.valueIterator();
+            while (it.next()) |sess| {
+                sess.*.sink.retain();
+                sinks.append(self.allocator, sess.*.sink) catch {
+                    sess.*.sink.release();
+                };
+            }
+        }
+        for (sinks.items) |s| s.close();
     }
 
     /// Broadcast a dev-mode live-reload notification to every connected WebSocket client.
     pub fn broadcastReload(self: *ConcaveEngine, reason: []const u8) void {
-        var buf: [128]u8 = undefined;
-        const payload = std.fmt.bufPrint(&buf, "{{\"type\":\"reload\",\"reason\":\"{s}\"}}", .{reason}) catch return;
-        self.clients_mutex.lockUncancelable(self.io);
-        defer self.clients_mutex.unlock(self.io);
-        var it = self.clients.valueIterator();
-        while (it.next()) |sess| {
-            sess.*.sink.send(payload);
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        out.writer.writeAll("{\"type\":\"reload\",\"reason\":") catch return;
+        storage_mod.writeJsonString(&out.writer, reason) catch return;
+        out.writer.writeByte('}') catch return;
+        const payload = out.written();
+
+        var sinks: std.ArrayList(ClientSink) = .empty;
+        defer {
+            for (sinks.items) |s| s.release();
+            sinks.deinit(self.allocator);
         }
+        {
+            self.clients_mutex.lockUncancelable(self.io);
+            defer self.clients_mutex.unlock(self.io);
+            var it = self.clients.valueIterator();
+            while (it.next()) |sess| {
+                sess.*.sink.retain();
+                sinks.append(self.allocator, sess.*.sink) catch {
+                    sess.*.sink.release();
+                };
+            }
+        }
+        for (sinks.items) |s| s.send(payload);
     }
 
     pub fn verifyAuthToken(self: *ConcaveEngine, allocator: Allocator, token: []const u8) !auth_mod.AuthIdentity {
@@ -537,12 +831,19 @@ pub const ConcaveEngine = struct {
 
     pub fn registerClient(self: *ConcaveEngine, sink: ClientSink) !u64 {
         const id = self.next_client_id.fetchAdd(1, .monotonic);
+        const delivery = try ClientDelivery.create(self.allocator, sink);
+        errdefer delivery.release();
         const sess = try self.allocator.create(ClientSession);
-        sess.* = .{ .id = id, .sink = sink };
+        sink.retain();
+        sess.* = .{ .id = id, .sink = sink, .delivery = delivery };
 
         self.clients_mutex.lockUncancelable(self.io);
         defer self.clients_mutex.unlock(self.io);
-        try self.clients.put(self.allocator, id, sess);
+        self.clients.put(self.allocator, id, sess) catch |err| {
+            sink.release();
+            self.allocator.destroy(sess);
+            return err;
+        };
         _ = self.metrics.ws_connections_total.fetchAdd(1, .monotonic);
         return id;
     }
@@ -563,16 +864,24 @@ pub const ConcaveEngine = struct {
             if (removed_subs > 0) {
                 _ = self.active_sub_count.fetchSub(removed_subs, .seq_cst);
             }
-            kv.value.deinit(self.allocator);
+            kv.value.deinit(self.allocator, self.io);
             self.allocator.destroy(kv.value);
         }
     }
 
     pub fn cloneClientAuth(self: *ConcaveEngine, allocator: Allocator, client_id: u64) ?auth_mod.AuthIdentity {
+        const now_ms = storage_mod.nowMillis(self.io);
         self.clients_mutex.lockUncancelable(self.io);
         defer self.clients_mutex.unlock(self.io);
         const sess = self.clients.get(client_id) orelse return null;
-        if (sess.auth) |*a| return a.clone(allocator) catch null;
+        if (sess.auth) |*a| {
+            if (a.isExpired(now_ms)) {
+                a.deinit(self.allocator);
+                sess.auth = null;
+                return null;
+            }
+            return a.clone(allocator) catch null;
+        }
         return null;
     }
 
@@ -586,95 +895,121 @@ pub const ConcaveEngine = struct {
 
     fn authenticateClientWithMode(self: *ConcaveEngine, client_id: u64, token: ?[]const u8, binary_reply: bool) ![]u8 {
         var new_auth: ?auth_mod.AuthIdentity = null;
+        var auth_err_name: ?[]const u8 = null;
         if (token) |tok| {
-            new_auth = auth_mod.verifyToken(self.allocator, self.io, self.auth_config, tok) catch |err| {
-                return if (binary_reply)
-                    try formatAuthErrorBinary(self.allocator, @errorName(err))
-                else
-                    try formatAuthError(self.allocator, @errorName(err));
-            };
+            if (auth_mod.verifyToken(self.allocator, self.io, self.auth_config, tok)) |verified| {
+                new_auth = verified;
+            } else |err| {
+                // Failed re-auth must clear any prior session identity and re-evaluate active
+                // subscriptions as unauthenticated so stale credentials never linger.
+                auth_err_name = @errorName(err);
+            }
         }
         defer if (new_auth) |*a| a.deinit(self.allocator);
 
-        self.sync_mutex.lockUncancelable(self.io);
-        defer self.sync_mutex.unlock(self.io);
+        var pending_sends: std.ArrayList(*ClientDelivery) = .empty;
+        defer flushPendingDeliveries(self.allocator, self.io, &pending_sends);
 
-        const SubSpec = struct { sub_id: []u8, name: []u8, args_json: []u8 };
-        var to_rerun: std.ArrayList(SubSpec) = .empty;
-        defer {
-            for (to_rerun.items) |s| {
-                self.allocator.free(s.sub_id);
-                self.allocator.free(s.name);
-                self.allocator.free(s.args_json);
-            }
-            to_rerun.deinit(self.allocator);
-        }
-
-        var use_binary_push = binary_reply;
         {
-            self.clients_mutex.lockUncancelable(self.io);
-            defer self.clients_mutex.unlock(self.io);
-            const sess = self.clients.get(client_id) orelse
-                return if (binary_reply)
-                    try formatAuthErrorBinary(self.allocator, "client disconnected")
-                else
-                    try formatAuthError(self.allocator, "client disconnected");
-            use_binary_push = sess.binary_protocol or binary_reply;
-            if (sess.auth) |*old| old.deinit(self.allocator);
-            sess.auth = if (new_auth) |*a| try a.clone(self.allocator) else null;
+            self.sync_mutex.lockUncancelable(self.io);
+            defer self.sync_mutex.unlock(self.io);
 
-            var it = sess.subscriptions.valueIterator();
-            while (it.next()) |sub| {
-                try to_rerun.append(self.allocator, .{
-                    .sub_id = try self.allocator.dupe(u8, sub.sub_id),
-                    .name = try self.allocator.dupe(u8, sub.name),
-                    .args_json = try self.allocator.dupe(u8, sub.args_json),
-                });
-            }
-        }
-
-        if (to_rerun.items.len > 0) {
-            var updates: std.ArrayList(UpdateFrame) = .empty;
+            const SubSpec = struct { sub_id: []u8, name: []u8, args_json: []u8 };
+            var to_rerun: std.ArrayList(SubSpec) = .empty;
             defer {
-                for (updates.items) |*u| u.deinit(self.allocator);
-                updates.deinit(self.allocator);
+                for (to_rerun.items) |s| {
+                    self.allocator.free(s.sub_id);
+                    self.allocator.free(s.name);
+                    self.allocator.free(s.args_json);
+                }
+                to_rerun.deinit(self.allocator);
             }
-            var to_ts: i64 = self.storage.latestCommitTs() catch 0;
 
-            for (to_rerun.items) |item| {
-                var ran = self.runQueryInternal(item.name, item.args_json, if (new_auth) |*a| a else null);
-                defer ran.read_set.deinit(self.allocator);
-                if (ran.snapshot_ts > to_ts) to_ts = ran.snapshot_ts;
-
-                try updates.append(self.allocator, .{
-                    .sub_id = try self.allocator.dupe(u8, item.sub_id),
-                    .result = try ran.result.clone(self.allocator),
-                });
-
+            var use_binary_push = binary_reply;
+            {
                 self.clients_mutex.lockUncancelable(self.io);
-                if (self.clients.get(client_id)) |sess| {
-                    if (sess.subscriptions.getPtr(item.sub_id)) |sub| {
-                        sub.read_set.deinit(self.allocator);
-                        sub.read_set = ran.read_set;
-                        ran.read_set = .{};
-                        if (sub.last_payload) |*lp| lp.deinit(self.allocator);
-                        sub.last_payload = ran.result;
-                        ran.result = .{ .ok = &.{} };
+                defer self.clients_mutex.unlock(self.io);
+                const sess = self.clients.get(client_id) orelse
+                    return if (binary_reply)
+                        try formatAuthErrorBinary(self.allocator, auth_err_name orelse "client disconnected")
+                    else
+                        try formatAuthError(self.allocator, auth_err_name orelse "client disconnected");
+                use_binary_push = sess.binary_protocol or binary_reply;
+                if (sess.auth) |*old| old.deinit(self.allocator);
+                sess.auth = if (new_auth) |*a| try a.clone(self.allocator) else null;
+
+                var it = sess.subscriptions.valueIterator();
+                while (it.next()) |sub| {
+                    try to_rerun.append(self.allocator, .{
+                        .sub_id = try self.allocator.dupe(u8, sub.sub_id),
+                        .name = try self.allocator.dupe(u8, sub.name),
+                        .args_json = try self.allocator.dupe(u8, sub.args_json),
+                    });
+                }
+            }
+
+            if (to_rerun.items.len > 0) {
+                var updates: std.ArrayList(UpdateFrame) = .empty;
+                defer {
+                    for (updates.items) |*u| u.deinit(self.allocator);
+                    updates.deinit(self.allocator);
+                }
+                var to_ts: i64 = self.storage.latestCommitTs() catch 0;
+
+                for (to_rerun.items) |item| {
+                    var ran = self.runQueryInternal(item.name, item.args_json, if (new_auth) |*a| a else null);
+                    defer ran.read_set.deinit(self.allocator);
+                    if (ran.snapshot_ts > to_ts) to_ts = ran.snapshot_ts;
+
+                    try updates.append(self.allocator, .{
+                        .sub_id = try self.allocator.dupe(u8, item.sub_id),
+                        .result = try ran.result.clone(self.allocator),
+                    });
+
+                    self.clients_mutex.lockUncancelable(self.io);
+                    if (self.clients.get(client_id)) |sess| {
+                        if (sess.subscriptions.getPtr(item.sub_id)) |sub| {
+                            sub.read_set.deinit(self.allocator);
+                            sub.read_set = ran.read_set;
+                            ran.read_set = .{};
+                            if (sub.last_payload) |*lp| lp.deinit(self.allocator);
+                            sub.last_payload = ran.result;
+                            ran.result = .{ .ok = &.{} };
+                        } else {
+                            ran.result.deinit(self.allocator);
+                        }
                     } else {
                         ran.result.deinit(self.allocator);
                     }
-                } else {
-                    ran.result.deinit(self.allocator);
+                    self.clients_mutex.unlock(self.io);
+                }
+
+                const frame = if (use_binary_push)
+                    try formatTransitionBinary(self.allocator, to_ts, updates.items)
+                else
+                    try formatTransition(self.allocator, to_ts, updates.items);
+                var frame_queued = false;
+                defer if (!frame_queued) self.allocator.free(frame);
+
+                self.clients_mutex.lockUncancelable(self.io);
+                if (self.clients.get(client_id)) |sess| {
+                    frame_queued = true;
+                    if (sess.delivery.enqueue(self.io, frame, use_binary_push)) {
+                        sess.delivery.retain();
+                        pending_sends.append(self.allocator, sess.delivery) catch {
+                            sess.delivery.release();
+                        };
+                    }
                 }
                 self.clients_mutex.unlock(self.io);
             }
+        }
 
-            const frame = if (use_binary_push)
-                try formatTransitionBinary(self.allocator, to_ts, updates.items)
+        if (auth_err_name) |ename| {
+            return if (binary_reply)
+                try formatAuthErrorBinary(self.allocator, ename)
             else
-                try formatTransition(self.allocator, to_ts, updates.items);
-            defer self.allocator.free(frame);
-            self.sendToClientLockedCheck(client_id, frame, use_binary_push);
+                try formatAuthError(self.allocator, ename);
         }
 
         return if (binary_reply)
@@ -684,105 +1019,122 @@ pub const ConcaveEngine = struct {
     }
 
     pub fn subscribe(self: *ConcaveEngine, client_id: u64, sub_id: []const u8, name: []const u8, args_json: []const u8) !void {
-        // Hold `sync_mutex` across initial query evaluation, subscription registration, and initial
-        // transition delivery so concurrent commits cannot slip between snapshot & registration
-        // (eliminating both lost-update races and out-of-order `commit_ts` frames).
-        self.sync_mutex.lockUncancelable(self.io);
-        defer self.sync_mutex.unlock(self.io);
+        if (sub_id.len == 0 or sub_id.len > MAX_SUB_ID_LEN) return error.InvalidSubscriptionId;
 
-        // Reserve an active-subscription slot BEFORE reading `snapshot_ts` so concurrent
-        // `handleLocalCommit` calls cannot take the zero-sub lock-free fast path and miss this sub.
-        _ = self.active_sub_count.fetchAdd(1, .seq_cst);
-        var slot_transferred = false;
-        defer if (!slot_transferred) {
-            _ = self.active_sub_count.fetchSub(1, .seq_cst);
-        };
+        var pending_sends: std.ArrayList(*ClientDelivery) = .empty;
+        defer flushPendingDeliveries(self.allocator, self.io, &pending_sends);
 
-        var auth_copy = self.cloneClientAuth(self.allocator, client_id);
-        defer if (auth_copy) |*a| a.deinit(self.allocator);
-
-        var ran = self.runQueryInternal(name, args_json, if (auth_copy) |*a| a else null);
-        errdefer {
-            ran.read_set.deinit(self.allocator);
-            ran.result.deinit(self.allocator);
-        }
-
-        const single_upd = [_]UpdateFrame{.{
-            .sub_id = @constCast(sub_id),
-            .result = ran.result,
-        }};
-
-        var had_any_subs_before = false;
+        // Hold `sync_mutex` across initial query evaluation and subscription registration so
+        // concurrent commits cannot slip between snapshot & registration; flush socket sends
+        // AFTER releasing both `clients_mutex` and `sync_mutex`.
         {
-            self.clients_mutex.lockUncancelable(self.io);
-            defer self.clients_mutex.unlock(self.io);
+            self.sync_mutex.lockUncancelable(self.io);
+            defer self.sync_mutex.unlock(self.io);
 
-            var cit = self.clients.valueIterator();
-            while (cit.next()) |sp| {
-                if (sp.*.subscriptions.count() > 0) {
-                    had_any_subs_before = true;
-                    break;
+            // Check per-client subscription cap early before running the query.
+            {
+                self.clients_mutex.lockUncancelable(self.io);
+                defer self.clients_mutex.unlock(self.io);
+                const sess = self.clients.get(client_id) orelse return;
+                if (!sess.subscriptions.contains(sub_id) and sess.subscriptions.count() >= MAX_SUBS_PER_CLIENT) {
+                    return error.TooManySubscriptions;
                 }
             }
 
-            if (self.clients.get(client_id)) |sess| {
-                const key = try self.allocator.dupe(u8, sub_id);
-                var replaced_existing = false;
-                if (sess.subscriptions.fetchRemove(key)) |old| {
-                    replaced_existing = true;
-                    self.allocator.free(old.key);
-                    var old_val = old.value;
-                    old_val.deinit(self.allocator);
-                }
-                const frame = if (sess.binary_protocol)
-                    try formatTransitionBinary(self.allocator, ran.snapshot_ts, &single_upd)
-                else
-                    try formatTransition(self.allocator, ran.snapshot_ts, &single_upd);
-                defer self.allocator.free(frame);
+            // Reserve an active-subscription slot BEFORE reading `snapshot_ts` so concurrent
+            // `handleLocalCommit` calls cannot take the zero-sub lock-free fast path and miss this sub.
+            _ = self.active_sub_count.fetchAdd(1, .seq_cst);
+            var slot_transferred = false;
+            defer if (!slot_transferred) {
+                _ = self.active_sub_count.fetchSub(1, .seq_cst);
+            };
 
-                try sess.subscriptions.put(self.allocator, key, .{
-                    .sub_id = try self.allocator.dupe(u8, sub_id),
-                    .name = try self.allocator.dupe(u8, name),
-                    .args_json = try self.allocator.dupe(u8, args_json),
-                    .read_set = ran.read_set,
-                    .last_payload = ran.result,
-                    .last_sent_ts = ran.snapshot_ts,
-                });
-                if (!replaced_existing) {
-                    slot_transferred = true;
+            var auth_copy = self.cloneClientAuth(self.allocator, client_id);
+            defer if (auth_copy) |*a| a.deinit(self.allocator);
+
+            // Reject public subscriptions to internal queries cleanly.
+            var ran: InternalQueryRun = if (self.isInternalFunction(name))
+                .{
+                    .result = .{ .err = try self.allocator.dupe(u8, "function is internal") },
+                    .read_set = .{},
+                    .snapshot_ts = self.storage.latestCommitTs() catch 0,
                 }
-                // Send under `clients_mutex` so `unregisterClient` cannot free WsSender concurrently
-                // and initial frame strictly precedes any later broadcast.
-                if (sess.binary_protocol) {
-                    sess.sink.sendBinary(frame);
-                } else {
-                    sess.sink.send(frame);
-                }
-            } else {
+            else
+                self.runQueryInternal(name, args_json, if (auth_copy) |*a| a else null);
+            errdefer {
                 ran.read_set.deinit(self.allocator);
                 ran.result.deinit(self.allocator);
             }
-        }
 
-        // If this replica was idle (zero active subscriptions), advance `last_broadcast_ts` to
-        // `ran.snapshot_ts` so `pollCommitLog` does not replay stale historical commits already
-        // included in this subscriber's initial snapshot.
-        if (!had_any_subs_before) {
-            const cur = self.last_broadcast_ts.load(.acquire);
-            if (ran.snapshot_ts > cur) {
-                self.last_broadcast_ts.store(ran.snapshot_ts, .release);
+            const single_upd = [_]UpdateFrame{.{
+                .sub_id = @constCast(sub_id),
+                .result = ran.result,
+            }};
+
+            var had_any_subs_before = false;
+            {
+                self.clients_mutex.lockUncancelable(self.io);
+                defer self.clients_mutex.unlock(self.io);
+
+                var cit = self.clients.valueIterator();
+                while (cit.next()) |sp| {
+                    if (sp.*.subscriptions.count() > 0) {
+                        had_any_subs_before = true;
+                        break;
+                    }
+                }
+
+                if (self.clients.get(client_id)) |sess| {
+                    if (!sess.subscriptions.contains(sub_id) and sess.subscriptions.count() >= MAX_SUBS_PER_CLIENT) {
+                        ran.read_set.deinit(self.allocator);
+                        ran.result.deinit(self.allocator);
+                        return error.TooManySubscriptions;
+                    }
+                    const key = try self.allocator.dupe(u8, sub_id);
+                    var replaced_existing = false;
+                    if (sess.subscriptions.fetchRemove(key)) |old| {
+                        replaced_existing = true;
+                        self.allocator.free(old.key);
+                        var old_val = old.value;
+                        old_val.deinit(self.allocator);
+                    }
+                    const frame = if (sess.binary_protocol)
+                        try formatTransitionBinary(self.allocator, ran.snapshot_ts, &single_upd)
+                    else
+                        try formatTransition(self.allocator, ran.snapshot_ts, &single_upd);
+                    errdefer self.allocator.free(frame);
+
+                    try sess.subscriptions.put(self.allocator, key, .{
+                        .sub_id = try self.allocator.dupe(u8, sub_id),
+                        .name = try self.allocator.dupe(u8, name),
+                        .args_json = try self.allocator.dupe(u8, args_json),
+                        .read_set = ran.read_set,
+                        .last_payload = ran.result,
+                        .last_sent_ts = ran.snapshot_ts,
+                    });
+                    if (!replaced_existing) {
+                        slot_transferred = true;
+                    }
+                    if (sess.delivery.enqueue(self.io, frame, sess.binary_protocol)) {
+                        sess.delivery.retain();
+                        pending_sends.append(self.allocator, sess.delivery) catch {
+                            sess.delivery.release();
+                        };
+                    }
+                } else {
+                    ran.read_set.deinit(self.allocator);
+                    ran.result.deinit(self.allocator);
+                }
             }
-        }
-    }
 
-    fn sendToClientLockedCheck(self: *ConcaveEngine, client_id: u64, payload: []const u8, binary: bool) void {
-        self.clients_mutex.lockUncancelable(self.io);
-        defer self.clients_mutex.unlock(self.io);
-        if (self.clients.get(client_id)) |sess| {
-            if (binary) {
-                sess.sink.sendBinary(payload);
-            } else {
-                sess.sink.send(payload);
+            // If this replica was idle (zero active subscriptions), advance `last_broadcast_ts` to
+            // `ran.snapshot_ts` so `pollCommitLog` does not replay stale historical commits already
+            // included in this subscriber's initial snapshot.
+            if (!had_any_subs_before) {
+                const cur = self.last_broadcast_ts.load(.acquire);
+                if (ran.snapshot_ts > cur) {
+                    self.last_broadcast_ts.store(ran.snapshot_ts, .release);
+                }
             }
         }
     }
@@ -800,7 +1152,27 @@ pub const ConcaveEngine = struct {
         }
     }
 
+    fn isInternalFunction(self: *const ConcaveEngine, name: []const u8) bool {
+        if (self.manifest.findFunction(name)) |fspec| {
+            return fspec.visibility == .internal;
+        }
+        return false;
+    }
+
     pub fn executeQuery(
+        self: *ConcaveEngine,
+        allocator: Allocator,
+        name: []const u8,
+        args_json: []const u8,
+        auth: ?*const auth_mod.AuthIdentity,
+    ) !ExecResult {
+        if (self.isInternalFunction(name)) {
+            return .{ .err = try allocator.dupe(u8, "function is internal") };
+        }
+        return self.executeQueryInternal(allocator, name, args_json, auth);
+    }
+
+    pub fn executeQueryInternal(
         self: *ConcaveEngine,
         allocator: Allocator,
         name: []const u8,
@@ -852,6 +1224,13 @@ pub const ConcaveEngine = struct {
 
         var tx = tx_mod.TxContext.init(self.allocator, self.io, self.storage, self.manifest, snapshot_ts, true);
         tx.track_reads = track_reads;
+        var caller_ns: []const u8 = "";
+        if (self.manifest.findFunction(name)) |fspec| {
+            if (fspec.namespace.len > 0) {
+                tx.allowed_namespace = fspec.namespace;
+                caller_ns = fspec.namespace;
+            }
+        }
         defer {
             // Move read_set out before deiniting remaining tx fields.
             tx.read_set = .{};
@@ -863,6 +1242,7 @@ pub const ConcaveEngine = struct {
             .io = self.io,
             .auth = if (auth) |a| a.* else null,
             .blob_store = self.blob_store,
+            .caller_namespace = caller_ns,
             .mode = .{ .tx = &tx },
         };
 
@@ -891,6 +1271,19 @@ pub const ConcaveEngine = struct {
         args_json: []const u8,
         auth: ?*const auth_mod.AuthIdentity,
     ) !MutationExecResult {
+        if (self.isInternalFunction(name)) {
+            return .{ .result = .{ .err = try allocator.dupe(u8, "function is internal") } };
+        }
+        return self.executeMutationInternal(allocator, name, args_json, auth);
+    }
+
+    pub fn executeMutationInternal(
+        self: *ConcaveEngine,
+        allocator: Allocator,
+        name: []const u8,
+        args_json: []const u8,
+        auth: ?*const auth_mod.AuthIdentity,
+    ) !MutationExecResult {
         const start_us = metrics_mod.PlatformMetrics.nowMicros(self.io);
         _ = self.metrics.mutations_total.fetchAdd(1, .monotonic);
         var retries: usize = 0;
@@ -906,6 +1299,13 @@ pub const ConcaveEngine = struct {
             };
 
             var tx = tx_mod.TxContext.init(self.allocator, self.io, self.storage, self.manifest, snapshot_ts, false);
+            var caller_ns: []const u8 = "";
+            if (self.manifest.findFunction(name)) |fspec| {
+                if (fspec.namespace.len > 0) {
+                    tx.allowed_namespace = fspec.namespace;
+                    caller_ns = fspec.namespace;
+                }
+            }
             defer tx.deinit();
 
             var env = ExecutionEnv{
@@ -913,6 +1313,7 @@ pub const ConcaveEngine = struct {
                 .io = self.io,
                 .auth = if (auth) |a| a.* else null,
                 .blob_store = self.blob_store,
+                .caller_namespace = caller_ns,
                 .mode = .{ .tx = &tx },
             };
 
@@ -981,17 +1382,36 @@ pub const ConcaveEngine = struct {
         args_json: []const u8,
         auth: ?*const auth_mod.AuthIdentity,
     ) !ExecResult {
+        if (self.isInternalFunction(name)) {
+            return .{ .err = try allocator.dupe(u8, "function is internal") };
+        }
+        return self.executeActionInternal(allocator, name, args_json, auth);
+    }
+
+    pub fn executeActionInternal(
+        self: *ConcaveEngine,
+        allocator: Allocator,
+        name: []const u8,
+        args_json: []const u8,
+        auth: ?*const auth_mod.AuthIdentity,
+    ) !ExecResult {
         const start_us = metrics_mod.PlatformMetrics.nowMicros(self.io);
         _ = self.metrics.actions_total.fetchAdd(1, .monotonic);
 
         const auth_clone = if (auth) |a| a.clone(self.allocator) catch null else null;
         defer if (auth_clone) |*ac| ac.deinit(self.allocator);
 
+        var caller_ns: []const u8 = "";
+        if (self.manifest.findFunction(name)) |fspec| {
+            caller_ns = fspec.namespace;
+        }
+
         var env = ExecutionEnv{
             .allocator = self.allocator,
             .io = self.io,
             .auth = auth_clone,
             .blob_store = self.blob_store,
+            .caller_namespace = caller_ns,
             .mode = .{ .action = self },
         };
         const res = self.executor.executeAction(allocator, name, args_json, &env);
@@ -1021,11 +1441,17 @@ pub const ConcaveEngine = struct {
         const auth_clone = if (auth) |a| a.clone(self.allocator) catch null else null;
         defer if (auth_clone) |*ac| ac.deinit(self.allocator);
 
+        var caller_ns: []const u8 = "";
+        if (self.manifest.matchHttpRoute(method, path)) |rspec| {
+            caller_ns = rspec.namespace;
+        }
+
         var env = ExecutionEnv{
             .allocator = self.allocator,
             .io = self.io,
             .auth = auth_clone,
             .blob_store = self.blob_store,
+            .caller_namespace = caller_ns,
             .mode = .{ .action = self },
         };
         const res = self.executor.executeHttpRoute(allocator, method, path, req_json, &env);
@@ -1046,6 +1472,7 @@ pub const ConcaveEngine = struct {
         for (self.manifest.crons) |cron| {
             const snapshot_ts = try self.storage.latestCommitTs();
             var tx = tx_mod.TxContext.init(self.allocator, self.io, self.storage, self.manifest, snapshot_ts, false);
+            tx.allow_system_access = true;
             defer tx.deinit();
 
             const has_pending = try hasCronJobWithStatus(self.allocator, &tx, cron.name, "pending");
@@ -1074,9 +1501,81 @@ pub const ConcaveEngine = struct {
         }
     }
 
+    /// Reap stuck `running` jobs whose lease expired (e.g. replica crashed mid-execution) so
+    /// neither one-shot jobs nor recurring crons ever stall permanently.
+    pub fn reapExpiredJobLeases(self: *ConcaveEngine) !usize {
+        const now_ms = storage_mod.nowMillis(self.io);
+        const start_key = try key_mod.encodeKey(self.allocator, &.{.{ .str_val = "running" }});
+        defer self.allocator.free(start_key);
+        const end_key = try key_mod.encodePrefixUpperBound(self.allocator, &.{.{ .str_val = "running" }});
+        defer self.allocator.free(end_key);
+
+        const running_docs = try self.storage.scanIndex(self.allocator, &.{
+            .namespace = "_system",
+            .table = "_scheduled_jobs",
+            .index_name = "by_status_run_at",
+            .start = .{ .included = start_key },
+            .end = .{ .excluded = end_key },
+            .order = .asc,
+            .limit = 32,
+        });
+        defer {
+            for (running_docs) |*d| d.deinit(self.allocator);
+            self.allocator.free(running_docs);
+        }
+
+        var reaped: usize = 0;
+        for (running_docs) |*doc| {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), doc.body_json, .{}) catch continue;
+            if (parsed != .object) continue;
+            const lease_exp: i64 = if (parsed.object.get("lease_expires_at_ms")) |lv|
+                (if (lv == .integer) lv.integer else 0)
+            else
+                0;
+            // Only reap jobs whose explicit lease has expired (or fallback to run_at_ms + 2*lease_ms).
+            const effective_exp = if (lease_exp > 0) lease_exp else blk: {
+                const ra = if (parsed.object.get("run_at_ms")) |rv| (if (rv == .integer) rv.integer else 0) else 0;
+                break :blk ra + self.job_lease_ms * 2;
+            };
+            if (effective_exp > now_ms) continue;
+
+            const attempts: i64 = if (parsed.object.get("attempts")) |av| (if (av == .integer) av.integer else 1) else 1;
+            const is_cron = if (parsed.object.get("cron_name")) |cv| (cv == .string and cv.string.len > 0) else false;
+
+            const snap_ts = self.storage.latestCommitTs() catch continue;
+            var tx = tx_mod.TxContext.init(self.allocator, self.io, self.storage, self.manifest, snap_ts, false);
+            tx.allow_system_access = true;
+            defer tx.deinit();
+
+            const patch_json = if (!is_cron and attempts >= self.job_max_attempts)
+                try std.fmt.allocPrint(self.allocator, "{{\"status\":\"dead\",\"last_error\":\"worker lease expired after {d} attempts\"}}", .{attempts})
+            else
+                try std.fmt.allocPrint(self.allocator, "{{\"status\":\"pending\",\"run_at_ms\":{d},\"last_error\":\"worker lease expired; retrying\"}}", .{now_ms});
+            defer self.allocator.free(patch_json);
+            tx.patch("_system", "_scheduled_jobs", doc.id, patch_json) catch continue;
+
+            var commit = self.storage.commitTx(self.allocator, self.manifest, snap_ts, &tx.read_set, tx.writes.items) catch continue;
+            defer commit.deinit(self.allocator);
+            if (!commit.write_set.isEmpty()) self.handleLocalCommit(commit.commit_ts, &commit.write_set);
+            reaped += 1;
+        }
+        return reaped;
+    }
+
     /// Claim and execute due jobs from `_system._scheduled_jobs` safely across replicas via OCC.
     pub fn pollScheduledJobs(self: *ConcaveEngine) !usize {
+        _ = self.reapExpiredJobLeases() catch 0;
         try self.ensureCronJobs();
+
+        // Periodically prune old Postgres commit_log rows to bound storage growth.
+        if (self.storage == .pg and self.pg_commit_log_keep > 0) {
+            self.pg_prune_tick +%= 1;
+            if (self.pg_prune_tick % 300 == 0) {
+                _ = self.storage.pg.pruneCommitLog(self.pg_commit_log_keep) catch 0;
+            }
+        }
 
         const now_ms = storage_mod.nowMillis(self.io);
         const start_key = try key_mod.encodeKey(self.allocator, &.{.{ .str_val = "pending" }});
@@ -1100,14 +1599,16 @@ pub const ConcaveEngine = struct {
 
         var executed: usize = 0;
         for (due_docs) |*doc| {
-            // Step 1: Atomically claim `pending` -> `running` via OCC.
+            // Step 1: Atomically claim `pending` -> `running` via OCC with a lease expiration.
             var fn_name_owned: []u8 = undefined;
             var args_json_owned: []u8 = undefined;
             var cron_name_owned: ?[]u8 = null;
+            var claimed_attempts: i64 = 1;
 
             const claimed = blk: {
                 const snap_ts = self.storage.latestCommitTs() catch break :blk false;
                 var tx = tx_mod.TxContext.init(self.allocator, self.io, self.storage, self.manifest, snap_ts, false);
+                tx.allow_system_access = true;
                 defer tx.deinit();
 
                 const fresh = (tx.get(self.allocator, "_system", "_scheduled_jobs", doc.id) catch break :blk false) orelse break :blk false;
@@ -1124,8 +1625,14 @@ pub const ConcaveEngine = struct {
                 const args_v = parsed.object.get("args_json") orelse break :blk false;
                 if (fn_v != .string or args_v != .string) break :blk false;
                 const attempts: i64 = if (parsed.object.get("attempts")) |av| (if (av == .integer) av.integer else 0) else 0;
+                claimed_attempts = attempts + 1;
+                const lease_exp = storage_mod.nowMillis(self.io) + self.job_lease_ms;
 
-                const patch_json = std.fmt.allocPrint(self.allocator, "{{\"status\":\"running\",\"attempts\":{d}}}", .{attempts + 1}) catch break :blk false;
+                const patch_json = std.fmt.allocPrint(
+                    self.allocator,
+                    "{{\"status\":\"running\",\"attempts\":{d},\"lease_expires_at_ms\":{d}}}",
+                    .{ claimed_attempts, lease_exp },
+                ) catch break :blk false;
                 defer self.allocator.free(patch_json);
                 tx.patch("_system", "_scheduled_jobs", doc.id, patch_json) catch break :blk false;
 
@@ -1162,7 +1669,7 @@ pub const ConcaveEngine = struct {
             if (self.manifest.findFunction(fn_name_owned)) |fspec| {
                 switch (fspec.kind) {
                     .mutation => {
-                        const mres: ?MutationExecResult = self.executeMutation(self.allocator, fn_name_owned, args_json_owned, null) catch |err| blk_e: {
+                        const mres: ?MutationExecResult = self.executeMutationInternal(self.allocator, fn_name_owned, args_json_owned, null) catch |err| blk_e: {
                             job_err = try self.allocator.dupe(u8, @errorName(err));
                             break :blk_e null;
                         };
@@ -1174,7 +1681,7 @@ pub const ConcaveEngine = struct {
                         }
                     },
                     .action => {
-                        const ares: ?ExecResult = self.executeAction(self.allocator, fn_name_owned, args_json_owned, null) catch |err| blk_e: {
+                        const ares: ?ExecResult = self.executeActionInternal(self.allocator, fn_name_owned, args_json_owned, null) catch |err| blk_e: {
                             job_err = try self.allocator.dupe(u8, @errorName(err));
                             break :blk_e null;
                         };
@@ -1193,7 +1700,7 @@ pub const ConcaveEngine = struct {
                 job_err = try std.fmt.allocPrint(self.allocator, "unknown scheduled function `{s}`", .{fn_name_owned});
             }
 
-            // Step 3: Record completion/failure and reschedule next cron tick if applicable.
+            // Step 3: Record completion/retry/dead-letter and reschedule next cron tick if applicable.
             _ = self.metrics.scheduler_jobs_executed_total.fetchAdd(1, .monotonic);
             if (job_err != null) {
                 _ = self.metrics.scheduler_jobs_failed_total.fetchAdd(1, .monotonic);
@@ -1201,14 +1708,28 @@ pub const ConcaveEngine = struct {
             for (0..4) |_| {
                 const snap_ts = self.storage.latestCommitTs() catch break;
                 var tx = tx_mod.TxContext.init(self.allocator, self.io, self.storage, self.manifest, snap_ts, false);
+                tx.allow_system_access = true;
                 defer tx.deinit();
 
                 var patch_out: std.Io.Writer.Allocating = .init(self.allocator);
                 defer patch_out.deinit();
                 if (job_err) |emsg| {
-                    try patch_out.writer.writeAll("{\"status\":\"failed\",\"last_error\":");
-                    try storage_mod.writeJsonString(&patch_out.writer, emsg);
-                    try patch_out.writer.writeByte('}');
+                    if (cron_name_owned == null and claimed_attempts < self.job_max_attempts) {
+                        const shift: u6 = @intCast(@min(@max(claimed_attempts - 1, 0), 6));
+                        const backoff_ms: i64 = @min(@as(i64, 60_000), @as(i64, 1000) << shift);
+                        const retry_at = storage_mod.nowMillis(self.io) + backoff_ms;
+                        try patch_out.writer.print("{{\"status\":\"pending\",\"run_at_ms\":{d},\"last_error\":", .{retry_at});
+                        try storage_mod.writeJsonString(&patch_out.writer, emsg);
+                        try patch_out.writer.writeByte('}');
+                    } else if (cron_name_owned == null) {
+                        try patch_out.writer.writeAll("{\"status\":\"dead\",\"last_error\":");
+                        try storage_mod.writeJsonString(&patch_out.writer, emsg);
+                        try patch_out.writer.writeByte('}');
+                    } else {
+                        try patch_out.writer.writeAll("{\"status\":\"failed\",\"last_error\":");
+                        try storage_mod.writeJsonString(&patch_out.writer, emsg);
+                        try patch_out.writer.writeByte('}');
+                    }
                 } else {
                     try patch_out.writer.writeAll("{\"status\":\"completed\"}");
                 }
@@ -1269,23 +1790,30 @@ pub const ConcaveEngine = struct {
             if (empty) return 0;
         }
 
-        self.sync_mutex.lockUncancelable(self.io);
-        defer self.sync_mutex.unlock(self.io);
+        var pending_sends: std.ArrayList(*ClientDelivery) = .empty;
+        defer flushPendingDeliveries(self.allocator, self.io, &pending_sends);
 
-        const since = self.last_broadcast_ts.load(.acquire);
-        const entries = try self.storage.commitsSince(self.allocator, since);
-        defer {
-            for (entries) |*e| e.deinit(self.allocator);
-            self.allocator.free(entries);
-        }
+        var count: usize = 0;
+        {
+            self.sync_mutex.lockUncancelable(self.io);
+            defer self.sync_mutex.unlock(self.io);
 
-        for (entries) |*entry| {
-            if (!entry.write_set.isEmpty()) {
-                self.broadcastInvalidation(entry.commit_ts, &entry.write_set);
+            const since = self.last_broadcast_ts.load(.acquire);
+            const entries = try self.storage.commitsSince(self.allocator, since);
+            defer {
+                for (entries) |*e| e.deinit(self.allocator);
+                self.allocator.free(entries);
             }
-            self.last_broadcast_ts.store(entry.commit_ts, .release);
+            count = entries.len;
+
+            for (entries) |*entry| {
+                if (!entry.write_set.isEmpty()) {
+                    self.broadcastInvalidation(entry.commit_ts, &entry.write_set, &pending_sends);
+                }
+                self.last_broadcast_ts.store(entry.commit_ts, .release);
+            }
         }
-        return entries.len;
+        return count;
     }
 
     pub fn spawnCommitTailer(self: *ConcaveEngine, poll_ms: u64) !std.Thread {
@@ -1313,36 +1841,46 @@ pub const ConcaveEngine = struct {
             return;
         }
 
-        self.sync_mutex.lockUncancelable(self.io);
-        defer self.sync_mutex.unlock(self.io);
+        var pending_sends: std.ArrayList(*ClientDelivery) = .empty;
+        defer flushPendingDeliveries(self.allocator, self.io, &pending_sends);
 
-        const since = self.last_broadcast_ts.load(.acquire);
-        if (commit_ts == since + 1) {
-            self.broadcastInvalidation(commit_ts, write_set);
-            self.last_broadcast_ts.store(commit_ts, .release);
-            return;
-        }
-        if (commit_ts <= since) return;
+        {
+            self.sync_mutex.lockUncancelable(self.io);
+            defer self.sync_mutex.unlock(self.io);
 
-        // Catch up any intermediate commits from other Cloud Run instances first.
-        const entries = self.storage.commitsSince(self.allocator, since) catch {
-            self.broadcastInvalidation(commit_ts, write_set);
-            self.last_broadcast_ts.store(commit_ts, .release);
-            return;
-        };
-        defer {
-            for (entries) |*e| e.deinit(self.allocator);
-            self.allocator.free(entries);
-        }
-        for (entries) |*entry| {
-            if (!entry.write_set.isEmpty()) {
-                self.broadcastInvalidation(entry.commit_ts, &entry.write_set);
+            const since = self.last_broadcast_ts.load(.acquire);
+            if (commit_ts == since + 1) {
+                self.broadcastInvalidation(commit_ts, write_set, &pending_sends);
+                self.last_broadcast_ts.store(commit_ts, .release);
+                return;
             }
-            self.last_broadcast_ts.store(entry.commit_ts, .release);
+            if (commit_ts <= since) return;
+
+            // Catch up any intermediate commits from other Cloud Run instances first.
+            const entries = self.storage.commitsSince(self.allocator, since) catch {
+                self.broadcastInvalidation(commit_ts, write_set, &pending_sends);
+                self.last_broadcast_ts.store(commit_ts, .release);
+                return;
+            };
+            defer {
+                for (entries) |*e| e.deinit(self.allocator);
+                self.allocator.free(entries);
+            }
+            for (entries) |*entry| {
+                if (!entry.write_set.isEmpty()) {
+                    self.broadcastInvalidation(entry.commit_ts, &entry.write_set, &pending_sends);
+                }
+                self.last_broadcast_ts.store(entry.commit_ts, .release);
+            }
         }
     }
 
-    fn broadcastInvalidation(self: *ConcaveEngine, commit_ts: i64, write_set: *const readset_mod.WriteSet) void {
+    fn broadcastInvalidation(
+        self: *ConcaveEngine,
+        commit_ts: i64,
+        write_set: *const readset_mod.WriteSet,
+        pending_sends: *std.ArrayList(*ClientDelivery),
+    ) void {
         const fanout_start_us = metrics_mod.PlatformMetrics.nowMicros(self.io);
         _ = self.metrics.ws_invalidations_total.fetchAdd(1, .monotonic);
         defer self.metrics.fanout_latency.observeUs(metrics_mod.PlatformMetrics.elapsedUs(self.io, fanout_start_us));
@@ -1350,7 +1888,6 @@ pub const ConcaveEngine = struct {
         const SubJob = struct { sub_id: []u8, name: []u8, args_json: []u8 };
         const ClientJob = struct {
             client_id: u64,
-            sink: ClientSink,
             auth: ?auth_mod.AuthIdentity,
             subs: std.ArrayList(SubJob),
         };
@@ -1369,12 +1906,20 @@ pub const ConcaveEngine = struct {
             impacted.deinit(self.allocator);
         }
 
+        const now_ms = storage_mod.nowMillis(self.io);
         {
             self.clients_mutex.lockUncancelable(self.io);
             defer self.clients_mutex.unlock(self.io);
             var cit = self.clients.valueIterator();
             while (cit.next()) |sess_ptr| {
                 const sess = sess_ptr.*;
+                // Enforce JWT expiration on long-lived WebSocket sessions.
+                if (sess.auth) |*a| {
+                    if (a.isExpired(now_ms)) {
+                        a.deinit(self.allocator);
+                        sess.auth = null;
+                    }
+                }
                 var matching: std.ArrayList(SubJob) = .empty;
                 var sit = sess.subscriptions.valueIterator();
                 while (sit.next()) |sub| {
@@ -1391,7 +1936,6 @@ pub const ConcaveEngine = struct {
                     const auth_c = if (sess.auth) |*a| a.clone(self.allocator) catch null else null;
                     impacted.append(self.allocator, .{
                         .client_id = sess.id,
-                        .sink = sess.sink,
                         .auth = auth_c,
                         .subs = matching,
                     }) catch {
@@ -1456,7 +2000,7 @@ pub const ConcaveEngine = struct {
                     continue;
                 }
 
-                // Commit evaluated states & send atomically under `clients_mutex` (eliminating WsSender UAF!).
+                // Commit evaluated states under `clients_mutex` and enqueue refcounted sends to run lock-free.
                 self.clients_mutex.lockUncancelable(self.io);
                 defer self.clients_mutex.unlock(self.io);
                 if (self.clients.get(cj.client_id)) |sess| {
@@ -1478,16 +2022,17 @@ pub const ConcaveEngine = struct {
                         }
                     }
                     if (updates.items.len > 0) {
-                        if (sess.binary_protocol) {
-                            const frame_bin = formatTransitionBinary(self.allocator, effective_ts, updates.items) catch break;
-                            defer self.allocator.free(frame_bin);
-                            sess.sink.sendBinary(frame_bin);
-                        } else {
-                            const frame_json = formatTransition(self.allocator, effective_ts, updates.items) catch break;
-                            defer self.allocator.free(frame_json);
-                            sess.sink.send(frame_json);
+                        const frame = if (sess.binary_protocol)
+                            formatTransitionBinary(self.allocator, effective_ts, updates.items) catch break
+                        else
+                            formatTransition(self.allocator, effective_ts, updates.items) catch break;
+                        if (sess.delivery.enqueue(self.io, frame, sess.binary_protocol)) {
+                            sess.delivery.retain();
+                            pending_sends.append(self.allocator, sess.delivery) catch {
+                                sess.delivery.release();
+                            };
+                            _ = self.metrics.ws_transitions_sent_total.fetchAdd(1, .monotonic);
                         }
-                        _ = self.metrics.ws_transitions_sent_total.fetchAdd(1, .monotonic);
                     }
                 }
                 break;
@@ -1584,13 +2129,15 @@ pub fn formatTransitionBinary(allocator: Allocator, to_ts: i64, updates: []const
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
+    const count = @min(updates.len, std.math.maxInt(u16));
     var hdr: [11]u8 = undefined;
     hdr[0] = 0x83;
     std.mem.writeInt(i64, hdr[1..9], to_ts, .big);
-    std.mem.writeInt(u16, hdr[9..11], @intCast(@min(updates.len, std.math.maxInt(u16))), .big);
+    std.mem.writeInt(u16, hdr[9..11], @intCast(count), .big);
     try out.appendSlice(allocator, &hdr);
 
-    for (updates) |u| {
+    for (updates[0..count]) |u| {
+        if (u.sub_id.len > std.math.maxInt(u16)) return error.InvalidSubscriptionId;
         var slen: [2]u8 = undefined;
         std.mem.writeInt(u16, &slen, @intCast(u.sub_id.len), .big);
         try out.appendSlice(allocator, &slen);
@@ -1598,6 +2145,7 @@ pub fn formatTransitionBinary(allocator: Allocator, to_ts: i64, updates: []const
 
         switch (u.result) {
             .ok => |val_json| {
+                if (val_json.len > std.math.maxInt(u32)) return error.PayloadTooLarge;
                 try out.append(allocator, 1);
                 var plen: [4]u8 = undefined;
                 std.mem.writeInt(u32, &plen, @intCast(val_json.len), .big);
@@ -1605,6 +2153,7 @@ pub fn formatTransitionBinary(allocator: Allocator, to_ts: i64, updates: []const
                 try out.appendSlice(allocator, val_json);
             },
             .err => |err_msg| {
+                if (err_msg.len > std.math.maxInt(u32)) return error.PayloadTooLarge;
                 try out.append(allocator, 0);
                 var plen: [4]u8 = undefined;
                 std.mem.writeInt(u32, &plen, @intCast(err_msg.len), .big);
@@ -1779,4 +2328,123 @@ test "cross-instance commit_log tailer pushes surgical transitions to remote sub
     try std.testing.expectEqual(@as(usize, 2), cap_gen.frames.items.len);
     try std.testing.expect(std.mem.indexOf(u8, cap_gen.frames.items[1], "cross-node-zig") != null);
     try std.testing.expectEqual(@as(usize, 1), cap_roc.frames.items.len);
+}
+
+test "engine: secret allowlist & namespace isolation + cryptoOp action-only enforcement" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const WalStore = @import("../core/wal_store.zig").WalStore;
+
+    // Ensure all tests in secrets.zig and crypto.zig are discovered and executed by `zig build test`.
+    std.testing.refAllDecls(secrets_mod);
+    std.testing.refAllDecls(crypto_mod);
+
+    const mf_json =
+        \\{
+        \\  "app_name": "sec_test",
+        \\  "tables": [],
+        \\  "allowed_secrets": ["STRIPE_KEY"],
+        \\  "components": [
+        \\    {"namespace": "auth", "package": "concave-auth", "tables": [], "allowed_secrets": ["AUTH_JWT_SEED"]}
+        \\  ],
+        \\  "functions": [
+        \\    {"name": "charge", "kind": "action", "namespace": ""},
+        \\    {"name": "auth.login", "kind": "action", "namespace": "auth"}
+        \\  ],
+        \\  "http_routes": [
+        \\    {"method": "GET", "path": "/.well-known/jwks.json", "namespace": "auth"}
+        \\  ]
+        \\}
+    ;
+    var mf = try manifest_mod.AppManifest.parseJson(allocator, mf_json);
+    defer mf.deinit();
+
+    const vault_path = ".zig-cache/test-engine-secrets.enc";
+    std.Io.Dir.cwd().deleteFile(io, vault_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, vault_path) catch {};
+    try secrets_mod.vaultSet(io, allocator, vault_path, "test-pass", "STRIPE_KEY", "sk_live_123");
+    try secrets_mod.vaultSet(io, allocator, vault_path, "test-pass", "AUTH_JWT_SEED", "seed_xyz");
+
+    const sp = try secrets_mod.SecretProvider.init(allocator, io, .{
+        .local_vault_path = vault_path,
+        .vault_passphrase = "test-pass",
+    });
+    defer sp.deinit();
+
+    var store = try WalStore.openInMemory(allocator, io);
+    defer store.deinit();
+
+    const DummyExec = struct {
+        mf: *const manifest_mod.AppManifest,
+        fn getMf(ptr: *anyopaque) *const manifest_mod.AppManifest {
+            return @as(*@This(), @ptrCast(@alignCast(ptr))).mf;
+        }
+        fn noop(_: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8, _: *ExecutionEnv) ExecResult {
+            return .{ .ok = alloc.dupe(u8, "null") catch &.{} };
+        }
+        const vtable = AppExecutor.VTable{
+            .manifest = &getMf,
+            .executeQuery = &noop,
+            .executeMutation = &noop,
+            .executeAction = &noop,
+        };
+    };
+    var dummy = DummyExec{ .mf = &mf };
+    var eng = try ConcaveEngine.init(allocator, io, .{ .wal = store }, .{ .ptr = @ptrCast(&dummy), .vtable = &DummyExec.vtable }, .{});
+    defer eng.deinit();
+    eng.secret_provider = sp;
+
+    // Root action can read STRIPE_KEY (and STRIPE_KEY@latest) but NOT auth component's AUTH_JWT_SEED
+    var root_env = ExecutionEnv{
+        .allocator = allocator,
+        .io = io,
+        .auth = null,
+        .caller_namespace = "",
+        .mode = .{ .action = eng },
+    };
+    const sk = try root_env.getSecret(allocator, "STRIPE_KEY");
+    defer allocator.free(sk);
+    try std.testing.expectEqualStrings("sk_live_123", sk);
+    const sk_ver = try root_env.getSecret(allocator, "STRIPE_KEY@latest");
+    defer allocator.free(sk_ver);
+    try std.testing.expectEqualStrings("sk_live_123", sk_ver);
+    try std.testing.expectError(error.AccessDenied, root_env.getSecret(allocator, "AUTH_JWT_SEED"));
+
+    // Auth component action can read AUTH_JWT_SEED but NOT root app's STRIPE_KEY
+    var auth_env = ExecutionEnv{
+        .allocator = allocator,
+        .io = io,
+        .auth = null,
+        .caller_namespace = "auth",
+        .mode = .{ .action = eng },
+    };
+    const seed = try auth_env.getSecret(allocator, "AUTH_JWT_SEED");
+    defer allocator.free(seed);
+    try std.testing.expectEqualStrings("seed_xyz", seed);
+    try std.testing.expectError(error.AccessDenied, auth_env.getSecret(allocator, "STRIPE_KEY"));
+
+    // cryptoOp succeeds in action mode
+    const h = try root_env.cryptoOp(allocator, "{\"op\":\"sha256\",\"data\":\"abc\"}");
+    defer allocator.free(h);
+    try std.testing.expectEqualStrings("\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\"", h);
+
+    // TX mode MUST block both getSecret and cryptoOp
+    var tx = tx_mod.TxContext.init(allocator, io, .{ .wal = store }, &mf, 0, true);
+    defer tx.deinit();
+    var tx_env = ExecutionEnv{
+        .allocator = allocator,
+        .io = io,
+        .auth = null,
+        .caller_namespace = "",
+        .mode = .{ .tx = &tx },
+    };
+    try std.testing.expectError(error.SecretsOnlyAllowedInAction, tx_env.getSecret(allocator, "STRIPE_KEY"));
+    try std.testing.expectError(error.CryptoOnlyAllowedInAction, tx_env.cryptoOp(allocator, "{\"op\":\"sha256\",\"data\":\"abc\"}"));
+}
+
+comptime {
+    if (@import("builtin").is_test) {
+        _ = @import("../core/secrets.zig");
+        _ = @import("../core/crypto.zig");
+    }
 }

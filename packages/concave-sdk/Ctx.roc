@@ -6,6 +6,15 @@ Ctx := [Ctx].{
         subject : Str,
         issuer : Str,
         name : Str,
+        email : Str,
+        email_verified : Bool,
+        session_id : Str,
+        roles : List(Str),
+    }
+
+    HttpHeader : {
+        name : Str,
+        value : Str,
     }
 
     HttpRequest : {
@@ -17,6 +26,40 @@ Ctx := [Ctx].{
     HttpResponse : {
         status : U64,
         body : Str,
+    }
+
+    HttpRequestEx : {
+        method : Str,
+        url : Str,
+        headers : List(HttpHeader),
+        body : Str,
+    }
+
+    HttpResponseEx : {
+        status : U64,
+        headers : List(HttpHeader),
+        body : Str,
+    }
+
+    ## Scoped secrets capability (available ONLY in Actions & HTTP routes, enforced against manifest allowlist).
+    Secrets : {
+        get! : Str => Try(Str, Str),
+    }
+
+    ## Zero-dependency host crypto capability (available ONLY in Actions & HTTP routes).
+    CryptoCap : {
+        op! : Str => Try(Str, Str),
+        random_bytes! : U64 => Try(Str, Str),
+        sha256! : Str => Try(Str, Str),
+        sha256_b64url! : Str => Try(Str, Str),
+        hmac_sha256! : Str, Str => Try(Str, Str),
+        ct_eq! : Str, Str => Try(Bool, Str),
+        hash_password! : Str => Try(Str, Str),
+        verify_password! : Str, Str => Try(Bool, Str),
+        ed25519_jwk! : Str, Str => Try(Str, Str),
+        jwt_sign_ed25519! : Str, Str, Str => Try(Str, Str),
+        aead_encrypt! : Str, Str, Str => Try(Str, Str),
+        aead_decrypt! : Str, Str, Str => Try(Str, Str),
     }
 
     ## Transactional job scheduler (committed atomically with the enclosing mutation).
@@ -93,6 +136,9 @@ Ctx := [Ctx].{
         auth! : () => Try(AuthIdentity, [Unauthenticated]),
         now_ms! : () => I64,
         http_fetch! : HttpRequest => Try(HttpResponse, Str),
+        http_request! : HttpRequestEx => Try(HttpResponseEx, Str),
+        secrets : Secrets,
+        crypto : CryptoCap,
         run_query! : Str, Str => Try(Str, Str),
         run_mutation! : Str, Str => Try(Str, Str),
     }
@@ -158,6 +204,38 @@ Ctx := [Ctx].{
             Ok(id) => Ok(id)
             Err(Unauthenticated) => Err("Unauthenticated")
         }
+
+    ## Check whether an authenticated identity holds a given role.
+    has_role : AuthIdentity, Str -> Bool
+    has_role = |id, role|
+        List.any(id.roles, |r| r == role)
+
+    ## Check whether an authenticated identity holds any of the given roles.
+    has_any_role : AuthIdentity, List(Str) -> Bool
+    has_any_role = |id, allowed_roles|
+        List.any(allowed_roles, |r| has_role(id, r))
+
+    ## Require an authenticated caller holding `role`.
+    require_role! : (() => Try(AuthIdentity, [Unauthenticated])), Str => Try(AuthIdentity, Str)
+    require_role! = |auth!, role| {
+        id = require_auth!(auth!)?
+        if has_role(id, role) {
+            Ok(id)
+        } else {
+            Err("Forbidden: missing required role `${role}`")
+        }
+    }
+
+    ## Require an authenticated caller holding at least one role in `allowed_roles`.
+    require_any_role! : (() => Try(AuthIdentity, [Unauthenticated])), List(Str) => Try(AuthIdentity, Str)
+    require_any_role! = |auth!, allowed_roles| {
+        id = require_auth!(auth!)?
+        if has_any_role(id, allowed_roles) {
+            Ok(id)
+        } else {
+            Err("Forbidden: insufficient role")
+        }
+    }
 
     ## Read current Unix epoch milliseconds from any context (`QueryCtx`, `MutationCtx`, or `ActionCtx`).
     now_ms! : { now_ms! : () => I64, ..r } => I64
@@ -238,6 +316,20 @@ Ctx := [Ctx].{
     http_fetch! = |ctx, req| {
         f! = ctx.http_fetch!
         f!(req)
+    }
+
+    ## Perform an outbound HTTP/HTTPS request with custom request/response headers inside an `ActionCtx`.
+    http_request! : ActionCtx, HttpRequestEx => Try(HttpResponseEx, Str)
+    http_request! = |ctx, req| {
+        f! = ctx.http_request!
+        f!(req)
+    }
+
+    ## Fetch an allowlisted secret inside an `ActionCtx`.
+    secret_get! : ActionCtx, Str => Try(Str, Str)
+    secret_get! = |ctx, name| {
+        f! = ctx.secrets.get!
+        f!(name)
     }
 
     ## Invoke a registered query re-entrantly from an `ActionCtx` with typed `Json.Encodable` args.

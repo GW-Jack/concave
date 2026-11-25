@@ -6,9 +6,12 @@ const auth_mod = @import("auth.zig");
 const compress = @import("compress.zig");
 const engine_mod = @import("engine.zig");
 const http2 = @import("http2.zig");
+const rate_limit = @import("rate_limit.zig");
 const ws_mod = @import("ws.zig");
 
 const DYNAMIC_GZIP_MIN_BYTES: usize = 512;
+const HTTP_SOCKET_TIMEOUT_SECS: i64 = 30;
+const MAX_HTTP_HEADERS: usize = 128;
 
 pub const ServerConfig = struct {
     host: []const u8 = "127.0.0.1",
@@ -17,6 +20,11 @@ pub const ServerConfig = struct {
     live_reload: bool = false,
     admin_key: ?[]const u8 = null,
     operator_token: ?[]const u8 = null,
+    cors_origins: []const []const u8 = &.{},
+    max_connections: usize = 512,
+    rate_limit_rps: u32 = 200,
+    rate_limit_burst: u32 = 400,
+    trust_proxy: bool = false,
     shutdown_flag: ?*std.atomic.Value(bool) = null,
 };
 
@@ -30,6 +38,13 @@ fn enableTcpNoDelay(stream: std.Io.net.Stream) void {
     ) catch {};
 }
 
+fn setSocketTimeouts(stream: std.Io.net.Stream, rcv_secs: i64, snd_secs: i64) void {
+    const rtv = std.posix.timeval{ .sec = @intCast(rcv_secs), .usec = 0 };
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&rtv)) catch {};
+    const stv = std.posix.timeval{ .sec = @intCast(snd_secs), .usec = 0 };
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&stv)) catch {};
+}
+
 pub fn serve(
     allocator: Allocator,
     io: std.Io,
@@ -39,6 +54,10 @@ pub fn serve(
     const addr = try std.Io.net.IpAddress.parse(config.host, config.port);
     var listener = try addr.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
+
+    var active_conns = std.atomic.Value(usize).init(0);
+    var limiter = rate_limit.RateLimiter.init(allocator, io, config.rate_limit_rps, config.rate_limit_burst);
+    defer limiter.deinit();
 
     std.debug.print("Concave server listening on http://{s}:{d} (HTTP/1.1 + HTTP/2 h2c + WS)\n", .{ config.host, config.port });
 
@@ -60,7 +79,17 @@ pub fn serve(
             }
         }
 
+        const prev_conns = active_conns.fetchAdd(1, .acq_rel);
+        if (prev_conns >= config.max_connections) {
+            _ = active_conns.fetchSub(1, .acq_rel);
+            const busy = makeEmptyResponse(503, "text/plain");
+            writeHttp1Response(io, stream, &busy, false);
+            stream.close(io);
+            continue;
+        }
+
         enableTcpNoDelay(stream);
+        setSocketTimeouts(stream, HTTP_SOCKET_TIMEOUT_SECS, HTTP_SOCKET_TIMEOUT_SECS);
 
         const ConnCtx = struct {
             allocator: Allocator,
@@ -70,10 +99,15 @@ pub fn serve(
             live_reload: bool,
             admin_key: ?[]const u8,
             operator_token: ?[]const u8,
+            cors_origins: []const []const u8,
+            limiter: *rate_limit.RateLimiter,
+            trust_proxy: bool,
             shutdown_flag: ?*std.atomic.Value(bool),
+            active_conns: *std.atomic.Value(usize),
             stream: std.Io.net.Stream,
 
             fn run(ctx: @This()) void {
+                defer _ = ctx.active_conns.fetchSub(1, .acq_rel);
                 handleConnection(
                     ctx.allocator,
                     ctx.io,
@@ -82,6 +116,9 @@ pub fn serve(
                     ctx.live_reload,
                     ctx.admin_key,
                     ctx.operator_token,
+                    ctx.cors_origins,
+                    ctx.limiter,
+                    ctx.trust_proxy,
                     ctx.shutdown_flag,
                     ctx.stream,
                 );
@@ -96,9 +133,14 @@ pub fn serve(
             .live_reload = config.live_reload,
             .admin_key = config.admin_key,
             .operator_token = config.operator_token,
+            .cors_origins = config.cors_origins,
+            .limiter = &limiter,
+            .trust_proxy = config.trust_proxy,
             .shutdown_flag = config.shutdown_flag,
+            .active_conns = &active_conns,
             .stream = stream,
         }}) catch {
+            _ = active_conns.fetchSub(1, .acq_rel);
             stream.close(io);
             continue;
         };
@@ -110,10 +152,13 @@ pub const HttpRequest = struct {
     method: []u8,
     path: []u8,
     query: []u8,
+    host: ?[]u8 = null,
+    origin: ?[]u8 = null,
     content_type: ?[]u8 = null,
     authorization: ?[]u8 = null,
     accept_encoding: ?[]u8 = null,
     if_none_match: ?[]u8 = null,
+    headers: []http2.HttpHeader = &.{},
     keep_alive: bool = true,
     upgrade_ws: bool = false,
     ws_key: ?[]u8 = null,
@@ -124,10 +169,17 @@ pub const HttpRequest = struct {
         allocator.free(self.method);
         allocator.free(self.path);
         allocator.free(self.query);
+        if (self.host) |h| allocator.free(h);
+        if (self.origin) |o| allocator.free(o);
         if (self.content_type) |ct| allocator.free(ct);
         if (self.authorization) |a| allocator.free(a);
         if (self.accept_encoding) |ae| allocator.free(ae);
         if (self.if_none_match) |inm| allocator.free(inm);
+        for (self.headers) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        if (self.headers.len > 0) allocator.free(self.headers);
         if (self.ws_key) |k| allocator.free(k);
         allocator.free(self.body);
     }
@@ -137,10 +189,13 @@ pub const HttpRequest = struct {
             .method = self.method,
             .path = self.path,
             .query = self.query,
+            .host = self.host,
+            .origin = self.origin,
             .content_type = self.content_type,
             .authorization = self.authorization,
             .accept_encoding = self.accept_encoding,
             .if_none_match = self.if_none_match,
+            .headers = self.headers,
             .body = self.body,
         };
     }
@@ -183,9 +238,11 @@ pub fn readHttpRequest(allocator: Allocator, reader: *std.Io.Reader) !?HttpReque
     var lines = std.mem.splitSequence(u8, head_bytes, "\r\n");
     const req_line = lines.next() orelse return null;
     var req_parts = std.mem.splitScalar(u8, req_line, ' ');
-    const method_raw = req_parts.next() orelse return null;
-    const target_raw = req_parts.next() orelse return null;
-    const version_raw = req_parts.next() orelse "HTTP/1.1";
+    const method_raw = req_parts.next() orelse return error.BadRequest;
+    const target_raw = req_parts.next() orelse return error.BadRequest;
+    const version_raw = req_parts.next() orelse return error.BadRequest;
+    if (req_parts.next() != null) return error.BadRequest;
+    if (method_raw.len == 0 or target_raw.len == 0) return error.BadRequest;
 
     // RFC 9113 HTTP/2 prior-knowledge connection preface begins with `"PRI * HTTP/2.0\r\n\r\n"`.
     if (std.mem.eql(u8, method_raw, "PRI") and std.mem.eql(u8, target_raw, "*") and std.mem.eql(u8, version_raw, "HTTP/2.0")) {
@@ -198,10 +255,19 @@ pub fn readHttpRequest(allocator: Allocator, reader: *std.Io.Reader) !?HttpReque
         };
     }
 
+    if (!std.mem.eql(u8, version_raw, "HTTP/1.1") and !std.mem.eql(u8, version_raw, "HTTP/1.0")) {
+        return error.BadRequest;
+    }
+
     const path_raw = if (std.mem.indexOfScalar(u8, target_raw, '?')) |qi| target_raw[0..qi] else target_raw;
     const query_raw = if (std.mem.indexOfScalar(u8, target_raw, '?')) |qi| target_raw[qi + 1 ..] else "";
 
     var content_length: usize = 0;
+    var saw_content_length = false;
+    var host: ?[]u8 = null;
+    errdefer if (host) |h| allocator.free(h);
+    var origin: ?[]u8 = null;
+    errdefer if (origin) |o| allocator.free(o);
     var content_type: ?[]u8 = null;
     errdefer if (content_type) |ct| allocator.free(ct);
     var auth_header: ?[]u8 = null;
@@ -215,13 +281,54 @@ pub fn readHttpRequest(allocator: Allocator, reader: *std.Io.Reader) !?HttpReque
     var ws_key: ?[]u8 = null;
     errdefer if (ws_key) |k| allocator.free(k);
 
+    var header_list: std.ArrayList(http2.HttpHeader) = .empty;
+    errdefer {
+        for (header_list.items) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        header_list.deinit(allocator);
+    }
+
     while (lines.next()) |line| {
-        const ci = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const hname = std.mem.trim(u8, line[0..ci], " \t");
+        if (line.len == 0) continue;
+        // Reject obs-fold (RFC 9112 §5.2) and malformed lines without ':'.
+        if (line[0] == ' ' or line[0] == '\t') return error.BadRequest;
+        const ci = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadRequest;
+        const hname_raw = line[0..ci];
+        // RFC 9112 §5.1: No whitespace allowed between field name and colon.
+        if (hname_raw.len == 0 or hname_raw[hname_raw.len - 1] == ' ' or hname_raw[hname_raw.len - 1] == '\t') {
+            return error.BadRequest;
+        }
+        const hname = hname_raw;
         const hval = std.mem.trim(u8, line[ci + 1 ..], " \t");
 
-        if (std.ascii.eqlIgnoreCase(hname, "Content-Length")) {
-            content_length = std.fmt.parseInt(usize, hval, 10) catch 0;
+        if (header_list.items.len >= MAX_HTTP_HEADERS) return error.HeadersTooLarge;
+        try header_list.append(allocator, .{
+            .name = try allocator.dupe(u8, hname),
+            .value = try allocator.dupe(u8, hval),
+        });
+
+        // RFC 9112 §6.1 / Request Smuggling defense: reject Transfer-Encoding (unsupported by HTTP/1.1 reader).
+        if (std.ascii.eqlIgnoreCase(hname, "Transfer-Encoding")) {
+            return error.UnsupportedTransferEncoding;
+        } else if (std.ascii.eqlIgnoreCase(hname, "Content-Length")) {
+            if (hval.len == 0) return error.BadRequest;
+            for (hval) |ch| {
+                if (ch < '0' or ch > '9') return error.BadRequest;
+            }
+            const parsed_len = std.fmt.parseInt(usize, hval, 10) catch return error.BadRequest;
+            if (saw_content_length and parsed_len != content_length) {
+                return error.BadRequest;
+            }
+            saw_content_length = true;
+            content_length = parsed_len;
+        } else if (std.ascii.eqlIgnoreCase(hname, "Host")) {
+            if (host) |old| allocator.free(old);
+            host = try allocator.dupe(u8, hval);
+        } else if (std.ascii.eqlIgnoreCase(hname, "Origin")) {
+            if (origin) |old| allocator.free(old);
+            origin = try allocator.dupe(u8, hval);
         } else if (std.ascii.eqlIgnoreCase(hname, "Content-Type")) {
             if (content_type) |old| allocator.free(old);
             content_type = try allocator.dupe(u8, hval);
@@ -259,15 +366,37 @@ pub fn readHttpRequest(allocator: Allocator, reader: *std.Io.Reader) !?HttpReque
         .method = try allocator.dupe(u8, method_raw),
         .path = try allocator.dupe(u8, path_raw),
         .query = try allocator.dupe(u8, query_raw),
+        .host = host,
+        .origin = origin,
         .content_type = content_type,
         .authorization = auth_header,
         .accept_encoding = accept_encoding,
         .if_none_match = if_none_match,
+        .headers = try header_list.toOwnedSlice(allocator),
         .keep_alive = keep_alive,
         .upgrade_ws = upgrade_ws,
         .ws_key = ws_key,
         .body = body,
     };
+}
+
+fn formatPeerIp(addr: std.Io.net.IpAddress, buf: *[64]u8) []const u8 {
+    return switch (addr) {
+        .ip4 => |v4| std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
+            v4.bytes[0], v4.bytes[1], v4.bytes[2], v4.bytes[3],
+        }) catch "unknown",
+        .ip6 => |v6| std.fmt.bufPrint(buf, "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}", .{
+            v6.bytes[0], v6.bytes[1], v6.bytes[2], v6.bytes[3],
+            v6.bytes[4], v6.bytes[5], v6.bytes[6], v6.bytes[7],
+        }) catch "unknown",
+    };
+}
+
+fn findHeaderValue(headers: []const http2.HttpHeader, name: []const u8) ?[]const u8 {
+    for (headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+    }
+    return null;
 }
 
 const DispatchCtx = struct {
@@ -277,10 +406,27 @@ const DispatchCtx = struct {
     live_reload: bool,
     admin_key: ?[]const u8,
     operator_token: ?[]const u8,
+    cors_origins: []const []const u8,
+    limiter: ?*rate_limit.RateLimiter = null,
+    trust_proxy: bool = false,
+    peer_ip: []const u8 = "unknown",
 
     fn h2Dispatch(ptr: *anyopaque, allocator: Allocator, req: *const http2.H2Request) http2.H2Response {
         const self: *DispatchCtx = @ptrCast(@alignCast(ptr));
-        return dispatchHttpRequest(allocator, self.io, self.engine, self.static_dir, self.live_reload, self.admin_key, self.operator_token, req);
+        return dispatchHttpRequest(
+            allocator,
+            self.io,
+            self.engine,
+            self.static_dir,
+            self.live_reload,
+            self.admin_key,
+            self.operator_token,
+            self.cors_origins,
+            self.limiter,
+            self.trust_proxy,
+            self.peer_ip,
+            req,
+        );
     }
 };
 
@@ -292,10 +438,17 @@ fn handleConnection(
     live_reload: bool,
     admin_key: ?[]const u8,
     operator_token: ?[]const u8,
+    cors_origins: []const []const u8,
+    limiter: *rate_limit.RateLimiter,
+    trust_proxy: bool,
     shutdown_flag: ?*std.atomic.Value(bool),
     stream: std.Io.net.Stream,
 ) void {
-    defer stream.close(io);
+    var stream_handed_off = false;
+    defer if (!stream_handed_off) stream.close(io);
+
+    var peer_ip_buf: [64]u8 = undefined;
+    const peer_ip = formatPeerIp(stream.socket.address, &peer_ip_buf);
 
     var rbuf: [8192]u8 = undefined;
     var sr = stream.reader(io, &rbuf);
@@ -307,6 +460,10 @@ fn handleConnection(
         .live_reload = live_reload,
         .admin_key = admin_key,
         .operator_token = operator_token,
+        .cors_origins = cors_origins,
+        .limiter = limiter,
+        .trust_proxy = trust_proxy,
+        .peer_ip = peer_ip,
     };
 
     var req_arena = std.heap.ArenaAllocator.init(allocator);
@@ -317,10 +474,22 @@ fn handleConnection(
         if (shutdown_flag) |sf| {
             if (sf.load(.acquire)) break;
         }
-        defer _ = req_arena.reset(.retain_capacity);
+        defer _ = req_arena.reset(.{ .retain_with_limit = 64 * 1024 });
         const ra = req_arena.allocator();
 
-        const maybe_req = readHttpRequest(ra, &sr.interface) catch return;
+        const maybe_req = readHttpRequest(ra, &sr.interface) catch |err| {
+            const err_status: u16 = switch (err) {
+                error.HeadersTooLarge => 431,
+                error.PayloadTooLarge => 413,
+                error.UnsupportedTransferEncoding => 501,
+                error.BadRequest => 400,
+                else => return,
+            };
+            const err_resp = makeEmptyResponse(err_status, "text/plain");
+            engine.metrics.recordHttpStatus(err_status);
+            writeHttp1Response(io, stream, &err_resp, false);
+            return;
+        };
         const req = maybe_req orelse return;
 
         // Seamless HTTP/2 (`h2c` prior knowledge) upgrade on first request preface
@@ -335,6 +504,12 @@ fn handleConnection(
 
         // WebSocket upgrade on `/ws`
         if (req.upgrade_ws and std.mem.eql(u8, req.path, "/ws")) {
+            if (!isWsOriginAllowed(req.origin, req.host, cors_origins, engine.auth_config.allow_dev_tokens)) {
+                const err_resp = makePlainResponse(ra, 403, "text/plain", "forbidden origin") catch return;
+                engine.metrics.recordHttpStatus(403);
+                writeHttp1Response(io, stream, &err_resp, false);
+                return;
+            }
             const key = req.ws_key orelse {
                 const err_resp = makePlainResponse(ra, 400, "text/plain", "missing Sec-WebSocket-Key") catch return;
                 engine.metrics.recordHttpStatus(400);
@@ -355,13 +530,30 @@ fn handleConnection(
             ) catch return;
             sw.interface.flush() catch return;
 
+            // Clear HTTP read timeout so idle WebSocket subscribers stay connected;
+            // WsSender applies its own 5s write timeout.
+            setSocketTimeouts(stream, 0, 5);
             const initial_binary = std.mem.indexOf(u8, req.query, "proto=bin") != null;
+            stream_handed_off = true;
             handleWebSocket(allocator, io, engine, stream, &sr.interface, initial_binary);
             return;
         }
 
         const h2_view = req.asH2View();
-        const resp = dispatchHttpRequest(ra, io, engine, static_dir, live_reload, admin_key, operator_token, &h2_view);
+        const resp = dispatchHttpRequest(
+            ra,
+            io,
+            engine,
+            static_dir,
+            live_reload,
+            admin_key,
+            operator_token,
+            cors_origins,
+            limiter,
+            trust_proxy,
+            peer_ip,
+            &h2_view,
+        );
 
         const shutting_down = if (shutdown_flag) |sf| sf.load(.acquire) else false;
         const keep_conn = req.keep_alive and !shutting_down and resp.status < 400;
@@ -371,7 +563,7 @@ fn handleConnection(
 }
 
 /// Unified HTTP/1.1 + HTTP/2 request router with zero-cost pre-compressed embedded assets,
-/// ETag/304 caching, and automatic gzip compression for dynamic & static payloads.
+/// ETag/304 caching, security headers, edge rate limiting, CORS policy, and automatic gzip compression.
 fn dispatchHttpRequest(
     allocator: Allocator,
     io: std.Io,
@@ -380,9 +572,28 @@ fn dispatchHttpRequest(
     live_reload: bool,
     admin_key: ?[]const u8,
     operator_token: ?[]const u8,
+    cors_origins: []const []const u8,
+    limiter: ?*rate_limit.RateLimiter,
+    trust_proxy: bool,
+    peer_ip: []const u8,
     req: *const http2.H2Request,
 ) http2.H2Response {
-    const resp = dispatchHttpRequestInner(allocator, io, engine, static_dir, live_reload, admin_key, operator_token, req);
+    if (limiter) |rl| {
+        if (!std.mem.eql(u8, req.path, "/health") and !std.mem.eql(u8, req.path, "/ready")) {
+            const xff = findHeaderValue(req.headers, "x-forwarded-for");
+            const client_ip = rate_limit.extractClientIp(peer_ip, xff, trust_proxy);
+            const decision = rl.check(client_ip);
+            if (!decision.allowed) {
+                var r429 = makeResponse(allocator, 429, "application/json", "{\"error\":\"rate limit exceeded\"}", false);
+                r429.retry_after_secs = decision.retry_after_secs;
+                r429.cors_allow_origin = resolveCorsOrigin(req.path, req.origin, cors_origins, engine.auth_config.allow_dev_tokens);
+                engine.metrics.recordHttpStatus(429);
+                return r429;
+            }
+        }
+    }
+    var resp = dispatchHttpRequestInner(allocator, io, engine, static_dir, live_reload, admin_key, operator_token, req);
+    resp.cors_allow_origin = resolveCorsOrigin(req.path, req.origin, cors_origins, engine.auth_config.allow_dev_tokens);
     engine.metrics.recordHttpStatus(resp.status);
     return resp;
 }
@@ -422,10 +633,13 @@ fn dispatchHttpRequestInner(
         return makeResponse(allocator, 200, "application/json", engine.manifest.raw_json, want_gzip);
     }
 
-    // Embedded Live Dev Dashboard (`/_dashboard`) — minified, pre-gzipped, ETag-cached
+    // Embedded Live Dev Dashboard (`/_dashboard`) — minified, pre-gzipped, ETag-cached + strict CSP
     if (std.mem.eql(u8, req.method, "GET")) {
         if (std.mem.eql(u8, req.path, "/_dashboard") or std.mem.eql(u8, req.path, "/_dashboard/")) {
-            return serveEmbeddedAsset(allocator, &assets.dashboard_index_html, want_gzip, req.if_none_match);
+            var resp = serveEmbeddedAsset(allocator, &assets.dashboard_index_html, want_gzip, req.if_none_match);
+            resp.content_security_policy = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
+            resp.x_frame_options = "DENY";
+            return resp;
         }
         if (std.mem.eql(u8, req.path, "/_dashboard/styles.css")) {
             return serveEmbeddedAsset(allocator, &assets.dashboard_styles_css, want_gzip, req.if_none_match);
@@ -438,7 +652,7 @@ fn dispatchHttpRequestInner(
     // Platform Operator Reliability Endpoints (`/_internal/metrics`, `/_internal/status`)
     if (std.mem.eql(u8, req.method, "GET") and std.mem.startsWith(u8, req.path, "/_internal/")) {
         const expected_tok = operator_token orelse admin_key;
-        if (!isOperatorAuthorized(engine, expected_tok, req.authorization, req.query)) {
+        if (!isOperatorAuthorized(engine, expected_tok, req.authorization)) {
             const status: u16 = if (expected_tok != null) 401 else 403;
             return makeResponse(allocator, status, "application/json", "{\"error\":\"operator access denied\"}", false);
         }
@@ -459,7 +673,7 @@ fn dispatchHttpRequestInner(
 
     // Admin inspection endpoints (`/_admin/stats`, `/_admin/table`, `/_admin/jobs`)
     if (std.mem.eql(u8, req.method, "GET") and std.mem.startsWith(u8, req.path, "/_admin/")) {
-        if (!isAdminAuthorized(engine, admin_key, req.authorization, req.query)) {
+        if (!isAdminAuthorized(engine, admin_key, req.authorization)) {
             const status: u16 = if (admin_key != null) 401 else 403;
             return makeResponse(allocator, status, "application/json", "{\"error\":\"admin access denied\"}", false);
         }
@@ -507,6 +721,81 @@ fn dispatchHttpRequestInner(
         return makeResponse(allocator, 404, "application/json", "{\"error\":\"unknown admin endpoint\"}", false);
     }
 
+    // Admin mutation endpoints (`/_admin/doc/patch`, `/_admin/doc/delete`, `/_admin/jobs/retry`, `/_admin/jobs/cancel`)
+    if (std.mem.eql(u8, req.method, "POST") and std.mem.startsWith(u8, req.path, "/_admin/")) {
+        if (!isAdminAuthorized(engine, admin_key, req.authorization)) {
+            const status: u16 = if (admin_key != null) 401 else 403;
+            return makeResponse(allocator, status, "application/json", "{\"error\":\"admin access denied\"}", false);
+        }
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, if (req.body.len > 0) req.body else "{}", .{}) catch
+            return makeResponse(allocator, 400, "application/json", "{\"error\":\"invalid JSON body\"}", false);
+        if (parsed != .object) {
+            return makeResponse(allocator, 400, "application/json", "{\"error\":\"expected JSON object\"}", false);
+        }
+
+        if (std.mem.eql(u8, req.path, "/_admin/doc/patch")) {
+            const ns = jsonStringField(parsed.object, "ns") orelse "";
+            const tbl = jsonStringField(parsed.object, "table") orelse
+                return makeResponse(allocator, 400, "application/json", "{\"error\":\"missing table\"}", false);
+            const id = jsonStringField(parsed.object, "id") orelse
+                return makeResponse(allocator, 400, "application/json", "{\"error\":\"missing id\"}", false);
+            const patch_val = parsed.object.get("patch") orelse
+                return makeResponse(allocator, 400, "application/json", "{\"error\":\"missing patch\"}", false);
+            const patch_json = storage_mod.stringifyJsonValue(a, patch_val) catch
+                return makeResponse(allocator, 400, "application/json", "{\"error\":\"invalid patch\"}", false);
+            engine.adminPatchDoc(ns, tbl, id, patch_json) catch |err| {
+                const st: u16 = switch (err) {
+                    storage_mod.StorageError.AccessDenied => 403,
+                    storage_mod.StorageError.NotFound => 404,
+                    storage_mod.StorageError.SchemaViolation, storage_mod.StorageError.InvalidJson, storage_mod.StorageError.UnknownTable => 400,
+                    else => 500,
+                };
+                const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch "{\"error\":\"patch failed\"}";
+                defer if (!std.mem.eql(u8, msg, "{\"error\":\"patch failed\"}")) allocator.free(msg);
+                return makeResponse(allocator, st, "application/json", msg, false);
+            };
+            return makeResponse(allocator, 200, "application/json", "{\"ok\":true}", false);
+        }
+        if (std.mem.eql(u8, req.path, "/_admin/doc/delete")) {
+            const ns = jsonStringField(parsed.object, "ns") orelse "";
+            const tbl = jsonStringField(parsed.object, "table") orelse
+                return makeResponse(allocator, 400, "application/json", "{\"error\":\"missing table\"}", false);
+            const id = jsonStringField(parsed.object, "id") orelse
+                return makeResponse(allocator, 400, "application/json", "{\"error\":\"missing id\"}", false);
+            engine.adminDeleteDoc(ns, tbl, id) catch |err| {
+                const st: u16 = switch (err) {
+                    storage_mod.StorageError.AccessDenied => 403,
+                    storage_mod.StorageError.NotFound => 404,
+                    else => 500,
+                };
+                const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch "{\"error\":\"delete failed\"}";
+                defer if (!std.mem.eql(u8, msg, "{\"error\":\"delete failed\"}")) allocator.free(msg);
+                return makeResponse(allocator, st, "application/json", msg, false);
+            };
+            return makeResponse(allocator, 200, "application/json", "{\"ok\":true}", false);
+        }
+        if (std.mem.eql(u8, req.path, "/_admin/jobs/retry")) {
+            const job_id = jsonStringField(parsed.object, "job_id") orelse
+                return makeResponse(allocator, 400, "application/json", "{\"error\":\"missing job_id\"}", false);
+            const ok = engine.adminRetryJob(job_id) catch
+                return makeResponse(allocator, 500, "application/json", "{\"error\":\"retry failed\"}", false);
+            if (!ok) return makeResponse(allocator, 404, "application/json", "{\"error\":\"job not found\"}", false);
+            return makeResponse(allocator, 200, "application/json", "{\"ok\":true}", false);
+        }
+        if (std.mem.eql(u8, req.path, "/_admin/jobs/cancel")) {
+            const job_id = jsonStringField(parsed.object, "job_id") orelse
+                return makeResponse(allocator, 400, "application/json", "{\"error\":\"missing job_id\"}", false);
+            const ok = engine.adminCancelJob(job_id) catch
+                return makeResponse(allocator, 500, "application/json", "{\"error\":\"cancel failed\"}", false);
+            if (!ok) return makeResponse(allocator, 404, "application/json", "{\"error\":\"job not found\"}", false);
+            return makeResponse(allocator, 200, "application/json", "{\"ok\":true}", false);
+        }
+        return makeResponse(allocator, 404, "application/json", "{\"error\":\"unknown admin endpoint\"}", false);
+    }
+
     // Embedded zero-dependency browser ESM client at `/_concave/*` — bundled, minified, pre-gzipped, ETag-cached
     if (std.mem.eql(u8, req.method, "GET") and std.mem.startsWith(u8, req.path, "/_concave/")) {
         const file = req.path["/_concave/".len..];
@@ -518,6 +807,10 @@ fn dispatchHttpRequestInner(
             &assets.client_client_js
         else if (std.mem.eql(u8, file, "dom.js"))
             &assets.client_dom_js
+        else if (std.mem.eql(u8, file, "router.js"))
+            &assets.client_router_js
+        else if (std.mem.eql(u8, file, "auth.js"))
+            &assets.auth_client_js
         else if (std.mem.eql(u8, file, "analytics.js"))
             &assets.analytics_client_js
         else if (std.mem.eql(u8, file, "monitor.js"))
@@ -571,8 +864,8 @@ fn dispatchHttpRequestInner(
         const bs = engine.blob_store orelse
             return makeResponse(allocator, 503, "application/json", "{\"error\":\"storage not configured\"}", false);
         const token = req.path["/_storage/upload/".len..];
-        const storage_id = bs.verifyUploadToken(allocator, token) catch
-            return makeResponse(allocator, 403, "application/json", "{\"error\":\"invalid or expired upload token\"}", false);
+        const storage_id = bs.consumeUploadToken(allocator, token) catch
+            return makeResponse(allocator, 403, "application/json", "{\"error\":\"invalid, expired, or already-used upload token\"}", false);
         defer allocator.free(storage_id);
         const ct = req.content_type orelse "application/octet-stream";
         bs.putLocalBlob(storage_id, ct, req.body) catch
@@ -592,10 +885,13 @@ fn dispatchHttpRequestInner(
         const blob = bs.getLocalBlob(allocator, storage_id) catch
             return makeResponse(allocator, 404, "text/plain", "blob not found", false);
         defer blob.deinit(allocator);
-        // Copy content_type-safe slice? Wait: `blob.content_type` is freed at defer; pick static mime or dupe?
-        // Return static common MIME or octet-stream to avoid lifetime issue on `H2Response.content_type`:
-        const ct_static = internCommonMime(blob.content_type);
-        return makeResponse(allocator, 200, ct_static, blob.bytes, want_gzip);
+        // Never serve untrusted user uploads as active web documents (HTML/SVG/JS/XML) on the app origin.
+        const ct_static = safeStorageMime(blob.content_type);
+        var resp = makeResponse(allocator, 200, ct_static, blob.bytes, want_gzip);
+        resp.content_disposition = "attachment";
+        resp.content_security_policy = "default-src 'none'; sandbox";
+        resp.x_frame_options = "DENY";
+        return resp;
     }
 
     // Custom application HTTP routes / webhooks (`App.http_route`)
@@ -621,7 +917,16 @@ fn dispatchHttpRequestInner(
         storage_mod.writeJsonString(rw, req.body) catch return makeEmptyResponse(500, "application/json");
         rw.writeAll(",\"content_type\":") catch return makeEmptyResponse(500, "application/json");
         storage_mod.writeJsonString(rw, req.content_type orelse "") catch return makeEmptyResponse(500, "application/json");
-        rw.writeByte('}') catch return makeEmptyResponse(500, "application/json");
+        rw.writeAll(",\"headers\":[") catch return makeEmptyResponse(500, "application/json");
+        for (req.headers, 0..) |hdr, hi| {
+            if (hi > 0) rw.writeByte(',') catch return makeEmptyResponse(500, "application/json");
+            rw.writeAll("{\"name\":") catch return makeEmptyResponse(500, "application/json");
+            storage_mod.writeJsonString(rw, hdr.name) catch return makeEmptyResponse(500, "application/json");
+            rw.writeAll(",\"value\":") catch return makeEmptyResponse(500, "application/json");
+            storage_mod.writeJsonString(rw, hdr.value) catch return makeEmptyResponse(500, "application/json");
+            rw.writeByte('}') catch return makeEmptyResponse(500, "application/json");
+        }
+        rw.writeAll("]}") catch return makeEmptyResponse(500, "application/json");
 
         const res = engine.executeHttpRoute(
             allocator,
@@ -652,7 +957,37 @@ fn dispatchHttpRequestInner(
                         (if (bv == .string) bv.string else "")
                     else
                         "";
-                    return makeResponse(allocator, status, internCommonMime(ct_raw), resp_body, want_gzip);
+                    var route_resp = makeResponse(allocator, status, internCommonMime(ct_raw), resp_body, want_gzip);
+                    if (parsed.object.get("headers")) |hv| {
+                        if (hv == .array and hv.array.items.len > 0) {
+                            var extra: std.ArrayList(http2.HttpHeader) = .empty;
+                            for (hv.array.items) |item| {
+                                if (item != .object) continue;
+                                const hn = jsonStringField(item.object, "name") orelse continue;
+                                const hval = jsonStringField(item.object, "value") orelse continue;
+                                if (!isValidResponseHeader(hn, hval)) continue;
+                                if (std.ascii.eqlIgnoreCase(hn, "cache-control")) {
+                                    // Preserve custom Cache-Control cleanly without duplicating.
+                                }
+                                const dn = allocator.dupe(u8, hn) catch continue;
+                                const dv = allocator.dupe(u8, hval) catch {
+                                    allocator.free(dn);
+                                    continue;
+                                };
+                                extra.append(allocator, .{ .name = dn, .value = dv }) catch {
+                                    allocator.free(dn);
+                                    allocator.free(dv);
+                                };
+                            }
+                            if (extra.items.len > 0) {
+                                route_resp.extra_headers = extra.toOwnedSlice(allocator) catch &.{};
+                                route_resp.extra_headers_owned = route_resp.extra_headers.len > 0;
+                            } else {
+                                extra.deinit(allocator);
+                            }
+                        }
+                    }
+                    return route_resp;
                 }
                 return makeResponse(allocator, 200, "application/json", val, want_gzip);
             },
@@ -814,7 +1149,9 @@ pub fn sanitizeStaticPath(allocator: Allocator, raw_path: []const u8) ![]u8 {
 
     var segs = std.mem.splitScalar(u8, rel, '/');
     while (segs.next()) |seg| {
-        if (std.mem.eql(u8, seg, "..") or std.mem.eql(u8, seg, ".")) {
+        if (seg.len == 0) continue;
+        // Reject `.`, `..`, and any dotfiles/hidden directories (`.env`, `.git`, `.htaccess`, etc.).
+        if (seg[0] == '.') {
             return error.ForbiddenPath;
         }
     }
@@ -839,7 +1176,22 @@ fn serveStaticFileResponse(
         return makeEmptyResponse(500, "text/plain");
     defer allocator.free(full_path);
 
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, full_path, allocator, .limited(16 * 1024 * 1024)) catch
+    // Resolve symlinks and verify canonical containment inside `root` (prevents symlink escape).
+    const real_root = std.Io.Dir.cwd().realPathFileAlloc(io, root, allocator) catch
+        return makeResponse(allocator, 404, "text/plain", "not found", false);
+    defer allocator.free(real_root);
+    const real_file = std.Io.Dir.cwd().realPathFileAlloc(io, full_path, allocator) catch
+        return makeResponse(allocator, 404, "text/plain", "not found", false);
+    defer allocator.free(real_file);
+    const root_trimmed = std.mem.trimEnd(u8, real_root, "/");
+    if (!std.mem.startsWith(u8, real_file, root_trimmed) or
+        real_file.len <= root_trimmed.len or
+        real_file[root_trimmed.len] != '/')
+    {
+        return makeResponse(allocator, 403, "text/plain", "forbidden", false);
+    }
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, real_file, allocator, .limited(16 * 1024 * 1024)) catch
         return makeResponse(allocator, 404, "text/plain", "not found", false);
     defer allocator.free(bytes);
 
@@ -895,6 +1247,23 @@ fn internCommonMime(ct: []const u8) []const u8 {
     return "application/octet-stream";
 }
 
+/// Restrict untrusted user-uploaded blob MIME types so active documents (HTML, SVG, JS, XML)
+/// are never served inline under the application origin (prevents stored XSS).
+fn safeStorageMime(ct: []const u8) []const u8 {
+    const base = if (std.mem.indexOfScalar(u8, ct, ';')) |semi|
+        std.mem.trim(u8, ct[0..semi], " \t")
+    else
+        std.mem.trim(u8, ct, " \t");
+    if (std.ascii.eqlIgnoreCase(base, "image/png")) return "image/png";
+    if (std.ascii.eqlIgnoreCase(base, "image/jpeg")) return "image/jpeg";
+    if (std.ascii.eqlIgnoreCase(base, "image/webp")) return "image/webp";
+    if (std.ascii.eqlIgnoreCase(base, "image/gif")) return "image/gif";
+    if (std.ascii.eqlIgnoreCase(base, "application/pdf")) return "application/pdf";
+    if (std.ascii.eqlIgnoreCase(base, "text/plain")) return "text/plain; charset=utf-8";
+    if (std.ascii.eqlIgnoreCase(base, "application/json")) return "application/json; charset=utf-8";
+    return "application/octet-stream";
+}
+
 fn writeHttp1Response(
     io: std.Io,
     stream: std.Io.net.Stream,
@@ -908,10 +1277,9 @@ fn writeHttp1Response(
         "HTTP/1.1 {d} {s}\r\n" ++
             "Content-Type: {s}\r\n" ++
             "Content-Length: {d}\r\n" ++
-            "Vary: Accept-Encoding\r\n" ++
-            "Access-Control-Allow-Origin: *\r\n" ++
-            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
-            "Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n" ++
+            "Vary: Accept-Encoding, Origin\r\n" ++
+            "X-Content-Type-Options: nosniff\r\n" ++
+            "Referrer-Policy: no-referrer\r\n" ++
             "Connection: {s}\r\n",
         .{
             resp.status,
@@ -921,6 +1289,23 @@ fn writeHttp1Response(
             if (keep_alive) "keep-alive" else "close",
         },
     ) catch return;
+    if (resp.cors_allow_origin) |acao| {
+        w.print(
+            "Access-Control-Allow-Origin: {s}\r\n" ++
+                "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
+                "Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n",
+            .{acao},
+        ) catch return;
+    }
+    if (resp.content_security_policy) |csp| {
+        w.print("Content-Security-Policy: {s}\r\n", .{csp}) catch return;
+    }
+    if (resp.content_disposition) |cd| {
+        w.print("Content-Disposition: {s}\r\n", .{cd}) catch return;
+    }
+    if (resp.x_frame_options) |xfo| {
+        w.print("X-Frame-Options: {s}\r\n", .{xfo}) catch return;
+    }
     if (resp.content_encoding) |ce| {
         w.print("Content-Encoding: {s}\r\n", .{ce}) catch return;
     }
@@ -929,6 +1314,16 @@ fn writeHttp1Response(
     }
     if (resp.cache_control) |cc| {
         w.print("Cache-Control: {s}\r\n", .{cc}) catch return;
+    }
+    if (resp.retry_after_secs) |ra| {
+        w.print("Retry-After: {d}\r\n", .{ra}) catch return;
+    }
+    for (resp.extra_headers) |eh| {
+        if (!isValidResponseHeader(eh.name, eh.value)) continue;
+        if (std.ascii.eqlIgnoreCase(eh.name, "content-length") or
+            std.ascii.eqlIgnoreCase(eh.name, "transfer-encoding") or
+            std.ascii.eqlIgnoreCase(eh.name, "connection")) continue;
+        w.print("{s}: {s}\r\n", .{ eh.name, eh.value }) catch return;
     }
     w.writeAll("\r\n") catch return;
     if (resp.body.len > 0) {
@@ -945,8 +1340,13 @@ fn handleWebSocket(
     reader: *std.Io.Reader,
     initial_binary: bool,
 ) void {
-    var sender = ws_mod.WsSender.init(io, stream);
-    const client_id = engine.registerClient(engine_mod.ClientSink.fromWsSender(&sender)) catch return;
+    const sender = ws_mod.WsSender.createShared(allocator, io, stream, true) catch {
+        stream.close(io);
+        return;
+    };
+    defer sender.release();
+
+    const client_id = engine.registerClient(engine_mod.ClientSink.fromWsSender(sender)) catch return;
     var binary_enabled = initial_binary;
     if (binary_enabled) {
         engine.setClientBinaryProtocol(client_id, true);
@@ -960,7 +1360,7 @@ fn handleWebSocket(
     defer ws_arena.deinit();
 
     while (true) {
-        defer _ = ws_arena.reset(.retain_capacity);
+        defer _ = ws_arena.reset(.{ .retain_with_limit = 64 * 1024 });
         const wa = ws_arena.allocator();
         const frame = ws_mod.readFrame(wa, reader) catch break;
 
@@ -971,14 +1371,14 @@ fn handleWebSocket(
             },
             .pong => {},
             .text => |text| {
-                handleWsText(wa, engine, client_id, &sender, text);
+                handleWsText(wa, engine, client_id, sender, text);
             },
             .binary => |bin| {
                 if (!binary_enabled) {
                     binary_enabled = true;
                     engine.setClientBinaryProtocol(client_id, true);
                 }
-                handleWsBinary(wa, engine, client_id, &sender, bin);
+                handleWsBinary(wa, engine, client_id, sender, bin);
             },
         }
     }
@@ -1277,7 +1677,6 @@ fn isOperatorAuthorized(
     engine: *const engine_mod.ConcaveEngine,
     expected_token: ?[]const u8,
     auth_header: ?[]const u8,
-    query: []const u8,
 ) bool {
     if (expected_token) |expected| {
         if (auth_header) |ah| {
@@ -1286,14 +1685,6 @@ fn isOperatorAuthorized(
                 tok = std.mem.trim(u8, tok["Bearer ".len..], " \t");
             }
             if (timingSafeStrEql(tok, expected)) return true;
-        }
-        var pairs = std.mem.splitScalar(u8, query, '&');
-        while (pairs.next()) |pair| {
-            if (std.mem.startsWith(u8, pair, "token=")) {
-                if (timingSafeStrEql(pair["token=".len..], expected)) return true;
-            } else if (std.mem.startsWith(u8, pair, "key=")) {
-                if (timingSafeStrEql(pair["key=".len..], expected)) return true;
-            }
         }
         return false;
     }
@@ -1304,7 +1695,6 @@ fn isAdminAuthorized(
     engine: *const engine_mod.ConcaveEngine,
     admin_key: ?[]const u8,
     auth_header: ?[]const u8,
-    query: []const u8,
 ) bool {
     if (admin_key) |expected| {
         if (auth_header) |ah| {
@@ -1314,15 +1704,117 @@ fn isAdminAuthorized(
             }
             if (timingSafeStrEql(tok, expected)) return true;
         }
-        var pairs = std.mem.splitScalar(u8, query, '&');
-        while (pairs.next()) |pair| {
-            if (std.mem.startsWith(u8, pair, "key=")) {
-                if (timingSafeStrEql(pair["key=".len..], expected)) return true;
-            }
-        }
         return false;
     }
     return engine.auth_config.allow_dev_tokens;
+}
+
+fn isLoopbackOrigin(origin: []const u8) bool {
+    const rest = if (std.mem.startsWith(u8, origin, "http://"))
+        origin["http://".len..]
+    else if (std.mem.startsWith(u8, origin, "https://"))
+        origin["https://".len..]
+    else
+        return false;
+    const host = if (std.mem.indexOfScalar(u8, rest, ':')) |ci| rest[0..ci] else rest;
+    return std.ascii.eqlIgnoreCase(host, "localhost") or
+        std.mem.eql(u8, host, "127.0.0.1") or
+        std.mem.eql(u8, host, "[::1]");
+}
+
+fn originMatchesAllowlist(origin: []const u8, cors_origins: []const []const u8) bool {
+    for (cors_origins) |allowed| {
+        if (std.mem.eql(u8, allowed, "*")) return true;
+        if (std.ascii.eqlIgnoreCase(origin, allowed)) return true;
+    }
+    return false;
+}
+
+/// Resolve `Access-Control-Allow-Origin` safely:
+/// - Admin, internal, and dashboard endpoints NEVER emit `*` and only allow explicit `CONCAVE_CORS_ORIGINS`.
+/// - Public API endpoints respect `CONCAVE_CORS_ORIGINS` (or loopback origins in local dev mode).
+fn resolveCorsOrigin(
+    path: []const u8,
+    origin: ?[]const u8,
+    cors_origins: []const []const u8,
+    allow_dev_tokens: bool,
+) ?[]const u8 {
+    const is_privileged = std.mem.startsWith(u8, path, "/_admin/") or
+        std.mem.startsWith(u8, path, "/_internal/") or
+        std.mem.startsWith(u8, path, "/_dashboard");
+
+    if (is_privileged) {
+        const orig = origin orelse return null;
+        for (cors_origins) |allowed| {
+            if (!std.mem.eql(u8, allowed, "*") and std.ascii.eqlIgnoreCase(orig, allowed)) {
+                return orig;
+            }
+        }
+        return null;
+    }
+
+    if (cors_origins.len > 0) {
+        const orig = origin orelse {
+            for (cors_origins) |allowed| {
+                if (std.mem.eql(u8, allowed, "*")) return "*";
+            }
+            return null;
+        };
+        if (originMatchesAllowlist(orig, cors_origins)) {
+            for (cors_origins) |allowed| {
+                if (std.ascii.eqlIgnoreCase(orig, allowed)) return orig;
+            }
+            return "*";
+        }
+        return null;
+    }
+
+    if (allow_dev_tokens) {
+        if (origin) |orig| {
+            if (isLoopbackOrigin(orig)) return orig;
+        }
+    }
+    return null;
+}
+
+/// Validate WebSocket `Origin` header (prevents Cross-Site WebSocket Hijacking).
+/// Non-browser clients without an `Origin` header are allowed; browser `Origin` headers must
+/// match `Host` (same-origin), `CONCAVE_CORS_ORIGINS`, or loopback in dev mode.
+pub fn isWsOriginAllowed(
+    origin: ?[]const u8,
+    host: ?[]const u8,
+    cors_origins: []const []const u8,
+    allow_dev_tokens: bool,
+) bool {
+    const orig = origin orelse return true;
+    if (orig.len == 0) return false;
+    if (cors_origins.len > 0 and originMatchesAllowlist(orig, cors_origins)) return true;
+
+    // Extract authority (`host[:port]`) from `scheme://authority`
+    const rest = if (std.mem.startsWith(u8, orig, "https://"))
+        orig["https://".len..]
+    else if (std.mem.startsWith(u8, orig, "http://"))
+        orig["http://".len..]
+    else
+        return false;
+    const orig_authority = if (std.mem.indexOfScalar(u8, rest, '/')) |si| rest[0..si] else rest;
+
+    if (host) |h| {
+        if (std.ascii.eqlIgnoreCase(orig_authority, std.mem.trim(u8, h, " \t"))) return true;
+    }
+    if (allow_dev_tokens and isLoopbackOrigin(orig)) return true;
+    return false;
+}
+
+fn isValidResponseHeader(name: []const u8, value: []const u8) bool {
+    if (name.len == 0 or name.len > 128 or value.len > 8192) return false;
+    for (name) |c| {
+        if (c <= 0x20 or c >= 0x7f or c == ':' or c == '\r' or c == '\n') return false;
+    }
+    for (value) |c| {
+        if (c == '\r' or c == '\n' or c == 0) return false;
+    }
+    return true;
 }
 
 fn timingSafeStrEql(a: []const u8, b: []const u8) bool {
@@ -1388,8 +1880,11 @@ fn httpStatusReason(status: u16) []const u8 {
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        413 => "Payload Too Large",
         429 => "Too Many Requests",
+        431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
+        501 => "Not Implemented",
         503 => "Service Unavailable",
         else => "OK",
     };
@@ -1398,4 +1893,42 @@ fn httpStatusReason(status: u16) []const u8 {
 fn jsonStringField(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
     const v = obj.get(name) orelse return null;
     return if (v == .string) v.string else null;
+}
+
+test "http1: rejects Transfer-Encoding, conflicting Content-Length, invalid Content-Length, and dotfiles" {
+    const alloc = std.testing.allocator;
+
+    // Transfer-Encoding must return UnsupportedTransferEncoding (prevents CL.TE / TE.CL smuggling).
+    {
+        const raw = "POST /api/mutation/x HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\ntest";
+        var r = std.Io.Reader.fixed(raw);
+        try std.testing.expectError(error.UnsupportedTransferEncoding, readHttpRequest(alloc, &r));
+    }
+    // Conflicting duplicate Content-Length headers must fail with BadRequest.
+    {
+        const raw = "POST /api/mutation/x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nContent-Length: 4\r\n\r\ntest";
+        var r = std.Io.Reader.fixed(raw);
+        try std.testing.expectError(error.BadRequest, readHttpRequest(alloc, &r));
+    }
+    // Non-numeric Content-Length must fail with BadRequest (never silently 0).
+    {
+        const raw = "POST /api/mutation/x HTTP/1.1\r\nHost: localhost\r\nContent-Length: abc\r\n\r\n";
+        var r = std.Io.Reader.fixed(raw);
+        try std.testing.expectError(error.BadRequest, readHttpRequest(alloc, &r));
+    }
+    // Dotfiles and traversal rejected by sanitizeStaticPath.
+    try std.testing.expectError(error.ForbiddenPath, sanitizeStaticPath(alloc, "/.env"));
+    try std.testing.expectError(error.ForbiddenPath, sanitizeStaticPath(alloc, "/.git/config"));
+    try std.testing.expectError(error.ForbiddenPath, sanitizeStaticPath(alloc, "/%2e%2e/secret"));
+
+    // Active storage MIME types coerced to octet-stream.
+    try std.testing.expectEqualStrings("application/octet-stream", safeStorageMime("text/html; charset=utf-8"));
+    try std.testing.expectEqualStrings("application/octet-stream", safeStorageMime("image/svg+xml"));
+    try std.testing.expectEqualStrings("image/png", safeStorageMime("image/png"));
+
+    // WebSocket Origin checks.
+    try std.testing.expect(isWsOriginAllowed(null, "example.com", &.{}, false));
+    try std.testing.expect(isWsOriginAllowed("https://example.com", "example.com", &.{}, false));
+    try std.testing.expect(!isWsOriginAllowed("https://evil.example", "example.com", &.{}, false));
+    try std.testing.expect(isWsOriginAllowed("https://app.example", "api.example", &.{"https://app.example"}, false));
 }

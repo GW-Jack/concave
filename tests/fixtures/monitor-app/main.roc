@@ -14,7 +14,9 @@ import monitor.Monitor
 
 ## Two independently mounted Monitor instances proving strict host-enforced namespace isolation.
 app_monitor : Monitor.Mount
-app_monitor = Monitor.mount("monitor")
+app_monitor =
+    Monitor.mount("monitor")
+    |> Monitor.with_insecure_webhooks(True)
 
 ops_monitor : Monitor.Mount
 ops_monitor = Monitor.mount_with("ops_monitor", {

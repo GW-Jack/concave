@@ -1,6 +1,6 @@
 # Browser Client & Signals SDK (`/_concave/index.js`)
 
-Concave ships a bespoke, **zero-dependency** native browser ESM runtime — bundled, minified, and pre-gzipped at build time into **1 single 5.8 KB gzipped request** at `/_concave/index.js` (with binary WebSocket framing and strong `ETag` / `304` caching) — no `npm`, no `node_modules`, no bundler, and no Virtual DOM.
+Concave ships a bespoke, **zero-dependency** native browser ESM runtime — bundled, minified, and pre-gzipped at build time into **1 single ~10 KB gzipped request** at `/_concave/index.js` (including binary WebSocket framing, proactive JWT refresh, glitch-free signals, surgical DOM helpers, and a reactive SPA router, with strong `ETag` / `304` caching) — no `npm`, no `node_modules`, no bundler, and no Virtual DOM.
 
 Companion `.d.ts` declarations (`client/concave-client/src/*.d.ts`) work alongside `--introspect` generated `_generated/{api.js,api.d.ts,dataModel.d.ts}` so editors (VS Code, `tsc --noEmit` with `checkJs: true`) give full end-to-end autocomplete and type checking on plain `.js` files.
 
@@ -32,13 +32,34 @@ When running `concave dev --static-dir ...`, the server automatically enables `-
 - `client.status()` — `"connecting" | "connected" | "reconnecting" | "closed"`
 - `client.commitTs()` — latest authoritative `commit_ts` applied to the client
 - `client.identity()` — current authenticated `AuthIdentity | null`
+- `client.isAuthenticated()` — reactive `boolean` (`true` while `client.identity() !== null`)
 
-### Authentication
+### Authentication & Proactive JWT Refresh
 ```js
 client.setAuth("Bearer eyJhbGciOiJSUzI1NiIs..."); // JWT (HS256, RS256, EdDSA, ES256)
 client.setAuth("dev:alice:Alice Smith");           // Dev mode only
 client.setAuth(null);                              // Sign out & re-evaluate subscriptions
+client.getToken();                                 // Current raw token string or null
 ```
+
+For short-lived JWTs (such as `packages/auth`, Clerk, Auth0, or Supabase), configure a `fetchToken` callback either in the constructor or via `client.setTokenFetcher(...)`:
+
+```js
+const client = new ConcaveClient(window.location.origin, {
+  fetchToken: async ({ forceRefresh }) => {
+    // Return a fresh JWT string (or null when signed out).
+    return await getJwt({ forceRefresh });
+  },
+  refreshMarginMs: 30_000, // default: refresh 30s before JWT `exp`
+});
+
+// Or attach/clear dynamically at runtime:
+client.setTokenFetcher(async ({ forceRefresh }) => ...);
+client.setTokenFetcher(null);
+```
+
+- **Proactive refresh**: `ConcaveClient` decodes the JWT `exp` claim locally and schedules a background refresh `refreshMarginMs` (default `30_000` ms, minimum `1_000` ms) before expiration, plus retries once with `{ forceRefresh: true }` if the server rejects an expired token.
+- **Zero-flicker same-user rotation**: When a refreshed JWT has the same `(sub, iss)` pair as the previous token, `ConcaveClient` re-authenticates the WebSocket in place while **preserving live query caches and optimistic overlays** (switching users or signing out still resets cached subscription state cleanly).
 
 ---
 
@@ -161,8 +182,52 @@ const dispose = mount(document.getElementById("root"), () =>
 
 ---
 
+## Reactive SPA Router (`/_concave/router.js` & `/_concave/index.js`)
+
+Concave includes a zero-dependency reactive History API router re-exported from `/_concave/index.js` (and also available standalone at `/_concave/router.js`):
+
+```js
+import { createRouter, matchRoute, mount, show, tags } from "/_concave/index.js";
+
+const { div, h1, nav, p } = tags;
+
+const router = createRouter([
+  { path: "/", name: "home" },
+  { path: "/rooms/:id", name: "room" },
+  { path: "/files/*", name: "files" },
+]);
+
+mount(document.getElementById("app"), () =>
+  div(
+    nav(
+      router.link("/", "Home"),
+      " · ",
+      router.link("/rooms/general", { class: "nav-link" }, "General"),
+    ),
+    () => {
+      const m = router.current();
+      if (!m.route) return p("Not Found");
+      if (m.route.name === "room") return h1(`Room: ${m.params.id}`);
+      return h1("Home");
+    },
+  ),
+);
+```
+
+- `createRouter(routes, { initialPath? })` returns `{ path, query, current, navigate, link, dispose }`:
+  - `path`: reactive `Signal<string>` of the current pathname.
+  - `query`: reactive `Signal<Record<string, string>>` of decoded URL query parameters (prototype-pollution safe).
+  - `current`: reactive `Accessor<{ route, params, path, query }>` matching the first route whose pattern matches `path()`.
+  - `navigate(to, { replace? })`: pushes/replaces browser history and updates `path`/`query` atomically in a `batch()`. Rejects non-relative or protocol-relative paths (`//...`).
+  - `link(to, props?, ...children)`: creates an `<a>` element that intercepts plain left-clicks for SPA navigation while preserving Cmd/Ctrl-click, middle-click, and `target="_blank"`.
+  - `dispose()`: detaches the `window` `popstate` listener.
+- `matchRoute(pattern, pathname)`: pure helper supporting static segments, `:param` captures, and trailing `*` wildcards; returns `Record<string, string> | null`.
+
+---
+
 ## Embedded Component Clients
 
-In addition to `/_concave/index.js`, the Zig host embeds optional component helpers:
+In addition to `/_concave/index.js` and `/_concave/router.js`, the Zig host embeds optional component helpers:
+- **`/_concave/auth.js`** — Auth v2 `createAuth(client, api.auth, options?)` controller with automatic `fetchToken` refresh wiring, live `sessionStatus` auto sign-out across tabs, password/OTP helpers, and `oauthUrl` / `consumeOAuthFragment` (see [AUTH.md](AUTH.md)).
 - **`/_concave/analytics.js`** — PostHog-style `createAnalytics(client, api.analytics)` helper (see [ANALYTICS.md](ANALYTICS.md)).
 - **`/_concave/monitor.js`** — Browser/Node error & metric capture helper (see [OBSERVABILITY.md](OBSERVABILITY.md)).

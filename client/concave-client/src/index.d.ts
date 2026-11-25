@@ -24,6 +24,7 @@ export {
   type OptimisticLocalStore,
   type QueryState,
   type ReloadEvent,
+  type TokenFetcher,
 } from "./client.js";
 
 export {
@@ -43,3 +44,15 @@ export {
   type Tags,
   type ValueBindingProps,
 } from "./dom.js";
+
+export {
+  createRouter,
+  matchRoute,
+  type NavigateOptions,
+  type RouteDefinition,
+  type RouteMatch,
+  type RouteParams,
+  type RouteQuery,
+  type Router,
+  type RouterOptions,
+} from "./router.js";

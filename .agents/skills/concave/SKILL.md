@@ -2,14 +2,14 @@
 name: concave
 description: >-
   Build realtime full-stack web apps with Concave: a single-binary Roc 0.1.0_RC1
-  backend + zero-dependency Zig runtime + <6.5 KB gzipped native browser ESM
-  signals & surgical DOM frontend (`/_concave/index.js`). Use when scaffolding,
-  coding, running, or debugging a Concave application.
+  backend + zero-dependency Zig runtime + ~10 KB gzipped native browser ESM
+  signals, reactive SPA router & surgical DOM frontend (`/_concave/index.js`).
+  Use when scaffolding, coding, running, or debugging a Concave application.
 ---
 
 # Building Full-Stack Realtime Apps with Concave
 
-Concave pairs a type-safe **Roc (`0.1.0_RC1`)** backend with a zero-dependency native browser ESM frontend (`/_concave/index.js`, `<6.5 KB` gzipped / `~22 KB` raw) — no `npm`, no `node_modules`, no bundler, no Virtual DOM.
+Concave pairs a type-safe **Roc (`0.1.0_RC1`)** backend with a zero-dependency native browser ESM frontend (`/_concave/index.js`, `~10 KB` gzipped including binary WebSocket sync, proactive JWT refresh, signals, surgical DOM helpers, and reactive SPA router) — no `npm`, no `node_modules`, no bundler, no Virtual DOM.
 
 ---
 
@@ -24,7 +24,7 @@ concave init my-app \
   --platform <relative-path-to-platform/main.roc> \
   --sdk <relative-path-to-packages/concave-sdk/main.roc>
 ```
-- Templates: `minimal` (default), `chat`, `kanban`.
+- Templates: `minimal` (default), `chat`, `kanban`, `auth` (optional `--auth <path>` defaults to sibling `../auth/main.roc` next to `--sdk`).
 - **Important:** Roc `0.1.0_RC1` requires relative paths (resolved from `<app>/backend/main.roc`) or HTTPS URLs in `app { pf: platform "...", sdk: "..." }`.
 
 ### Generate Typed Client API (`codegen`)
@@ -47,12 +47,26 @@ concave dev \
 - App: `http://127.0.0.1:3210`
 - Built-in Dev Dashboard: `http://127.0.0.1:3210/_dashboard`
 
-### Build & Run Production Binary
+### Secrets, Backups & Production Server Operations
 ```sh
-concave build --entry my-app/backend/main.roc --output my-server --opt dev
-./my-server --serve --host 127.0.0.1 --port 3210 --db .concave/app.wal --static-dir my-app/frontend
+# Offline encrypted local dev vault (XChaCha20-Poly1305; default .concave/dev.vault)
+concave secrets set AUTH_JWT_PRIVATE_KEY --value <64-hex-char-ed25519-seed>
+concave secrets list
+concave secrets delete AUTH_JWT_PRIVATE_KEY
+
+# Atomic compacted WAL backups & restores
+concave backup --db .concave/app.wal --out .concave/app.bak
+concave restore --in .concave/app.bak --db .concave/app.wal [--force]
+
+# Build & run production binary
+concave build --entry my-app/backend/main.roc --output my-server --opt speed
+./my-server --serve --host 0.0.0.0 --port 8080 --static-dir my-app/frontend
+
+# Backfill newly added secondary indexes in PostgreSQL before serving traffic
+DATABASE_URL="postgres://..." ./my-server --backfill-indexes
 ```
-Pass `--live-reload` to enable static file watching and `Cache-Control: no-cache` on static files when running the compiled binary directly. Run `./my-server --help` for all flags.
+- Key production env vars: `CONCAVE_GCP_PROJECT` (Google Cloud Secret Manager), `CONCAVE_SECRETS_DIR` (tmpfs mount), `CONCAVE_SECRETS_VAULT` (offline encrypted vault), `CONCAVE_RATE_LIMIT_RPS` (default `200`), `CONCAVE_RATE_LIMIT_BURST` (default `400`), `CONCAVE_TRUST_PROXY` (`true` behind Cloud Run/Fly LB), `CONCAVE_PG_COMMIT_LOG_KEEP` (default `50000`), `CONCAVE_STRICT_MIGRATIONS`.
+- Pass `--live-reload` to enable static file watching and `Cache-Control: no-cache` on static files when running the compiled binary directly. Run `./my-server --help` for all flags.
 
 ---
 
@@ -167,17 +181,19 @@ add_many! = |ctx, args| {
 ```
 
 ### Capabilities & Helpers (`Ctx`)
-> **Roc `0.1.0_RC1` syntax notes:**
-> - Dot-call syntax (`ctx.http_fetch!(...)`) is UFCS method dispatch in Roc `0.1.0_RC1`, not a record-field function call. Always use the `Ctx.*` wrapper functions below (or bind a record field to a local `f! = ctx.foo!` before calling it).
+> **Roc `0.1.0_RC1` syntax & serialization notes:**
+> - Dot-call syntax (`ctx.http_fetch!(...)`) is UFCS method dispatch in Roc `0.1.0_RC1`, not a record-field function call. Always use the `Ctx.*` wrapper functions below (or bind a record field to a local `f! = ctx.crypto.sha256!` before calling it).
 > - Single-field records require an explicit colon (`{ id: id }`) — `{ id }` without a colon is parsed as a block returning `id`!
+> - Inside polymorphic `Json.Encodable` record literals (e.g. `Db.insert!`, `Db.patch!`, `Ctx.run_mutation!`), write **`Bool.True` / `Bool.False`** (not bare `True`/`False`, which serialize as tag strings `"True"`/`"False"`) and annotate integer literals (`0.I64`) if ambiguous.
 > - Built-in `Json.to_str`, `Json.to_str_try`, and `Json.parse` are available globally in Roc `0.1.0_RC1`.
 
 - **`Ctx.QueryCtx`**: Read-only, reactive over WebSockets (`db : DbReader`, `storage : StorageReader`, `auth!`, `now_ms!`).
 - **`Ctx.MutationCtx`**: ACID transaction with OCC retries and read-your-own-writes (`db : DbWriter`, `scheduler`, `storage : StorageWriter`, `auth!`, `now_ms!`).
-- **`Ctx.ActionCtx`**: External HTTP/HTTPS I/O (`http_fetch!`, `run_query!`, `run_mutation!`, `storage : StorageWriter`, `auth!`, `now_ms!`).
+- **`Ctx.ActionCtx`**: External HTTP/HTTPS I/O, allowlisted secrets & host crypto (`http_fetch!`, `http_request!`, `secrets`, `crypto`, `run_query!`, `run_mutation!`, `storage : StorageWriter`, `auth!`, `now_ms!`).
 
 #### Auth & Time
-- `Ctx.require_auth!(ctx.auth!)` -> `Try(Ctx.AuthIdentity, Str)` where `AuthIdentity : { subject : Str, issuer : Str, name : Str }`.
+- `Ctx.require_auth!(ctx.auth!)` -> `Try(Ctx.AuthIdentity, Str)` where `AuthIdentity : { subject : Str, issuer : Str, name : Str, email : Str, email_verified : Bool, session_id : Str, roles : List(Str) }`.
+  - Role helpers: `Ctx.has_role(id, role)`, `Ctx.has_any_role(id, roles)`, `Ctx.require_role!(ctx.auth!, role)`, `Ctx.require_any_role!(ctx.auth!, roles)`.
   - Dev token format: `"dev:<subject>:<name>"` (pass via `new ConcaveClient(url, { authToken })`, `client.setAuth(...)`, or HTTP header `Authorization: Bearer dev:alice:Alice`).
 - `Ctx.now_ms!(ctx)` -> `I64` (Unix epoch ms; works in all 3 contexts).
 - `Ctx.as_reader(ctx.db)`, `Ctx.as_query_ctx(ctx)` (for passing a `MutationCtx` into helpers taking `QueryCtx`).
@@ -194,14 +210,21 @@ Jobs commit atomically with the mutation (rolled back on `Err`):
 - `Ctx.delete_storage!(ctx, storage_id)` -> `Try({}, Str)` (`MutationCtx` or `ActionCtx`).
 - **Browser upload protocol:** `POST` or `PUT` raw file bytes to the signed URL returned by `generate_upload_url!` (with `Content-Type` header); the server responds `200 {"storage_id": "<id>"}`. `GET` on the URL returned by `get_storage_url!` serves the bytes (and `404` after deletion).
 
+#### Action Secrets & Host Crypto (`ActionCtx` / HTTP Routes Only)
+- **Secrets allowlist**: Declare `App.with_secret(app, "STRIPE_KEY")` / `App.with_secrets(app, [...])` (or `Component.with_secrets(spec, [...])` for component-isolated secrets) and read via `Ctx.secret_get!(ctx, "STRIPE_KEY")?`. Supports `"NAME"`, `"NAME@3"`, and `"projects/<proj>/secrets/<name>/versions/<ver>"`.
+- **Host crypto (`ctx.crypto`)**: Bind fields locally (`sha256! = ctx.crypto.sha256!`): `random_bytes!`, `sha256!`, `sha256_b64url!`, `hmac_sha256!`, `ct_eq!`, `hash_password!` (Argon2id), `verify_password!`, `ed25519_jwk!`, `jwt_sign_ed25519!`, `aead_encrypt!` / `aead_decrypt!` (XChaCha20-Poly1305).
+
 #### External HTTP Actions & Custom HTTP Webhooks
-- `Ctx.http_fetch!(ctx, { method: "GET", url, body: "" })` -> `Try(Ctx.HttpResponse, Str)` where `HttpRequest : { method : Str, url : Str, body : Str }` and `HttpResponse : { status : U64, body : Str }` (use `resp.status.to_str()` for string conversion).
+- `Ctx.http_fetch!(ctx, { method: "GET", url, body: "" })` -> `Try(Ctx.HttpResponse, Str)` (`{ status : U64, body : Str }`).
+- `Ctx.http_request!(ctx, { method, url, headers, body })` -> `Try(Ctx.HttpResponseEx, Str)` (`{ status : U64, headers : List(Ctx.HttpHeader), body : Str }`) for custom request/response headers.
 - `Ctx.run_query!(ctx, "fn.name", args_record)` / `Ctx.run_mutation!(ctx, "fn.name", args_record)` -> `Try(Str, Str)` (auto-encodes `args_record` as JSON and returns the **JSON-encoded** result string; use `Ctx.run_query_raw!` / `Ctx.run_mutation_raw!` when forwarding raw JSON strings such as `req.body`).
-- `App.http_route(method, path, handler!)` handler signature:
+- `App.http_route(method, path, handler!)` / `App.http_route_with_headers(method, path, handler!)` (plus component-scoped `App.component_http_route*`, `App.component_action`, `App.component_internal_action`):
   ```roc
   webhook! : Ctx.ActionCtx, App.HttpRouteRequest => Try(App.HttpRouteResponse, Str)
-  # HttpRouteRequest  : { method : Str, path : Str, query : Str, body : Str, content_type : Str }
-  # HttpRouteResponse : { status : U64, content_type : Str, body : Str }
+  # HttpRouteRequest    : { method : Str, path : Str, query : Str, body : Str, content_type : Str, headers : List(App.HttpHeader) }
+  # HttpRouteResponse   : { status : U64, content_type : Str, body : Str }
+  # HttpRouteResponseEx : { status : U64, content_type : Str, headers : List(App.HttpHeader), body : Str }
+  # Use `App.header_value(req, "x-signature")` for case-insensitive header lookup.
   webhook! = |ctx, req| {
       id_json = Ctx.run_mutation_raw!(ctx, "todos.add", req.body)?
       Ok({ status: 201, content_type: "application/json", body: "{\"ok\":true,\"id\":${id_json}}" })
@@ -267,13 +290,15 @@ import { createApi } from "./_generated/api.js";
 
 const client = new ConcaveClient(window.location.origin, {
   authToken: "dev:alice:Alice", // optional in dev mode
+  // fetchToken: async ({ forceRefresh }) => jwt, // proactive JWT refresh before `exp`
+  // refreshMarginMs: 30_000,   // default: 30s before JWT `exp`
   // liveReload: true,          // default: true (CSS hot-swap or page reload in dev)
   // onReload: (ev) => {},      // optional custom reload hook ({ type: "reload", reason: "css" | "static" })
 });
 const db = createApi(client);
 ```
-- Reactive client signals: `client.status()` (`"connecting" | "connected" | "reconnecting" | "closed"`), `client.commitTs()`, `client.identity()`.
-- Lifecycle & auth: `client.setAuth(token | null)`, `client.close()`.
+- Reactive client signals: `client.status()` (`"connecting" | "connected" | "reconnecting" | "closed"`), `client.commitTs()`, `client.identity()`, `client.isAuthenticated()`.
+- Lifecycle & auth: `client.setAuth(token | null)`, `client.getToken()`, `client.setTokenFetcher(fn | null)`, `client.close()`. Same-`(sub, iss)` JWT rotations preserve live query caches without flickering.
 - Bound functions on `db`:
   - **Queries:** `const notes = db.notes.list()` or reactive args `db.todos.list(() => activeList() ? { list_id: activeList() } : null)`.
     - Returns an accessor `() => { status: "paused" | "loading" | "ready" | "error", data, error }` with `.dispose()` for manual teardown outside `createRoot`/`mount`.
@@ -373,23 +398,43 @@ mount(document.getElementById("app"), () =>
 - `show(whenAccessor, renderThen, renderElse?)`: Conditional branch with automatic `createRoot` teardown.
 - `mount(container, renderRoot)`: Mounts inside a `createRoot` and returns `dispose()`.
 
+### Reactive SPA Router (`createRouter`, `matchRoute`)
+Re-exported from `/_concave/index.js` (also standalone at `/_concave/router.js`):
+```js
+import { createRouter } from "/_concave/index.js";
+
+const router = createRouter([
+  { path: "/", name: "home" },
+  { path: "/rooms/:id", name: "room" },
+  { path: "/files/*", name: "files" },
+]);
+// router.path(), router.query(), router.current() -> { route, params, path, query }
+// router.navigate("/rooms/general", { replace?: boolean })
+// router.link("/rooms/general", { class: "nav" }, "General")
+// router.dispose()
+```
+
 ### Wire Endpoints (for Testing / Custom Clients)
 - WebSocket sync & RPC: `ws(s)://<host>/ws` (binary default via `?proto=bin`, or JSON text frames). Live reload pushes `{"type":"reload","reason":"css" | "static"}`.
 - HTTP RPC: `POST /api/query/<name>`, `POST /api/mutation/<name>`, `POST /api/action/<name>` with JSON body and optional `Authorization: Bearer <token>` header; responds `{"ok":true,"value":...}` or `{"ok":false,"error":"..."}`.
 - Blob storage: `POST`/`PUT` bytes to signed `/_storage/upload/<token>` -> `{"storage_id":"<id>"}`; `GET /_storage/<id>` downloads bytes.
 - Health / readiness / operator telemetry: `GET /health`, `GET /ready`, `GET /_internal/status`, `GET /_internal/metrics`.
-- Embedded SDK assets: `/_concave/index.js`, `/_concave/analytics.js`, `/_concave/monitor.js`.
+- Embedded SDK assets: `/_concave/index.js`, `/_concave/router.js`, `/_concave/auth.js`, `/_concave/analytics.js`, `/_concave/monitor.js`.
 
 ---
 
 ## 4. Built-in Composable Components & Custom Components
 
-Concave ships four zero-dependency pure-Roc component packages (each gets host-enforced table namespace isolation while participating in your app's exact same ACID transactions):
+Concave ships eight zero-dependency pure-Roc component packages (each gets host-enforced table & secret namespace isolation while participating in your app's exact same ACID transactions):
 
 ```roc
 app [concave_app] {
     pf: platform "<relative>/platform/main.roc",
     sdk: "<relative>/packages/concave-sdk/main.roc",
+    auth: "<relative>/packages/auth/main.roc",
+    migrations: "<relative>/packages/migrations/main.roc",
+    email: "<relative>/packages/email/main.roc",
+    webhooks: "<relative>/packages/webhooks/main.roc",
     presence: "<relative>/packages/presence/main.roc",
     ratelimit: "<relative>/packages/rate-limiter/main.roc",
     analytics: "<relative>/packages/analytics/main.roc",
@@ -399,6 +444,9 @@ app [concave_app] {
 
 ### Mounting & Attaching
 ```roc
+import auth.Auth
+import auth.OAuth
+import migrations.Migrations
 import presence.Presence
 import ratelimit.RateLimiter
 import analytics.Analytics
@@ -406,6 +454,8 @@ import analytics.Props
 import monitor.Monitor
 import monitor.Attrs
 
+app_auth = Auth.mount("auth")
+app_migrations = Migrations.mount("migrations")
 doc_presence = Presence.mount("presence", 30000)         # (namespace, ttl_ms)
 save_limiter = RateLimiter.mount("rate_limit", 10, 60000) # (namespace, max_requests, window_ms)
 app_analytics = Analytics.mount("analytics")
@@ -413,13 +463,33 @@ app_monitor = Monitor.mount("monitor")
 
 concave_app = ||
     App.new("my-app")
+    |> Auth.attach_with_cron(app_auth, 3600000) # or Auth.attach(app_auth)
+    |> Migrations.attach(app_migrations)
     |> Presence.attach(doc_presence)
     |> RateLimiter.attach(save_limiter)
     |> Analytics.attach(app_analytics)
     |> Monitor.attach(app_monitor) # or Monitor.attach_with_cron(app_monitor, 30000, 3600000)
 ```
 
-### Server-Side Transactional Helpers (Inside Your Mutations)
+### Server-Side Transactional Helpers (Inside Your Mutations & Queries)
+- **Auth (`packages/auth`)**:
+  - Transactional session guards: `Auth.require_active_session!(app_auth, ctx)?` (`QueryCtx`), `Auth.require_active_session_mut!(app_auth, ctx)?` (`MutationCtx`), `Auth.current_user_id!(app_auth, ctx)?` -> `SignedIn(uid) | SignedOut`, `Auth.get_session_status!(app_auth, ctx.db, sid, now)?`.
+  - Exposes `GET /.well-known/jwks.json`, `GET /auth/oauth/<provider>/start|callback` (`OAuth.google`, `OAuth.github`, `OAuth.discord`, `OAuth.custom`, single-use `?oauth_code=...` handoff via `<ns>.exchangeOAuthCode`), `GET /auth/magic-link/verify`, `<ns>.signUpPassword`, `<ns>.signInPassword`, `<ns>.requestOtp`, `<ns>.verifyOtp`, `<ns>.requestMagicLink`, `<ns>.verifyMagicLink`, `<ns>.enrollTotp`, `<ns>.confirmTotp`, `<ns>.verifyTotp`, `<ns>.disableTotp`, `<ns>.refresh`, `<ns>.signOut`, `<ns>.signOutAll`, `<ns>.listSessions`, and reactive `<ns>.sessionStatus`.
+  - Embedded browser/Node client at `/_concave/auth.js`:
+    ```js
+    import { createAuth } from "/_concave/auth.js";
+    const auth = createAuth(client, api.auth, { storage: window.localStorage });
+    await auth.consumeOAuthCallback();
+    await auth.signInPassword({ email, password });
+    await auth.signOutAll();
+    ```
+- **Email (`packages/email`)**:
+  - Durable transactional email with Resend (`Email.with_resend`), Postmark (`Email.with_postmark`), or custom webhook relay (`Email.with_webhook_provider`), idempotency keys, exponential backoff retries, and dead-lettering (`Email.enqueue!(app_email, ctx, { to, subject, html, text, idempotency_key })?`). Exposes `<ns>.get`, `<ns>.listByStatus`, `<ns>.retry`.
+- **Webhooks (`packages/webhooks`)**:
+  - Durable HMAC-SHA256 signed outbound webhook delivery (`X-Concave-Signature: t=<ts>,v1=<hex>`) via `Webhooks.dispatch!(app_webhooks, ctx, event_type, payload_json)?` and inbound verification via `Webhooks.verify_signature!(ctx, secret, sig_header, payload, tolerance_secs)?`. Exposes `<ns>.registerEndpoint`, `<ns>.listEndpoints`, `<ns>.listDeliveries`, `<ns>.retryDelivery`.
+- **Migrations (`packages/migrations`)**:
+  - Register resumable OCC-safe batched migrations with `Migrations.register(m, "name", Migrations.table_migration(table, transform_doc!))` (or custom `(MutationCtx, Str, U64 => Try(BatchStepResult, Str))`).
+  - Exposes admin-gated `<ns>.status`, `<ns>.get`, `<ns>.start` (`{ name, batch_size, dry_run, force }`), and `<ns>.cancel` (`{ name }`).
 - **RateLimiter**: `_ = RateLimiter.enforce!(save_limiter, ctx, user.subject)?` (returns `Err("Rate limit exceeded")` and rolls back the enclosing mutation when quota is exhausted). Exposes query `<ns>.status` (`{ key }`).
 - **Presence**: Exposes `<ns>.heartbeat` (`{ room_id, typing }`), `<ns>.leave` (`{ room_id }`), and `<ns>.listOnline` (`{ room_id }`).
 - **Analytics**:

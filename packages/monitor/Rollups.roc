@@ -194,9 +194,39 @@ Rollups := [Rollups].{
     }
 
     ## Compute overall stats and time-bucketed series over `samples`.
+    ## Automatically widens `bucket_ms` so at most 500 buckets are ever produced (DoS defense).
     compute_series : Str, List(MetricSample), I64 -> MetricSeriesResult
     compute_series = |name, samples, raw_bucket_ms| {
-        bucket_ms = if raw_bucket_ms <= 0 { 60000 } else { raw_bucket_ms }
+        req_bucket_ms = if raw_bucket_ms <= 0 { 60000 } else { raw_bucket_ms }
+
+        var $min_ts = 0.I64
+        var $max_ts = 0.I64
+        var $has_ts = False
+        for s in samples {
+            if !$has_ts {
+                $min_ts = s.timestamp_ms
+                $max_ts = s.timestamp_ms
+                $has_ts = True
+            } else {
+                if s.timestamp_ms < $min_ts { $min_ts = s.timestamp_ms }
+                if s.timestamp_ms > $max_ts { $max_ts = s.timestamp_ms }
+            }
+        }
+
+        bucket_ms =
+            if $has_ts and $max_ts > $min_ts {
+                max_i64 = 9223372036854775807
+                span =
+                    if $min_ts < 0 and $max_ts > max_i64 + $min_ts {
+                        max_i64
+                    } else {
+                        $max_ts - $min_ts
+                    }
+                min_step = (span // 500) + 1
+                if req_bucket_ms < min_step { min_step } else { req_bucket_ms }
+            } else {
+                req_bucket_ms
+            }
 
         var $all_vals = []
         var $bucket_starts = []

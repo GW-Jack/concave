@@ -1,13 +1,69 @@
 import { createRoot, effect, onCleanup, signal } from "./signals.js";
 
+const URL_ATTRS = new Set([
+  "href",
+  "src",
+  "action",
+  "formaction",
+  "data",
+  "xlink:href",
+  "poster",
+]);
+
+const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function isSafeUrl(raw) {
+  const trimmed = String(raw).replace(/[\u0000-\u0020\u007f-\u009f]+/g, "");
+  if (!trimmed) return true;
+  if (trimmed.startsWith("//")) return false;
+  if (
+    trimmed.startsWith("/") ||
+    trimmed.startsWith("./") ||
+    trimmed.startsWith("../") ||
+    trimmed.startsWith("#") ||
+    trimmed.startsWith("?")
+  ) {
+    return true;
+  }
+  const colon = trimmed.indexOf(":");
+  if (colon === -1) return true;
+  let end = trimmed.length;
+  for (const ch of ["/", "?", "#"]) {
+    const idx = trimmed.indexOf(ch);
+    if (idx !== -1 && idx < end) end = idx;
+  }
+  if (colon > end) return true;
+  const scheme = trimmed.slice(0, colon).toLowerCase();
+  return (
+    scheme === "https" ||
+    scheme === "http" ||
+    scheme === "mailto" ||
+    scheme === "tel" ||
+    scheme === "blob"
+  );
+}
+
 function setProp(node, key, value) {
+  if (FORBIDDEN_KEYS.has(key)) return;
+  const lower = key.toLowerCase();
+  // Never allow inline event handler attributes (on*) or iframe srcdoc via setAttribute.
+  if ((lower.length > 2 && lower.startsWith("on")) || lower === "srcdoc") {
+    return;
+  }
   if (key === "class" || key === "className") {
     node.className = value == null ? "" : String(value);
   } else if (key === "style") {
     if (typeof value === "string") {
       node.setAttribute("style", value);
     } else if (value && typeof value === "object") {
-      Object.assign(node.style, value);
+      for (const [sk, sv] of Object.entries(value)) {
+        if (FORBIDDEN_KEYS.has(sk) || sk.toLowerCase() === "csstext") continue;
+        if (sk.startsWith("--")) {
+          node.style.setProperty?.(sk, sv == null ? "" : String(sv));
+        } else {
+          node.style[sk] = sv == null ? "" : String(sv);
+        }
+      }
     }
   } else if (key === "value" && "value" in node) {
     const next = value == null ? "" : String(value);
@@ -18,6 +74,13 @@ function setProp(node, key, value) {
     node[key] = Boolean(value);
   } else if (value === false || value === null || value === undefined) {
     node.removeAttribute(key);
+  } else if (URL_ATTRS.has(lower)) {
+    const urlStr = value === true ? "" : String(value);
+    if (!isSafeUrl(urlStr)) {
+      node.removeAttribute(key);
+      return;
+    }
+    node.setAttribute(key, urlStr);
   } else {
     node.setAttribute(key, value === true ? "" : String(value));
   }
@@ -98,12 +161,15 @@ export function el(tag, props, ...children) {
 
   if (props) {
     for (const [k, raw] of Object.entries(props)) {
+      if (FORBIDDEN_KEYS.has(k)) continue;
       if (k === "ref" && typeof raw === "function") refFn = raw;
       else if (k === "value") val = [raw];
-      else if (k.startsWith("on") && typeof raw === "function") {
-        const ev = k.slice(2).toLowerCase();
-        node.addEventListener(ev, raw);
-        onCleanup(() => node.removeEventListener(ev, raw));
+      else if (k.length > 2 && k.slice(0, 2).toLowerCase() === "on") {
+        if (typeof raw === "function") {
+          const ev = k.slice(2).toLowerCase();
+          node.addEventListener(ev, raw);
+          onCleanup(() => node.removeEventListener(ev, raw));
+        }
       } else bindProp(node, k, raw);
     }
   }
@@ -223,7 +289,7 @@ export const tags = new Proxy(Object.create(null), {
 });
 
 export function mount(container, renderRoot) {
-  container.innerHTML = "";
+  container.textContent = "";
   let rootDispose = () => {};
   createRoot((dispose) => {
     rootDispose = dispose;
@@ -231,6 +297,6 @@ export function mount(container, renderRoot) {
   });
   return () => {
     rootDispose();
-    container.innerHTML = "";
+    container.textContent = "";
   };
 }

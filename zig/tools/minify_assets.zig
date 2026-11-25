@@ -10,9 +10,9 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
 
-    // Args: <out_zig_path> <signals.js> <client.js> <dom.js> <analytics.js> <monitor.js> <dash.html> <dash.css> <dash.js>
-    if (args.len < 10) {
-        std.debug.print("usage: minify_assets <out.zig> <signals.js> <client.js> <dom.js> <analytics.js> <monitor.js> <dash.html> <dash.css> <dash.js>\n", .{});
+    // Args: <out_zig_path> <signals.js> <client.js> <dom.js> <router.js> <auth.js> <analytics.js> <monitor.js> <dash.html> <dash.css> <dash.js>
+    if (args.len < 12) {
+        std.debug.print("usage: minify_assets <out.zig> <signals.js> <client.js> <dom.js> <router.js> <auth.js> <analytics.js> <monitor.js> <dash.html> <dash.css> <dash.js>\n", .{});
         std.process.exit(2);
     }
 
@@ -23,19 +23,23 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(client_src);
     const dom_src = try readFile(gpa, io, args[4]);
     defer gpa.free(dom_src);
-    const analytics_src = try readFile(gpa, io, args[5]);
+    const router_src = try readFile(gpa, io, args[5]);
+    defer gpa.free(router_src);
+    const auth_src = try readFile(gpa, io, args[6]);
+    defer gpa.free(auth_src);
+    const analytics_src = try readFile(gpa, io, args[7]);
     defer gpa.free(analytics_src);
-    const monitor_src = try readFile(gpa, io, args[6]);
+    const monitor_src = try readFile(gpa, io, args[8]);
     defer gpa.free(monitor_src);
-    const dash_html_src = try readFile(gpa, io, args[7]);
+    const dash_html_src = try readFile(gpa, io, args[9]);
     defer gpa.free(dash_html_src);
-    const dash_css_src = try readFile(gpa, io, args[8]);
+    const dash_css_src = try readFile(gpa, io, args[10]);
     defer gpa.free(dash_css_src);
-    const dash_js_src = try readFile(gpa, io, args[9]);
+    const dash_js_src = try readFile(gpa, io, args[11]);
     defer gpa.free(dash_js_src);
 
-    // Bundle `signals.js` + `client.js` + `dom.js` into a single zero-waterfall ESM file for `/_concave/index.js`.
-    const bundle_src = try bundleCoreClient(gpa, signals_src, client_src, dom_src);
+    // Bundle `signals.js` + `client.js` + `dom.js` + `router.js` into a single zero-waterfall ESM file for `/_concave/index.js`.
+    const bundle_src = try bundleCoreClient(gpa, signals_src, client_src, dom_src, router_src);
     defer gpa.free(bundle_src);
 
     const bundle_min = try minifyJs(gpa, bundle_src);
@@ -46,6 +50,10 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(client_min);
     const dom_min = try minifyJs(gpa, dom_src);
     defer gpa.free(dom_min);
+    const router_min = try minifyJs(gpa, router_src);
+    defer gpa.free(router_min);
+    const auth_min = try minifyJs(gpa, auth_src);
+    defer gpa.free(auth_min);
     const analytics_min = try minifyJs(gpa, analytics_src);
     defer gpa.free(analytics_min);
     const monitor_min = try minifyJs(gpa, monitor_src);
@@ -79,6 +87,8 @@ pub fn main(init: std.process.Init) !void {
     try emitAsset(gpa, w, "client_signals_js", signals_min, "text/javascript; charset=utf-8");
     try emitAsset(gpa, w, "client_client_js", client_min, "text/javascript; charset=utf-8");
     try emitAsset(gpa, w, "client_dom_js", dom_min, "text/javascript; charset=utf-8");
+    try emitAsset(gpa, w, "client_router_js", router_min, "text/javascript; charset=utf-8");
+    try emitAsset(gpa, w, "auth_client_js", auth_min, "text/javascript; charset=utf-8");
     try emitAsset(gpa, w, "analytics_client_js", analytics_min, "text/javascript; charset=utf-8");
     try emitAsset(gpa, w, "monitor_client_js", monitor_min, "text/javascript; charset=utf-8");
     try emitAsset(gpa, w, "dashboard_index_html", dash_html_min, "text/html; charset=utf-8");
@@ -97,22 +107,28 @@ fn readFile(allocator: Allocator, io: std.Io, path: []const u8) ![]u8 {
     return try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(8 * 1024 * 1024));
 }
 
-fn bundleCoreClient(allocator: Allocator, signals_src: []const u8, client_src: []const u8, dom_src: []const u8) ![]u8 {
+fn bundleCoreClient(allocator: Allocator, signals_src: []const u8, client_src: []const u8, dom_src: []const u8, router_src: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, signals_src);
     try out.append(allocator, '\n');
-    try appendWithoutRelativeSignalsImport(allocator, &out, client_src);
+    try appendWithoutRelativeCoreImports(allocator, &out, client_src);
     try out.append(allocator, '\n');
-    try appendWithoutRelativeSignalsImport(allocator, &out, dom_src);
+    try appendWithoutRelativeCoreImports(allocator, &out, dom_src);
+    try out.append(allocator, '\n');
+    try appendWithoutRelativeCoreImports(allocator, &out, router_src);
     return try out.toOwnedSlice(allocator);
 }
 
-fn appendWithoutRelativeSignalsImport(allocator: Allocator, out: *std.ArrayList(u8), src: []const u8) !void {
+fn appendWithoutRelativeCoreImports(allocator: Allocator, out: *std.ArrayList(u8), src: []const u8) !void {
     var lines = std.mem.splitScalar(u8, src, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (std.mem.startsWith(u8, trimmed, "import ") and std.mem.indexOf(u8, trimmed, "./signals.js") != null) {
+        if (std.mem.startsWith(u8, trimmed, "import ") and
+            (std.mem.indexOf(u8, trimmed, "./signals.js") != null or
+                std.mem.indexOf(u8, trimmed, "./dom.js") != null or
+                std.mem.indexOf(u8, trimmed, "./client.js") != null))
+        {
             continue;
         }
         try out.appendSlice(allocator, line);
@@ -204,7 +220,7 @@ pub fn minifyJs(allocator: Allocator, src: []const u8) ![]u8 {
                 if (src[i] == '\n') had_newline = true;
                 i += 1;
             }
-            if (i + 1 < src.len) i += 2;
+            if (i + 1 < src.len) i += 2 else i = src.len;
             had_space = true;
             continue;
         }
@@ -440,7 +456,7 @@ pub fn minifyCss(allocator: Allocator, src: []const u8) ![]u8 {
         if (c == '/' and i + 1 < src.len and src[i + 1] == '*') {
             i += 2;
             while (i + 1 < src.len and !(src[i] == '*' and src[i + 1] == '/')) i += 1;
-            if (i + 1 < src.len) i += 2;
+            if (i + 1 < src.len) i += 2 else i = src.len;
             continue;
         }
         if (c == '"' or c == '\'') {

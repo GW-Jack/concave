@@ -118,6 +118,10 @@ pub const WalStore = struct {
     index_buckets: std.StringHashMapUnmanaged(std.ArrayList(SortedIndexRow)) = .empty,
     /// Monotonic commit log for OCC conflict checks and cross-instance tailing.
     commit_log: std.ArrayList(CommitEntry) = .empty,
+    /// Lowest commit_ts whose successor commits are all still retained in `commit_log`.
+    /// Any transaction whose `snapshot_ts < min_retained_commit_ts` cannot be safely validated
+    /// against missed commits and must conservatively abort with `StorageError.Conflict`.
+    min_retained_commit_ts: i64 = 0,
     /// Number of WAL records appended since the last atomic compaction.
     wal_records_since_compact: usize = 0,
     /// Automatically compact the WAL after this many commits (0 disables auto-compaction).
@@ -324,6 +328,9 @@ pub const WalStore = struct {
             self.rwlock.lockSharedUncancelable(self.io);
             defer self.rwlock.unlockShared(self.io);
             if (self.latest_ts > snapshot_ts) {
+                if (snapshot_ts < self.min_retained_commit_ts) {
+                    return storage_mod.StorageError.Conflict;
+                }
                 for (self.commit_log.items) |*entry| {
                     if (entry.commit_ts > snapshot_ts and read_set.intersects(&entry.write_set)) {
                         return storage_mod.StorageError.Conflict;
@@ -421,9 +428,19 @@ pub const WalStore = struct {
         // mutations run at full speed and batch together into the next group commit!
         if (wal_file_to_sync) |file| {
             defer self.wal_io_mutex.unlock(self.io);
-            file.sync(self.io) catch {};
-            _ = self.wal_fsync_count.fetchAdd(1, .monotonic);
-            _ = self.wal_group_batches.fetchAdd(1, .monotonic);
+            if (file.sync(self.io)) |_| {
+                _ = self.wal_fsync_count.fetchAdd(1, .monotonic);
+                _ = self.wal_group_batches.fetchAdd(1, .monotonic);
+            } else |_| {
+                // Propagate fsync failure so callers never believe an unsynced commit is durable.
+                var ec = batch_head;
+                while (ec) |w| : (ec = w.next) {
+                    if (w.result) |*ok_res| {
+                        ok_res.deinit(w.allocator);
+                        w.result = storage_mod.StorageError.StorageFailure;
+                    } else |_| {}
+                }
+            }
         }
 
         if (should_compact) {
@@ -459,6 +476,9 @@ pub const WalStore = struct {
     ) !CommitResult {
         // 1. OCC conflict check against every commit strictly after `snapshot_ts`.
         if (self.latest_ts > snapshot_ts) {
+            if (snapshot_ts < self.min_retained_commit_ts) {
+                return storage_mod.StorageError.Conflict;
+            }
             for (self.commit_log.items) |*entry| {
                 if (entry.commit_ts > snapshot_ts) {
                     if (read_set.intersects(&entry.write_set)) {
@@ -553,12 +573,16 @@ pub const WalStore = struct {
             .write_set = write_set,
         });
 
-        // Bound in-memory commit_log size while keeping a generous sliding window for OCC/tailers.
+        // Bound in-memory commit_log size while tracking `min_retained_commit_ts` so older
+        // snapshots conservatively abort with `Conflict` instead of silently bypassing OCC.
         if (self.commit_log.items.len > 4096) {
             const drop = self.commit_log.items.len - 2048;
             for (self.commit_log.items[0..drop]) |*old| old.deinit(self.allocator);
             std.mem.copyForwards(CommitEntry, self.commit_log.items[0..2048], self.commit_log.items[drop..]);
             self.commit_log.shrinkRetainingCapacity(2048);
+            if (self.commit_log.items.len > 0) {
+                self.min_retained_commit_ts = self.commit_log.items[0].commit_ts - 1;
+            }
         }
 
         return .{
@@ -577,8 +601,12 @@ pub const WalStore = struct {
         try self.compactLocked(path);
     }
 
-    fn compactLocked(self: *WalStore, path: []const u8) !void {
-        var payload: std.Io.Writer.Allocating = .init(self.allocator);
+    fn formatCompactSnapshotLocked(self: *const WalStore, allocator: Allocator) ![]u8 {
+        if (self.latest_ts == 0 and self.docs.count() == 0) {
+            return try allocator.alloc(u8, 0);
+        }
+
+        var payload: std.Io.Writer.Allocating = .init(allocator);
         defer payload.deinit();
         const w = &payload.writer;
 
@@ -606,9 +634,15 @@ pub const WalStore = struct {
         try w.writeAll("]}");
 
         const crc = std.hash.Crc32.hash(payload.written());
-        var line: std.Io.Writer.Allocating = .init(self.allocator);
-        defer line.deinit();
+        var line: std.Io.Writer.Allocating = .init(allocator);
+        errdefer line.deinit();
         try line.writer.print("{x:0>8}|{s}\n", .{ crc, payload.written() });
+        return try line.toOwnedSlice();
+    }
+
+    fn compactLocked(self: *WalStore, path: []const u8) !void {
+        const snapshot = try self.formatCompactSnapshotLocked(self.allocator);
+        defer self.allocator.free(snapshot);
 
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.compact.tmp", .{path});
         defer self.allocator.free(tmp_path);
@@ -617,9 +651,10 @@ pub const WalStore = struct {
             const file = std.Io.Dir.cwd().createFile(self.io, tmp_path, .{ .truncate = true }) catch
                 return storage_mod.StorageError.StorageFailure;
             defer file.close(self.io);
-            file.writePositionalAll(self.io, line.written(), 0) catch
+            file.writePositionalAll(self.io, snapshot, 0) catch
                 return storage_mod.StorageError.StorageFailure;
-            file.sync(self.io) catch {};
+            file.sync(self.io) catch
+                return storage_mod.StorageError.StorageFailure;
         }
 
         if (self.wal_file) |f| {
@@ -889,11 +924,108 @@ pub const WalStore = struct {
         return file;
     }
 
+    /// Stream-replay the WAL file line-by-line with no total file size limit.
+    /// Only `error.FileNotFound` is treated as a fresh empty store; any other I/O error
+    /// fails startup explicitly rather than silently discarding durable data.
     fn replayWalLocked(self: *WalStore, path: []const u8, manifest: *const manifest_mod.AppManifest) !void {
-        const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(64 * 1024 * 1024)) catch
-            return;
-        defer self.allocator.free(bytes);
-        try self.replayWalBytesLocked(bytes, manifest);
+        const file = std.Io.Dir.cwd().openFile(self.io, path, .{ .mode = .read_only }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return storage_mod.StorageError.StorageFailure,
+        };
+        defer file.close(self.io);
+
+        var chunk: [64 * 1024]u8 = undefined;
+        var line_buf: std.ArrayList(u8) = .empty;
+        defer line_buf.deinit(self.allocator);
+        var offset: u64 = 0;
+
+        while (true) {
+            const n = file.readPositionalAll(self.io, &chunk, offset) catch
+                return storage_mod.StorageError.StorageFailure;
+            if (n == 0) break;
+            offset += n;
+
+            var start: usize = 0;
+            while (start < n) {
+                if (std.mem.indexOfScalarPos(u8, chunk[0..n], start, '\n')) |nl| {
+                    try line_buf.appendSlice(self.allocator, chunk[start..nl]);
+                    const raw_line = std.mem.trim(u8, line_buf.items, " \t\r");
+                    if (raw_line.len > 0) {
+                        const ok = try self.replayWalLineLocked(raw_line, manifest);
+                        if (!ok) return;
+                    }
+                    line_buf.clearRetainingCapacity();
+                    start = nl + 1;
+                } else {
+                    try line_buf.appendSlice(self.allocator, chunk[start..n]);
+                    // Cap a single WAL line to 64 MiB to guard against unbounded malformed records.
+                    if (line_buf.items.len > 64 * 1024 * 1024) {
+                        return storage_mod.StorageError.StorageFailure;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    const StrictReplayInfo = struct {
+        bytes: usize,
+        crc32: u32,
+    };
+
+    /// Strictly validate and replay every record in a WAL file.
+    /// Rejects missing CRC32 frames, checksum mismatches, truncated trailing lines,
+    /// malformed JSON, or invalid operations with `error.CorruptBackup`.
+    fn replayWalStrictLocked(self: *WalStore, path: []const u8, manifest: *const manifest_mod.AppManifest) !StrictReplayInfo {
+        const file = try std.Io.Dir.cwd().openFile(self.io, path, .{ .mode = .read_only });
+        defer file.close(self.io);
+
+        var chunk: [64 * 1024]u8 = undefined;
+        var line_buf: std.ArrayList(u8) = .empty;
+        defer line_buf.deinit(self.allocator);
+        var offset: u64 = 0;
+        var hasher = std.hash.Crc32.init();
+
+        while (true) {
+            const n = file.readPositionalAll(self.io, &chunk, offset) catch
+                return storage_mod.StorageError.StorageFailure;
+            if (n == 0) break;
+            offset += n;
+            hasher.update(chunk[0..n]);
+
+            var start: usize = 0;
+            while (start < n) {
+                if (std.mem.indexOfScalarPos(u8, chunk[0..n], start, '\n')) |nl| {
+                    try line_buf.appendSlice(self.allocator, chunk[start..nl]);
+                    const raw_line = std.mem.trim(u8, line_buf.items, " \t\r");
+                    if (raw_line.len > 0) {
+                        if (raw_line.len < 9 or raw_line[8] != '|') {
+                            return error.CorruptBackup;
+                        }
+                        const ok = try self.replayWalLineLocked(raw_line, manifest);
+                        if (!ok) return error.CorruptBackup;
+                    }
+                    line_buf.clearRetainingCapacity();
+                    start = nl + 1;
+                } else {
+                    try line_buf.appendSlice(self.allocator, chunk[start..n]);
+                    if (line_buf.items.len > 64 * 1024 * 1024) {
+                        return error.CorruptBackup;
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Any unterminated non-whitespace trailing data indicates a truncated backup.
+        if (std.mem.trim(u8, line_buf.items, " \t\r").len > 0) {
+            return error.CorruptBackup;
+        }
+
+        return .{
+            .bytes = @intCast(offset),
+            .crc32 = hasher.final(),
+        };
     }
 
     /// Replay a WAL byte buffer into this store (also used directly by crash-recovery & fuzz tests).
@@ -917,149 +1049,115 @@ pub const WalStore = struct {
             const raw_line = std.mem.trim(u8, bytes[pos..nl], " \t\r");
             pos = nl + 1;
             if (raw_line.len == 0) continue;
+            if (!(try self.replayWalLineLocked(raw_line, manifest))) break;
+        }
+    }
 
-            // Verify CRC32 framing if present (`<8-hex-crc>|<json>`).
-            var json_slice = raw_line;
-            if (raw_line.len >= 9 and raw_line[8] == '|') {
-                const expected_crc = std.fmt.parseInt(u32, raw_line[0..8], 16) catch break;
-                const payload = raw_line[9..];
-                if (std.hash.Crc32.hash(payload) != expected_crc) {
-                    // Corrupted WAL record => stop replay at the last valid committed prefix.
-                    break;
-                }
-                json_slice = payload;
-            } else if (raw_line[0] != '{') {
-                break;
+    fn replayWalLineLocked(self: *WalStore, raw_line: []const u8, manifest: *const manifest_mod.AppManifest) !bool {
+        // Verify CRC32 framing if present (`<8-hex-crc>|<json>`).
+        var json_slice = raw_line;
+        if (raw_line.len >= 9 and raw_line[8] == '|') {
+            const expected_crc = std.fmt.parseInt(u32, raw_line[0..8], 16) catch return false;
+            const payload = raw_line[9..];
+            if (std.hash.Crc32.hash(payload) != expected_crc) {
+                // Corrupted WAL record => stop replay at the last valid committed prefix.
+                return false;
             }
+            json_slice = payload;
+        } else if (raw_line[0] != '{') {
+            return false;
+        }
 
-            var arena = std.heap.ArenaAllocator.init(self.allocator);
-            defer arena.deinit();
-            const a = arena.allocator();
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
 
-            const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, json_slice, .{}) catch break;
-            if (parsed != .object) break;
-            const ts_v = parsed.object.get("ts") orelse break;
-            if (ts_v != .integer or ts_v.integer <= 0) break;
-            const ops_v = parsed.object.get("ops") orelse break;
-            if (ops_v != .array) break;
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, json_slice, .{}) catch return false;
+        if (parsed != .object) return false;
+        const ts_v = parsed.object.get("ts") orelse return false;
+        if (ts_v != .integer or ts_v.integer <= 0) return false;
+        const ops_v = parsed.object.get("ops") orelse return false;
+        if (ops_v != .array) return false;
 
-            // Validate and decode all ops in this transaction before applying any of them.
-            var decoded_ops: std.ArrayList(WriteOp) = .empty;
-            var valid_line = true;
-            for (ops_v.array.items) |op_v| {
-                if (op_v != .object) {
-                    valid_line = false;
-                    break;
-                }
-                const kind = jsonStrField(op_v.object, "op") orelse {
-                    valid_line = false;
-                    break;
-                };
-                const ns = jsonStrField(op_v.object, "ns") orelse {
-                    valid_line = false;
-                    break;
-                };
-                const tbl = jsonStrField(op_v.object, "table") orelse {
-                    valid_line = false;
-                    break;
-                };
-                const id = jsonStrField(op_v.object, "id") orelse {
-                    valid_line = false;
-                    break;
-                };
+        // Validate and decode all ops in this transaction before applying any of them.
+        var decoded_ops: std.ArrayList(WriteOp) = .empty;
+        for (ops_v.array.items) |op_v| {
+            if (op_v != .object) return false;
+            const kind = jsonStrField(op_v.object, "op") orelse return false;
+            const ns = jsonStrField(op_v.object, "ns") orelse return false;
+            const tbl = jsonStrField(op_v.object, "table") orelse return false;
+            const id = jsonStrField(op_v.object, "id") orelse return false;
 
-                if (std.mem.eql(u8, kind, "insert")) {
-                    const ct = jsonIntField(op_v.object, "ct") orelse {
-                        valid_line = false;
-                        break;
-                    };
-                    const body = jsonStrField(op_v.object, "body") orelse {
-                        valid_line = false;
-                        break;
-                    };
-                    try decoded_ops.append(a, .{ .insert = .{
-                        .namespace = @constCast(ns),
-                        .table = @constCast(tbl),
-                        .doc_id = @constCast(id),
-                        .creation_time_ms = ct,
-                        .body_json = @constCast(body),
-                    } });
-                } else if (std.mem.eql(u8, kind, "replace")) {
-                    const body = jsonStrField(op_v.object, "body") orelse {
-                        valid_line = false;
-                        break;
-                    };
-                    try decoded_ops.append(a, .{ .replace = .{
-                        .namespace = @constCast(ns),
-                        .table = @constCast(tbl),
-                        .doc_id = @constCast(id),
-                        .body_json = @constCast(body),
-                    } });
-                } else if (std.mem.eql(u8, kind, "patch")) {
-                    const patch = jsonStrField(op_v.object, "patch") orelse {
-                        valid_line = false;
-                        break;
-                    };
-                    try decoded_ops.append(a, .{ .patch = .{
-                        .namespace = @constCast(ns),
-                        .table = @constCast(tbl),
-                        .doc_id = @constCast(id),
-                        .patch_json = @constCast(patch),
-                    } });
-                } else if (std.mem.eql(u8, kind, "delete")) {
-                    try decoded_ops.append(a, .{ .delete = .{
-                        .namespace = @constCast(ns),
-                        .table = @constCast(tbl),
-                        .doc_id = @constCast(id),
-                    } });
-                } else {
-                    valid_line = false;
-                    break;
-                }
-            }
-            if (!valid_line) break;
-
-            // Validate doc existence for replace/patch before mutating state.
-            var v_exists: std.StringHashMapUnmanaged(bool) = .empty;
-            var ops_applicable = true;
-            for (decoded_ops.items) |op| {
-                switch (op) {
-                    .insert => |ins| {
-                        const k = try makeDocKey(a, ins.namespace, ins.table, ins.doc_id);
-                        try v_exists.put(a, k, true);
-                    },
-                    .replace => |r| {
-                        const k = try makeDocKey(a, r.namespace, r.table, r.doc_id);
-                        if (!(v_exists.get(k) orelse self.docs.contains(k))) {
-                            ops_applicable = false;
-                            break;
-                        }
-                    },
-                    .patch => |p| {
-                        const k = try makeDocKey(a, p.namespace, p.table, p.doc_id);
-                        if (!(v_exists.get(k) orelse self.docs.contains(k))) {
-                            ops_applicable = false;
-                            break;
-                        }
-                    },
-                    .delete => |d| {
-                        const k = try makeDocKey(a, d.namespace, d.table, d.doc_id);
-                        try v_exists.put(a, k, false);
-                    },
-                }
-            }
-            if (!ops_applicable) break;
-
-            var ws: readset_mod.WriteSet = .{};
-            defer ws.deinit(self.allocator);
-            for (decoded_ops.items) |op| {
-                self.applyOpLocked(manifest, op, &ws) catch break;
-            }
-            if (ts_v.integer > self.latest_ts) {
-                self.latest_ts = ts_v.integer;
-                self.latest_ts_atomic.store(ts_v.integer, .release);
+            if (std.mem.eql(u8, kind, "insert")) {
+                const ct = jsonIntField(op_v.object, "ct") orelse return false;
+                const body = jsonStrField(op_v.object, "body") orelse return false;
+                try decoded_ops.append(a, .{ .insert = .{
+                    .namespace = @constCast(ns),
+                    .table = @constCast(tbl),
+                    .doc_id = @constCast(id),
+                    .creation_time_ms = ct,
+                    .body_json = @constCast(body),
+                } });
+            } else if (std.mem.eql(u8, kind, "replace")) {
+                const body = jsonStrField(op_v.object, "body") orelse return false;
+                try decoded_ops.append(a, .{ .replace = .{
+                    .namespace = @constCast(ns),
+                    .table = @constCast(tbl),
+                    .doc_id = @constCast(id),
+                    .body_json = @constCast(body),
+                } });
+            } else if (std.mem.eql(u8, kind, "patch")) {
+                const patch = jsonStrField(op_v.object, "patch") orelse return false;
+                try decoded_ops.append(a, .{ .patch = .{
+                    .namespace = @constCast(ns),
+                    .table = @constCast(tbl),
+                    .doc_id = @constCast(id),
+                    .patch_json = @constCast(patch),
+                } });
+            } else if (std.mem.eql(u8, kind, "delete")) {
+                try decoded_ops.append(a, .{ .delete = .{
+                    .namespace = @constCast(ns),
+                    .table = @constCast(tbl),
+                    .doc_id = @constCast(id),
+                } });
+            } else {
+                return false;
             }
         }
+
+        // Validate doc existence for replace/patch before mutating state.
+        var v_exists: std.StringHashMapUnmanaged(bool) = .empty;
+        for (decoded_ops.items) |op| {
+            switch (op) {
+                .insert => |ins| {
+                    const k = try makeDocKey(a, ins.namespace, ins.table, ins.doc_id);
+                    try v_exists.put(a, k, true);
+                },
+                .replace => |r| {
+                    const k = try makeDocKey(a, r.namespace, r.table, r.doc_id);
+                    if (!(v_exists.get(k) orelse self.docs.contains(k))) return false;
+                },
+                .patch => |p| {
+                    const k = try makeDocKey(a, p.namespace, p.table, p.doc_id);
+                    if (!(v_exists.get(k) orelse self.docs.contains(k))) return false;
+                },
+                .delete => |d| {
+                    const k = try makeDocKey(a, d.namespace, d.table, d.doc_id);
+                    try v_exists.put(a, k, false);
+                },
+            }
+        }
+
+        var ws: readset_mod.WriteSet = .{};
+        defer ws.deinit(self.allocator);
+        for (decoded_ops.items) |op| {
+            self.applyOpLocked(manifest, op, &ws) catch return false;
+        }
+        if (ts_v.integer > self.latest_ts) {
+            self.latest_ts = ts_v.integer;
+            self.latest_ts_atomic.store(ts_v.integer, .release);
+        }
+        return true;
     }
 
     /// Assert that `self.indexes` matches `computeIndexEntries` across every live document (no orphan or missing rows).
@@ -1121,6 +1219,119 @@ pub const WalStore = struct {
         }
     }
 };
+
+const empty_backup_manifest_json =
+    \\{"app_name":"wal-backup","tables":[],"components":[],"functions":[]}
+;
+
+fn makeTempPath(io: std.Io, allocator: Allocator, dst_path: []const u8) ![]u8 {
+    var rand_bytes: [8]u8 = undefined;
+    io.random(&rand_bytes);
+    const hex = std.fmt.bytesToHex(rand_bytes, .lower);
+    return try std.fmt.allocPrint(allocator, "{s}.{s}.tmp", .{ dst_path, hex });
+}
+
+fn writeFileAtomic(io: std.Io, allocator: Allocator, dst_path: []const u8, data: []const u8) !void {
+    if (std.fs.path.dirname(dst_path)) |dir| {
+        if (dir.len > 0) {
+            try std.Io.Dir.cwd().createDirPath(io, dir);
+        }
+    }
+
+    const tmp_path = try makeTempPath(io, allocator, dst_path);
+    defer allocator.free(tmp_path);
+    errdefer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    {
+        const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
+        defer file.close(io);
+        if (data.len > 0) {
+            try file.writePositionalAll(io, data, 0);
+        }
+        try file.sync(io);
+    }
+
+    try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), dst_path, io);
+}
+
+/// Create a clean, compacted, fsynced, CRC32-valid WAL snapshot backup of `src_wal_path`,
+/// written atomically to `dst_path` (temp file + fsync + rename).
+/// Does not modify `src_wal_path`. Returns total bytes written to `dst_path`.
+pub fn backupWalFile(io: std.Io, allocator: Allocator, src_wal_path: []const u8, dst_path: []const u8) !usize {
+    const src_size: u64 = blk: {
+        const f = try std.Io.Dir.cwd().openFile(io, src_wal_path, .{ .mode = .read_only });
+        defer f.close(io);
+        const st = try f.stat(io);
+        break :blk st.size;
+    };
+
+    var manifest = try manifest_mod.AppManifest.parseJson(allocator, empty_backup_manifest_json);
+    defer manifest.deinit();
+
+    var store = try WalStore.openInMemory(allocator, io);
+    defer store.deinit();
+
+    try store.replayWalLocked(src_wal_path, &manifest);
+    if (src_size > 0 and store.latest_ts == 0) {
+        return error.CorruptBackup;
+    }
+
+    const snapshot = try store.formatCompactSnapshotLocked(allocator);
+    defer allocator.free(snapshot);
+
+    try writeFileAtomic(io, allocator, dst_path, snapshot);
+    return snapshot.len;
+}
+
+/// Strictly validate `backup_path` by replaying every record and CRC32 checksum into a temporary
+/// `WalStore` (rejecting corrupted or truncated backups with `error.CorruptBackup` before
+/// touching `dst_wal_path`), then atomically copy + fsync + rename it to `dst_wal_path`.
+/// Returns total bytes restored.
+pub fn restoreWalFile(io: std.Io, allocator: Allocator, backup_path: []const u8, dst_wal_path: []const u8) !usize {
+    var manifest = try manifest_mod.AppManifest.parseJson(allocator, empty_backup_manifest_json);
+    defer manifest.deinit();
+
+    var store = try WalStore.openInMemory(allocator, io);
+    defer store.deinit();
+
+    const verified = try store.replayWalStrictLocked(backup_path, &manifest);
+
+    if (std.fs.path.dirname(dst_wal_path)) |dir| {
+        if (dir.len > 0) {
+            try std.Io.Dir.cwd().createDirPath(io, dir);
+        }
+    }
+
+    const tmp_path = try makeTempPath(io, allocator, dst_wal_path);
+    defer allocator.free(tmp_path);
+    errdefer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    {
+        const src_file = try std.Io.Dir.cwd().openFile(io, backup_path, .{ .mode = .read_only });
+        defer src_file.close(io);
+
+        const dst_file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
+        defer dst_file.close(io);
+
+        var chunk: [64 * 1024]u8 = undefined;
+        var offset: u64 = 0;
+        var copy_hasher = std.hash.Crc32.init();
+        while (true) {
+            const n = try src_file.readPositionalAll(io, &chunk, offset);
+            if (n == 0) break;
+            try dst_file.writePositionalAll(io, chunk[0..n], offset);
+            copy_hasher.update(chunk[0..n]);
+            offset += n;
+        }
+        if (offset != verified.bytes or copy_hasher.final() != verified.crc32) {
+            return error.CorruptBackup;
+        }
+        try dst_file.sync(io);
+    }
+
+    try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), dst_wal_path, io);
+    return verified.bytes;
+}
 
 fn jsonStrField(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
     const v = obj.get(name) orelse return null;
@@ -1415,4 +1626,149 @@ test "wal store leader-follower group commit batches concurrent fsyncs and prese
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, wire.written(), .{});
     defer parsed.deinit();
     try std.testing.expectEqual(total_expected, parsed.value.array.items.len);
+}
+
+test "backupWalFile and restoreWalFile round-trip compacted snapshot and preserve state" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const src_path = ".zig-cache/test-backup-src.wal";
+    const bak_path = ".zig-cache/test-backup-out.bak";
+    const dst_path = ".zig-cache/test-backup-restored.wal";
+    std.Io.Dir.cwd().deleteFile(io, src_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, bak_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, dst_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, src_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, bak_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, dst_path) catch {};
+
+    const manifest_json =
+        \\{"app_name":"bak","tables":[{"name":"notes","document_schema":{"kind":"any"},"indexes":[{"name":"by_tag","fields":["tag"]}]}],"components":[],"functions":[]}
+    ;
+    var manifest = try manifest_mod.AppManifest.parseJson(allocator, manifest_json);
+    defer manifest.deinit();
+
+    var store = try WalStore.openFile(allocator, io, src_path);
+    store.compact_threshold = 0;
+    try store.initSchema(&manifest);
+
+    var empty_rs: readset_mod.ReadSet = .{};
+    defer empty_rs.deinit(allocator);
+
+    {
+        const w_ins = [_]WriteOp{
+            .{ .insert = .{ .namespace = @constCast(""), .table = @constCast("notes"), .doc_id = @constCast("n1"), .creation_time_ms = 1000, .body_json = @constCast("{\"tag\":\"v0\",\"text\":\"init\"}") } },
+            .{ .insert = .{ .namespace = @constCast(""), .table = @constCast("notes"), .doc_id = @constCast("n2"), .creation_time_ms = 2000, .body_json = @constCast("{\"tag\":\"drop\",\"text\":\"ephemeral\"}") } },
+        };
+        var c = try store.commitTx(allocator, &manifest, 0, &empty_rs, &w_ins);
+        c.deinit(allocator);
+    }
+    for (1..25) |i| {
+        const patch_json = try std.fmt.allocPrint(allocator, "{{\"tag\":\"v{d}\",\"text\":\"rev {d}\"}}", .{ i, i });
+        defer allocator.free(patch_json);
+        const w_pat = [_]WriteOp{.{ .patch = .{ .namespace = @constCast(""), .table = @constCast("notes"), .doc_id = @constCast("n1"), .patch_json = patch_json } }};
+        var c = try store.commitTx(allocator, &manifest, try store.latestCommitTs(), &empty_rs, &w_pat);
+        c.deinit(allocator);
+    }
+    {
+        const w_del = [_]WriteOp{.{ .delete = .{ .namespace = @constCast(""), .table = @constCast("notes"), .doc_id = @constCast("n2") } }};
+        var c = try store.commitTx(allocator, &manifest, try store.latestCommitTs(), &empty_rs, &w_del);
+        c.deinit(allocator);
+    }
+
+    const expected_ts = try store.latestCommitTs();
+    store.deinit();
+
+    const src_bytes = try std.Io.Dir.cwd().readFileAlloc(io, src_path, allocator, .limited(10 * 1024 * 1024));
+    const src_len = src_bytes.len;
+    allocator.free(src_bytes);
+
+    // Backup produces a smaller, compacted CRC32-framed snapshot.
+    const backed_up_bytes = try backupWalFile(io, allocator, src_path, bak_path);
+    try std.testing.expect(backed_up_bytes > 0);
+    try std.testing.expect(backed_up_bytes < src_len);
+
+    // Restore validates and atomically writes to dst_path.
+    const restored_bytes = try restoreWalFile(io, allocator, bak_path, dst_path);
+    try std.testing.expectEqual(backed_up_bytes, restored_bytes);
+
+    // Reopen restored WAL and verify exact state + commit_ts + secondary index integrity.
+    var reopened = try WalStore.openFile(allocator, io, dst_path);
+    defer reopened.deinit();
+    try reopened.initSchema(&manifest);
+    try std.testing.expectEqual(expected_ts, try reopened.latestCommitTs());
+
+    const n1 = (try reopened.getDoc(allocator, "", "notes", "n1")).?;
+    defer n1.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, n1.body_json, "\"v24\"") != null);
+    try std.testing.expect((try reopened.getDoc(allocator, "", "notes", "n2")) == null);
+    try reopened.verifyIndexIntegrity(allocator, &manifest);
+}
+
+test "restoreWalFile rejects corrupted and truncated backups without touching destination" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const src_path = ".zig-cache/test-corrupt-src.wal";
+    const bak_path = ".zig-cache/test-corrupt-good.bak";
+    const bad_flip_path = ".zig-cache/test-corrupt-flip.bak";
+    const bad_trunc_path = ".zig-cache/test-corrupt-trunc.bak";
+    const bad_garbage_path = ".zig-cache/test-corrupt-garbage.bak";
+    const dst_path = ".zig-cache/test-corrupt-dst.wal";
+
+    const paths = [_][]const u8{ src_path, bak_path, bad_flip_path, bad_trunc_path, bad_garbage_path, dst_path };
+    for (paths) |p| std.Io.Dir.cwd().deleteFile(io, p) catch {};
+    defer for (paths) |p| std.Io.Dir.cwd().deleteFile(io, p) catch {};
+
+    const manifest_json =
+        \\{"app_name":"bak-err","tables":[{"name":"notes","document_schema":{"kind":"any"},"indexes":[]}],"components":[],"functions":[]}
+    ;
+    var manifest = try manifest_mod.AppManifest.parseJson(allocator, manifest_json);
+    defer manifest.deinit();
+
+    var store = try WalStore.openFile(allocator, io, src_path);
+    try store.initSchema(&manifest);
+    var empty_rs: readset_mod.ReadSet = .{};
+    defer empty_rs.deinit(allocator);
+    const w = [_]WriteOp{.{ .insert = .{
+        .namespace = @constCast(""),
+        .table = @constCast("notes"),
+        .doc_id = @constCast("k1"),
+        .creation_time_ms = 500,
+        .body_json = @constCast("{\"msg\":\"important\"}"),
+    } }};
+    var c = try store.commitTx(allocator, &manifest, 0, &empty_rs, &w);
+    c.deinit(allocator);
+    store.deinit();
+
+    _ = try backupWalFile(io, allocator, src_path, bak_path);
+    const good_bytes = try std.Io.Dir.cwd().readFileAlloc(io, bak_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(good_bytes);
+
+    // Seed destination with sentinel data to verify failed restores NEVER overwrite it.
+    const sentinel = "SENTINEL_UNTOUCHED_DATA";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dst_path, .data = sentinel });
+
+    // 1. Bit-flipped payload (CRC mismatch) -> rejected.
+    const flipped = try allocator.dupe(u8, good_bytes);
+    defer allocator.free(flipped);
+    flipped[flipped.len / 2] ^= 0x01;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = bad_flip_path, .data = flipped });
+    try std.testing.expectError(error.CorruptBackup, restoreWalFile(io, allocator, bad_flip_path, dst_path));
+
+    // 2. Truncated backup (missing trailing newline & cut-off JSON) -> rejected.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = bad_trunc_path, .data = good_bytes[0 .. good_bytes.len / 2] });
+    try std.testing.expectError(error.CorruptBackup, restoreWalFile(io, allocator, bad_trunc_path, dst_path));
+
+    // 3. Garbage non-WAL content -> rejected.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = bad_garbage_path, .data = "not a wal file\n" });
+    try std.testing.expectError(error.CorruptBackup, restoreWalFile(io, allocator, bad_garbage_path, dst_path));
+
+    // 4. Missing backup file -> FileNotFound.
+    try std.testing.expectError(error.FileNotFound, restoreWalFile(io, allocator, ".zig-cache/does-not-exist.bak", dst_path));
+
+    // Verify destination file is 100% intact.
+    const after_dst = try std.Io.Dir.cwd().readFileAlloc(io, dst_path, allocator, .limited(1024));
+    defer allocator.free(after_dst);
+    try std.testing.expectEqualStrings(sentinel, after_dst);
 }

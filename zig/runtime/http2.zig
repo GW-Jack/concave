@@ -24,21 +24,37 @@ pub const FLAG_PADDED: u8 = 0x8;
 pub const FLAG_PRIORITY: u8 = 0x20;
 
 pub const MAX_FRAME_SIZE: usize = 16384;
+pub const MAX_CONCURRENT_STREAMS: usize = 128;
+pub const MAX_HEADER_BLOCK_BYTES: usize = 64 * 1024;
+pub const MAX_DECODED_HEADER_BYTES: usize = 64 * 1024;
+pub const MAX_DECODED_HEADER_COUNT: usize = 128;
+pub const MAX_HPACK_TABLE_SIZE: usize = 4096;
+pub const MAX_CONTROL_BURST: usize = 256;
+
+pub const HttpHeader = struct {
+    name: []u8,
+    value: []u8,
+};
 
 pub const H2Request = struct {
     method: []u8,
     path: []u8,
     query: []u8,
+    host: ?[]u8 = null,
+    origin: ?[]u8 = null,
     content_type: ?[]u8 = null,
     authorization: ?[]u8 = null,
     accept_encoding: ?[]u8 = null,
     if_none_match: ?[]u8 = null,
+    headers: []const HttpHeader = &.{},
     body: []u8,
 
     pub fn deinit(self: *const H2Request, allocator: Allocator) void {
         allocator.free(self.method);
         allocator.free(self.path);
         allocator.free(self.query);
+        if (self.host) |v| allocator.free(v);
+        if (self.origin) |v| allocator.free(v);
         if (self.content_type) |v| allocator.free(v);
         if (self.authorization) |v| allocator.free(v);
         if (self.accept_encoding) |v| allocator.free(v);
@@ -56,11 +72,25 @@ pub const H2Response = struct {
     etag: ?[]u8 = null,
     etag_owned: bool = true,
     cache_control: ?[]const u8 = null,
+    cors_allow_origin: ?[]const u8 = null,
+    content_security_policy: ?[]const u8 = null,
+    content_disposition: ?[]const u8 = null,
+    x_frame_options: ?[]const u8 = null,
+    retry_after_secs: ?u32 = null,
+    extra_headers: []const HttpHeader = &.{},
+    extra_headers_owned: bool = false,
 
     pub fn deinit(self: *const H2Response, allocator: Allocator) void {
         if (self.body_owned and self.body.len > 0) allocator.free(self.body);
         if (self.etag_owned) {
             if (self.etag) |e| allocator.free(e);
+        }
+        if (self.extra_headers_owned and self.extra_headers.len > 0) {
+            for (self.extra_headers) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            }
+            allocator.free(self.extra_headers);
         }
     }
 };
@@ -70,10 +100,13 @@ pub const DispatchFn = *const fn (ctx: *anyopaque, allocator: Allocator, req: *c
 const StreamBuf = struct {
     method: ?[]u8 = null,
     raw_path: ?[]u8 = null,
+    host: ?[]u8 = null,
+    origin: ?[]u8 = null,
     content_type: ?[]u8 = null,
     authorization: ?[]u8 = null,
     accept_encoding: ?[]u8 = null,
     if_none_match: ?[]u8 = null,
+    headers: std.ArrayList(HttpHeader) = .empty,
     header_block: std.ArrayList(u8) = .empty,
     body: std.ArrayList(u8) = .empty,
     end_stream: bool = false,
@@ -81,10 +114,17 @@ const StreamBuf = struct {
     fn deinit(self: *StreamBuf, allocator: Allocator) void {
         if (self.method) |v| allocator.free(v);
         if (self.raw_path) |v| allocator.free(v);
+        if (self.host) |v| allocator.free(v);
+        if (self.origin) |v| allocator.free(v);
         if (self.content_type) |v| allocator.free(v);
         if (self.authorization) |v| allocator.free(v);
         if (self.accept_encoding) |v| allocator.free(v);
         if (self.if_none_match) |v| allocator.free(v);
+        for (self.headers.items) |h| {
+            allocator.free(h.name);
+            allocator.free(h.value);
+        }
+        self.headers.deinit(allocator);
         self.header_block.deinit(allocator);
         self.body.deinit(allocator);
     }
@@ -104,8 +144,9 @@ pub fn serveConnection(
     var sw = stream.writer(io, &wbuf);
     const writer = &sw.interface;
 
-    // Send initial server SETTINGS: MAX_CONCURRENT_STREAMS=128, INITIAL_WINDOW_SIZE=1MB, ENABLE_PUSH=0
+    // Send initial server SETTINGS: HEADER_TABLE_SIZE=4096, ENABLE_PUSH=0, MAX_CONCURRENT_STREAMS=128, INITIAL_WINDOW_SIZE=1MB
     const initial_settings = [_]u8{
+        0x00, 0x01, 0x00, 0x00, 0x10, 0x00, // HEADER_TABLE_SIZE = 4096
         0x00, 0x02, 0x00, 0x00, 0x00, 0x00, // ENABLE_PUSH = 0
         0x00, 0x03, 0x00, 0x00, 0x00, 0x80, // MAX_CONCURRENT_STREAMS = 128
         0x00, 0x04, 0x00, 0x10, 0x00, 0x00, // INITIAL_WINDOW_SIZE = 1 MiB
@@ -129,6 +170,8 @@ pub fn serveConnection(
 
     var peer_max_frame: usize = MAX_FRAME_SIZE;
     var last_stream_id: u32 = 0;
+    var expecting_continuation_sid: ?u32 = null;
+    var control_burst: usize = 0;
     var stack_payload: [4096]u8 = undefined;
     var req_arena = std.heap.ArenaAllocator.init(allocator);
     defer req_arena.deinit();
@@ -144,6 +187,17 @@ pub fn serveConnection(
         const ftype: FrameType = @enumFromInt(fhdr[3]);
         const flags: u8 = fhdr[4];
         const sid: u32 = std.mem.readInt(u32, fhdr[5..9], .big) & 0x7FFF_FFFF;
+
+        // RFC 9113 §6.10: While awaiting CONTINUATION, only CONTINUATION for the exact same stream is valid.
+        if (expecting_continuation_sid) |exp_sid| {
+            if (ftype != .continuation or sid != exp_sid) {
+                sendGoAway(writer, last_stream_id, 1); // PROTOCOL_ERROR
+                break;
+            }
+        } else if (ftype == .continuation) {
+            sendGoAway(writer, last_stream_id, 1); // PROTOCOL_ERROR
+            break;
+        }
 
         if (length > 1024 * 1024) {
             sendGoAway(writer, last_stream_id, 6); // FRAME_SIZE_ERROR
@@ -164,6 +218,11 @@ pub fn serveConnection(
 
         switch (ftype) {
             .settings => {
+                control_burst += 1;
+                if (control_burst > MAX_CONTROL_BURST) {
+                    sendGoAway(writer, last_stream_id, 11); // ENHANCE_YOUR_CALM
+                    break;
+                }
                 if ((flags & FLAG_ACK) == 0) {
                     var off: usize = 0;
                     while (off + 6 <= payload.len) : (off += 6) {
@@ -178,21 +237,55 @@ pub fn serveConnection(
                 }
             },
             .ping => {
+                control_burst += 1;
+                if (control_burst > MAX_CONTROL_BURST) {
+                    sendGoAway(writer, last_stream_id, 11);
+                    break;
+                }
                 if ((flags & FLAG_ACK) == 0 and payload.len == 8) {
                     writeFrame(writer, .ping, FLAG_ACK, 0, payload) catch break;
                     writer.flush() catch break;
                 }
             },
             .goaway => break,
-            .window_update, .priority => {},
+            .window_update, .priority => {
+                control_burst += 1;
+                if (control_burst > MAX_CONTROL_BURST) {
+                    sendGoAway(writer, last_stream_id, 11);
+                    break;
+                }
+            },
             .rst_stream => {
+                // Mitigate Rapid Reset (CVE-2023-44487) floods.
+                control_burst += 1;
+                if (control_burst > MAX_CONTROL_BURST) {
+                    sendGoAway(writer, last_stream_id, 11); // ENHANCE_YOUR_CALM
+                    break;
+                }
                 if (streams.fetchRemove(sid)) |kv| {
                     var sb = kv.value;
                     sb.deinit(allocator);
                 }
             },
             .headers, .continuation => {
-                if (sid == 0) break;
+                if (sid == 0) {
+                    sendGoAway(writer, last_stream_id, 1);
+                    break;
+                }
+                if (ftype == .headers and !streams.contains(sid)) {
+                    if (streams.count() >= MAX_CONCURRENT_STREAMS) {
+                        var rst: [4]u8 = undefined;
+                        std.mem.writeInt(u32, &rst, 7, .big); // REFUSED_STREAM
+                        writeFrame(writer, .rst_stream, 0, sid, &rst) catch break;
+                        writer.flush() catch break;
+                        control_burst += 1;
+                        if (control_burst > MAX_CONTROL_BURST) {
+                            sendGoAway(writer, last_stream_id, 11);
+                            break;
+                        }
+                        continue;
+                    }
+                }
                 if (sid > last_stream_id) last_stream_id = sid;
                 const gop = streams.getOrPut(allocator, sid) catch break;
                 if (!gop.found_existing) gop.value_ptr.* = .{};
@@ -215,26 +308,44 @@ pub fn serveConnection(
                         gop.value_ptr.end_stream = true;
                     }
                 }
+
+                // Prevent CONTINUATION flood (CVE-2024-27316 class) by capping total header_block bytes.
+                if (gop.value_ptr.header_block.items.len + frag.len > MAX_HEADER_BLOCK_BYTES) {
+                    sendGoAway(writer, last_stream_id, 11); // ENHANCE_YOUR_CALM
+                    break;
+                }
                 gop.value_ptr.header_block.appendSlice(allocator, frag) catch break;
 
                 if ((flags & FLAG_END_HEADERS) != 0) {
+                    expecting_continuation_sid = null;
                     hpack.decodeBlock(gop.value_ptr.header_block.items, gop.value_ptr) catch {
                         sendGoAway(writer, last_stream_id, 9); // COMPRESSION_ERROR
                         break;
                     };
                     gop.value_ptr.header_block.clearRetainingCapacity();
                     if (gop.value_ptr.end_stream) {
-                        defer _ = req_arena.reset(.retain_capacity);
+                        control_burst = 0;
+                        defer _ = req_arena.reset(.{ .retain_with_limit = 64 * 1024 });
                         completeStream(req_arena.allocator(), writer, reader, sid, gop.value_ptr, peer_max_frame, dispatch_ctx, dispatch_fn) catch break;
                         if (streams.fetchRemove(sid)) |kv| {
                             var sb = kv.value;
                             sb.deinit(allocator);
                         }
                     }
+                } else {
+                    expecting_continuation_sid = sid;
+                    control_burst += 1;
+                    if (control_burst > MAX_CONTROL_BURST) {
+                        sendGoAway(writer, last_stream_id, 11);
+                        break;
+                    }
                 }
             },
             .data => {
-                if (sid == 0) break;
+                if (sid == 0) {
+                    sendGoAway(writer, last_stream_id, 1);
+                    break;
+                }
                 const sb = streams.getPtr(sid) orelse continue;
                 var data = payload;
                 if ((flags & FLAG_PADDED) != 0) {
@@ -266,8 +377,9 @@ pub fn serveConnection(
                     writer.flush() catch break;
                 }
                 if ((flags & FLAG_END_STREAM) != 0) {
+                    control_burst = 0;
                     sb.end_stream = true;
-                    defer _ = req_arena.reset(.retain_capacity);
+                    defer _ = req_arena.reset(.{ .retain_with_limit = 64 * 1024 });
                     completeStream(req_arena.allocator(), writer, reader, sid, sb, peer_max_frame, dispatch_ctx, dispatch_fn) catch break;
                     if (streams.fetchRemove(sid)) |kv| {
                         var rem = kv.value;
@@ -300,10 +412,13 @@ fn completeStream(
         .method = @constCast(sb.method orelse "GET"),
         .path = @constCast(path_slice),
         .query = @constCast(query_slice),
+        .host = sb.host,
+        .origin = sb.origin,
         .content_type = sb.content_type,
         .authorization = sb.authorization,
         .accept_encoding = sb.accept_encoding,
         .if_none_match = sb.if_none_match,
+        .headers = sb.headers.items,
         .body = sb.body.items,
     };
 
@@ -345,12 +460,53 @@ fn completeStream(
         try encodeHpackLiteralIndexedName(allocator, &hdr_block, 24, cc); // cache-control
     }
     try encodeHpackLiteralIndexedName(allocator, &hdr_block, 59, "Accept-Encoding"); // vary
-    try encodeHpackLiteralIndexedName(allocator, &hdr_block, 20, "*"); // access-control-allow-origin
-    try encodeHpackLiteralNewName(allocator, &hdr_block, "access-control-allow-headers", "Content-Type, Authorization");
-    try encodeHpackLiteralNewName(allocator, &hdr_block, "access-control-allow-methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+    try encodeHpackLiteralNewName(allocator, &hdr_block, "x-content-type-options", "nosniff");
+    try encodeHpackLiteralNewName(allocator, &hdr_block, "referrer-policy", "no-referrer");
+    if (resp.x_frame_options) |xfo| {
+        try encodeHpackLiteralNewName(allocator, &hdr_block, "x-frame-options", xfo);
+    }
+    if (resp.content_security_policy) |csp| {
+        try encodeHpackLiteralNewName(allocator, &hdr_block, "content-security-policy", csp);
+    }
+    if (resp.content_disposition) |cd| {
+        try encodeHpackLiteralIndexedName(allocator, &hdr_block, 25, cd); // content-disposition
+    }
+    if (resp.cors_allow_origin) |cors| {
+        try encodeHpackLiteralIndexedName(allocator, &hdr_block, 20, cors); // access-control-allow-origin
+        try encodeHpackLiteralNewName(allocator, &hdr_block, "access-control-allow-headers", "Content-Type, Authorization");
+        try encodeHpackLiteralNewName(allocator, &hdr_block, "access-control-allow-methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+    }
+    if (resp.retry_after_secs) |ra| {
+        var ra_buf: [16]u8 = undefined;
+        const ra_str = std.fmt.bufPrint(&ra_buf, "{d}", .{ra}) catch "1";
+        try encodeHpackLiteralNewName(allocator, &hdr_block, "retry-after", ra_str);
+    }
+    for (resp.extra_headers) |eh| {
+        if (eh.name.len == 0 or eh.name[0] == ':') continue;
+        var lower_buf: [128]u8 = undefined;
+        if (eh.name.len > lower_buf.len) continue;
+        for (eh.name, 0..) |ch, idx| lower_buf[idx] = std.ascii.toLower(ch);
+        const lname = lower_buf[0..eh.name.len];
+        if (std.mem.eql(u8, lname, "content-length") or std.mem.eql(u8, lname, "transfer-encoding") or std.mem.eql(u8, lname, "connection")) continue;
+        try encodeHpackLiteralNewName(allocator, &hdr_block, lname, eh.value);
+    }
 
-    const hdr_flags: u8 = FLAG_END_HEADERS | (if (resp.body.len == 0) FLAG_END_STREAM else 0);
-    try writeFrame(writer, .headers, hdr_flags, stream_id, hdr_block.items);
+    // Split response HEADERS into CONTINUATION frames if larger than `max_frame` (preventing 24-bit truncation).
+    const end_stream_flag: u8 = if (resp.body.len == 0) FLAG_END_STREAM else 0;
+    if (hdr_block.items.len <= max_frame) {
+        try writeFrame(writer, .headers, FLAG_END_HEADERS | end_stream_flag, stream_id, hdr_block.items);
+    } else {
+        var hoff: usize = 0;
+        var first = true;
+        while (hoff < hdr_block.items.len) {
+            const chunk_len = @min(max_frame, hdr_block.items.len - hoff);
+            const is_last = (hoff + chunk_len == hdr_block.items.len);
+            const f_flags: u8 = (if (first) end_stream_flag else 0) | (if (is_last) FLAG_END_HEADERS else 0);
+            try writeFrame(writer, if (first) .headers else .continuation, f_flags, stream_id, hdr_block.items[hoff .. hoff + chunk_len]);
+            hoff += chunk_len;
+            first = false;
+        }
+    }
 
     var off: usize = 0;
     while (off < resp.body.len) {
@@ -366,6 +522,7 @@ fn completeStream(
 }
 
 fn writeFrame(writer: *std.Io.Writer, ftype: FrameType, flags: u8, stream_id: u32, payload: []const u8) !void {
+    if (payload.len > 0xFF_FFFF) return error.FrameTooLarge;
     var hdr: [9]u8 = undefined;
     hdr[0] = @intCast((payload.len >> 16) & 0xFF);
     hdr[1] = @intCast((payload.len >> 8) & 0xFF);
@@ -496,7 +653,7 @@ pub const HpackDecoder = struct {
     allocator: Allocator,
     dynamic: std.ArrayList(DynEntry) = .empty,
     dynamic_size: usize = 0,
-    max_dynamic_size: usize = 4096,
+    max_dynamic_size: usize = MAX_HPACK_TABLE_SIZE,
 
     pub fn init(allocator: Allocator) HpackDecoder {
         return .{ .allocator = allocator };
@@ -547,12 +704,33 @@ pub const HpackDecoder = struct {
 
     pub fn decodeBlock(self: *HpackDecoder, block: []const u8, target: *StreamBuf) !void {
         var pos: usize = 0;
+        var field_count: usize = 0;
+        var decoded_bytes: usize = 0;
+        var allow_size_update = true;
+
         while (pos < block.len) {
             const b = block[pos];
+            if ((b & 0xE0) == 0x20) {
+                // RFC 7541 §4.2: Dynamic table size updates MUST occur at the beginning of the header block
+                // and MUST NOT exceed SETTINGS_HEADER_TABLE_SIZE (4096).
+                if (!allow_size_update) return error.CompressionError;
+                const new_max = try decodeInt(block, &pos, 5);
+                if (new_max > MAX_HPACK_TABLE_SIZE) return error.CompressionError;
+                self.max_dynamic_size = new_max;
+                self.evictTo(self.max_dynamic_size);
+                continue;
+            }
+            allow_size_update = false;
+
+            field_count += 1;
+            if (field_count > MAX_DECODED_HEADER_COUNT) return error.CompressionError;
+
             if ((b & 0x80) != 0) {
                 // Indexed Header Field (7-bit prefix)
                 const idx = try decodeInt(block, &pos, 7);
                 const pair = try self.getEntry(idx);
+                decoded_bytes += pair.name.len + pair.value.len;
+                if (decoded_bytes > MAX_DECODED_HEADER_BYTES) return error.CompressionError;
                 try applyHeader(self.allocator, target, pair.name, pair.value);
             } else if ((b & 0xC0) == 0x40) {
                 // Literal Header Field with Incremental Indexing (6-bit prefix)
@@ -561,13 +739,10 @@ pub const HpackDecoder = struct {
                 defer self.allocator.free(name);
                 const value = try decodeStr(self.allocator, block, &pos);
                 defer self.allocator.free(value);
+                decoded_bytes += name.len + value.len;
+                if (decoded_bytes > MAX_DECODED_HEADER_BYTES) return error.CompressionError;
                 try self.insertDynamic(name, value);
                 try applyHeader(self.allocator, target, name, value);
-            } else if ((b & 0xE0) == 0x20) {
-                // Dynamic Table Size Update (5-bit prefix)
-                const new_max = try decodeInt(block, &pos, 5);
-                self.max_dynamic_size = @min(new_max, 65536);
-                self.evictTo(self.max_dynamic_size);
             } else {
                 // Literal Header Field without Indexing / Never Indexed (4-bit prefix)
                 const idx = try decodeInt(block, &pos, 4);
@@ -575,6 +750,8 @@ pub const HpackDecoder = struct {
                 defer self.allocator.free(name);
                 const value = try decodeStr(self.allocator, block, &pos);
                 defer self.allocator.free(value);
+                decoded_bytes += name.len + value.len;
+                if (decoded_bytes > MAX_DECODED_HEADER_BYTES) return error.CompressionError;
                 try applyHeader(self.allocator, target, name, value);
             }
         }
@@ -585,9 +762,24 @@ fn applyHeader(allocator: Allocator, sb: *StreamBuf, name: []const u8, value: []
     if (std.mem.eql(u8, name, ":method")) {
         if (sb.method) |old| allocator.free(old);
         sb.method = try allocator.dupe(u8, value);
+        return;
     } else if (std.mem.eql(u8, name, ":path")) {
         if (sb.raw_path) |old| allocator.free(old);
         sb.raw_path = try allocator.dupe(u8, value);
+        return;
+    } else if (std.mem.eql(u8, name, ":authority")) {
+        if (sb.host == null) sb.host = try allocator.dupe(u8, value);
+        return;
+    } else if (name.len > 0 and name[0] == ':') {
+        return;
+    }
+
+    if (std.ascii.eqlIgnoreCase(name, "host")) {
+        if (sb.host) |old| allocator.free(old);
+        sb.host = try allocator.dupe(u8, value);
+    } else if (std.ascii.eqlIgnoreCase(name, "origin")) {
+        if (sb.origin) |old| allocator.free(old);
+        sb.origin = try allocator.dupe(u8, value);
     } else if (std.ascii.eqlIgnoreCase(name, "content-type")) {
         if (sb.content_type) |old| allocator.free(old);
         sb.content_type = try allocator.dupe(u8, value);
@@ -600,6 +792,13 @@ fn applyHeader(allocator: Allocator, sb: *StreamBuf, name: []const u8, value: []
     } else if (std.ascii.eqlIgnoreCase(name, "if-none-match")) {
         if (sb.if_none_match) |old| allocator.free(old);
         sb.if_none_match = try allocator.dupe(u8, value);
+    }
+
+    if (sb.headers.items.len < 64) {
+        const hn = try allocator.dupe(u8, name);
+        errdefer allocator.free(hn);
+        const hv = try allocator.dupe(u8, value);
+        try sb.headers.append(allocator, .{ .name = hn, .value = hv });
     }
 }
 
@@ -626,7 +825,7 @@ fn decodeStr(allocator: Allocator, buf: []const u8, pos: *usize) ![]u8 {
     if (pos.* >= buf.len) return error.UnexpectedEof;
     const is_huffman = (buf[pos.*] & 0x80) != 0;
     const len = try decodeInt(buf, pos, 7);
-    if (pos.* + len > buf.len) return error.UnexpectedEof;
+    if (len > buf.len - pos.*) return error.UnexpectedEof;
     const slice = buf[pos.* .. pos.* + len];
     pos.* += len;
     if (!is_huffman) return try allocator.dupe(u8, slice);
@@ -746,6 +945,7 @@ pub fn decodeHuffman(allocator: Allocator, input: []const u8) ![]u8 {
             cur = next;
             const sym = HUFFMAN_TRIE[cur].sym;
             if (sym >= 0) {
+                if (out.items.len >= MAX_DECODED_HEADER_BYTES) return error.CompressionError;
                 try out.append(allocator, @intCast(sym));
                 cur = 0;
                 rem_bits = 0;
@@ -758,15 +958,13 @@ pub fn decodeHuffman(allocator: Allocator, input: []const u8) ![]u8 {
     return try out.toOwnedSlice(allocator);
 }
 
-test "http2: HPACK static/dynamic/Huffman decoding (RFC 7541 Appendix C.4.1)" {
+test "http2: HPACK static/dynamic/Huffman decoding + enforces dynamic table & size caps" {
     const allocator = std.testing.allocator;
-    // RFC 7541 C.4.1 Huffman-encoded "www.example.com" = f1e3 c2e5 f23a 6ba0 ab90 f4ff
     const huff_bytes = [_]u8{ 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff };
     const decoded = try decodeHuffman(allocator, &huff_bytes);
     defer allocator.free(decoded);
     try std.testing.expectEqualStrings("www.example.com", decoded);
 
-    // Decode indexed `:method: GET` (0x82) + `:path: /` (0x84) + `accept-encoding: gzip, deflate` (0x90)
     var dec = HpackDecoder.init(allocator);
     defer dec.deinit();
     var sb = StreamBuf{};
@@ -775,4 +973,9 @@ test "http2: HPACK static/dynamic/Huffman decoding (RFC 7541 Appendix C.4.1)" {
     try std.testing.expectEqualStrings("GET", sb.method.?);
     try std.testing.expectEqualStrings("/", sb.raw_path.?);
     try std.testing.expectEqualStrings("gzip, deflate", sb.accept_encoding.?);
+
+    // Reject dynamic table size update > 4096 (RFC 7541 §4.2)
+    var sb2 = StreamBuf{};
+    defer sb2.deinit(allocator);
+    try std.testing.expectError(error.CompressionError, dec.decodeBlock(&[_]u8{ 0x3f, 0xe2, 0x1f }, &sb2));
 }

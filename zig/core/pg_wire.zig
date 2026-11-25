@@ -105,6 +105,8 @@ pub const PgUrl = struct {
                     tls_mode = .verify_ca;
                 } else if (std.mem.eql(u8, mode, "verify-full")) {
                     tls_mode = .verify_full;
+                } else {
+                    return error.InvalidDatabaseUrl;
                 }
             }
         }
@@ -261,7 +263,7 @@ const PgConn = struct {
         var len_buf: [4]u8 = undefined;
         try r.readSliceAll(&len_buf);
         const total_len = std.mem.readInt(u32, &len_buf, .big);
-        if (total_len < 4) return error.InvalidPostgresFrame;
+        if (total_len < 4 or total_len > 64 * 1024 * 1024 + 4) return error.InvalidPostgresFrame;
         const payload_len = total_len - 4;
         const payload = try allocator.alloc(u8, payload_len);
         errdefer allocator.free(payload);
@@ -295,6 +297,9 @@ const PgConn = struct {
         try startup.appendSlice(self.allocator, "database\x00");
         try startup.appendSlice(self.allocator, url.database);
         try startup.append(self.allocator, 0);
+        // Force standard SQL string literal escaping and UTF-8 encoding so `quoteSql` is always safe.
+        try startup.appendSlice(self.allocator, "standard_conforming_strings\x00on\x00");
+        try startup.appendSlice(self.allocator, "client_encoding\x00UTF8\x00");
         try startup.append(self.allocator, 0); // terminator
 
         try self.sendMsg(null, startup.items);
@@ -304,6 +309,12 @@ const PgConn = struct {
         var scram_nonce: ?[]u8 = null;
         defer if (scram_nonce) |s| self.allocator.free(s);
         var scram_expected_server_sig: ?[32]u8 = null;
+        var scram_started = false;
+        var scram_verified = false;
+
+        const is_loopback = std.mem.eql(u8, url.host, "localhost") or
+            std.mem.eql(u8, url.host, "127.0.0.1") or
+            std.mem.eql(u8, url.host, "::1");
 
         while (true) {
             const msg = try self.readMsg(self.allocator);
@@ -314,9 +325,15 @@ const PgConn = struct {
                     if (msg.payload.len < 4) return error.PostgresAuthFailed;
                     const auth_type = std.mem.readInt(u32, msg.payload[0..4], .big);
                     switch (auth_type) {
-                        0 => {}, // AuthenticationOk
+                        0 => {
+                            // AuthenticationOk — if SCRAM was initiated, server MUST have proved its signature first.
+                            if (scram_started and !scram_verified) return error.PostgresAuthFailed;
+                        },
                         3 => {
-                            // CleartextPassword
+                            // CleartextPassword — refuse over unencrypted non-loopback links.
+                            if (url.tls_mode == .disable and !is_loopback) {
+                                return error.CleartextAuthRequiresTls;
+                            }
                             var p = try self.allocator.alloc(u8, url.password.len + 1);
                             defer self.allocator.free(p);
                             @memcpy(p[0..url.password.len], url.password);
@@ -349,6 +366,7 @@ const PgConn = struct {
                         },
                         10 => {
                             // AuthenticationSASL -> SCRAM-SHA-256
+                            scram_started = true;
                             var raw_nonce: [18]u8 = undefined;
                             self.io.random(&raw_nonce);
                             var nonce_buf: [24]u8 = undefined;
@@ -385,11 +403,15 @@ const PgConn = struct {
                             // AuthenticationSASLFinal — verify server signature in constant time (RFC 5802).
                             const expected = scram_expected_server_sig orelse return error.PostgresAuthFailed;
                             try verifyScramServerFinal(msg.payload[4..], expected);
+                            scram_verified = true;
                         },
                         else => return error.UnsupportedPostgresAuth,
                     }
                 },
-                'Z' => return, // ReadyForQuery
+                'Z' => {
+                    if (scram_started and !scram_verified) return error.PostgresAuthFailed;
+                    return; // ReadyForQuery
+                },
                 'E' => return error.PostgresAuthFailed,
                 'S', 'K', 'N' => {}, // ParameterStatus, BackendKeyData, NoticeResponse
                 else => {},
@@ -1356,13 +1378,183 @@ pub const PgStore = struct {
         }
         unreachable;
     }
+
+    /// Prune old `commit_log` rows for this deployment, retaining the most recent `keep_count`
+    /// commits (`commit_ts > latest_ts - keep_count`).
+    /// When `keep_count == 0` or `latest_ts <= keep_count`, this is a safe no-op returning 0.
+    pub fn pruneCommitLog(self: *PgStore, keep_count: usize) !usize {
+        if (keep_count == 0) return 0;
+        const latest_ts = try self.latestCommitTs();
+        const cutoff_ts = computePruneCutoff(latest_ts, keep_count) orelse return 0;
+
+        const sql = try std.fmt.allocPrint(
+            self.allocator,
+            "WITH deleted AS (DELETE FROM commit_log WHERE deployment_id = {s} AND commit_ts <= {d} RETURNING 1) SELECT COUNT(*) FROM deleted",
+            .{ self.quoted_deployment_id, cutoff_ts },
+        );
+        defer self.allocator.free(sql);
+
+        for (0..2) |attempt| {
+            const conn = try self.acquireConn();
+            var healthy = false;
+            defer self.releaseConn(conn, healthy);
+
+            const rows = conn.queryRows(self.allocator, sql) catch |err| {
+                if (attempt == 0) continue;
+                return err;
+            };
+            healthy = true;
+            defer {
+                for (rows) |*r| r.deinit(self.allocator);
+                self.allocator.free(rows);
+            }
+            if (rows.len == 0 or rows[0].cols.len == 0) return 0;
+            return std.fmt.parseInt(usize, rows[0].cols[0], 10) catch 0;
+        }
+        return 0;
+    }
+
+    /// Idempotently backfill secondary `index_entries` for every document in this deployment
+    /// whose table exists in `manifest`. Uses keyset pagination (`LIMIT 500`) ordered by
+    /// `(namespace, table_name, doc_id)` so large tables are never loaded into RAM at once.
+    /// Returns the total number of documents re-indexed.
+    pub fn backfillIndexes(self: *PgStore, manifest: *const manifest_mod.AppManifest) !usize {
+        const BATCH_SIZE: usize = 500;
+        const q_dep = self.quoted_deployment_id;
+
+        var last_ns: ?[]u8 = null;
+        defer if (last_ns) |s| self.allocator.free(s);
+        var last_tbl: ?[]u8 = null;
+        defer if (last_tbl) |s| self.allocator.free(s);
+        var last_id: ?[]u8 = null;
+        defer if (last_id) |s| self.allocator.free(s);
+
+        var total_reindexed: usize = 0;
+
+        while (true) {
+            const select_sql = try formatBackfillBatchSql(
+                self.allocator,
+                q_dep,
+                last_ns,
+                last_tbl,
+                last_id,
+                BATCH_SIZE,
+            );
+            defer self.allocator.free(select_sql);
+
+            const conn = try self.acquireConn();
+            var healthy = false;
+            defer self.releaseConn(conn, healthy);
+
+            const begin_sql = try std.fmt.allocPrint(
+                self.allocator,
+                "BEGIN; SELECT pg_advisory_xact_lock(hashtext({s}));",
+                .{q_dep},
+            );
+            defer self.allocator.free(begin_sql);
+            try conn.exec(begin_sql);
+            errdefer conn.exec("ROLLBACK") catch {};
+
+            const rows = try conn.queryRows(self.allocator, select_sql);
+            defer {
+                for (rows) |*r| r.deinit(self.allocator);
+                self.allocator.free(rows);
+            }
+
+            if (rows.len == 0) {
+                try conn.exec("COMMIT");
+                healthy = true;
+                break;
+            }
+
+            for (rows) |row| {
+                if (row.cols.len < 5) continue;
+                const ns = row.cols[0];
+                const tbl = row.cols[1];
+                const doc_id = row.cols[2];
+                if (manifest.findTable(ns, tbl) == null) continue;
+
+                const doc = Document{
+                    .id = doc_id,
+                    .creation_time_ms = std.fmt.parseInt(i64, row.cols[3], 10) catch 0,
+                    .body_json = row.cols[4],
+                };
+                var dummy_ws: readset_mod.WriteSet = .{};
+                defer dummy_ws.deinit(self.allocator);
+
+                try self.deletePgIndexes(conn, q_dep, ns, tbl, doc_id);
+                try self.insertPgIndexes(conn, manifest, q_dep, ns, tbl, &doc, self.allocator, &dummy_ws);
+                total_reindexed += 1;
+            }
+
+            try conn.exec("COMMIT");
+            healthy = true;
+
+            if (rows.len < BATCH_SIZE) break;
+
+            const last_row = rows[rows.len - 1];
+            if (last_row.cols.len < 3) break;
+            const next_ns = try self.allocator.dupe(u8, last_row.cols[0]);
+            errdefer self.allocator.free(next_ns);
+            const next_tbl = try self.allocator.dupe(u8, last_row.cols[1]);
+            errdefer self.allocator.free(next_tbl);
+            const next_id = try self.allocator.dupe(u8, last_row.cols[2]);
+
+            if (last_ns) |s| self.allocator.free(s);
+            if (last_tbl) |s| self.allocator.free(s);
+            if (last_id) |s| self.allocator.free(s);
+            last_ns = next_ns;
+            last_tbl = next_tbl;
+            last_id = next_id;
+        }
+
+        return total_reindexed;
+    }
 };
+
+fn computePruneCutoff(latest_ts: i64, keep_count: usize) ?i64 {
+    if (keep_count == 0 or latest_ts <= 0) return null;
+    const latest_u: u64 = @intCast(latest_ts);
+    const keep_u: u64 = @intCast(keep_count);
+    const diff = std.math.sub(u64, latest_u, keep_u) catch return null;
+    if (diff == 0) return null;
+    return @intCast(diff);
+}
+
+fn formatBackfillBatchSql(
+    allocator: Allocator,
+    q_dep: []const u8,
+    last_ns: ?[]const u8,
+    last_tbl: ?[]const u8,
+    last_id: ?[]const u8,
+    batch_size: usize,
+) ![]u8 {
+    if (last_ns != null and last_tbl != null and last_id != null) {
+        const q_ns = try quoteSql(allocator, last_ns.?);
+        defer allocator.free(q_ns);
+        const q_tbl = try quoteSql(allocator, last_tbl.?);
+        defer allocator.free(q_tbl);
+        const q_id = try quoteSql(allocator, last_id.?);
+        defer allocator.free(q_id);
+        return try std.fmt.allocPrint(
+            allocator,
+            "SELECT namespace, table_name, doc_id, creation_time_ms, body_json::text FROM documents WHERE deployment_id = {s} AND (namespace, table_name, doc_id) > ({s}, {s}, {s}) ORDER BY namespace ASC, table_name ASC, doc_id ASC LIMIT {d}",
+            .{ q_dep, q_ns, q_tbl, q_id, batch_size },
+        );
+    }
+    return try std.fmt.allocPrint(
+        allocator,
+        "SELECT namespace, table_name, doc_id, creation_time_ms, body_json::text FROM documents WHERE deployment_id = {s} ORDER BY namespace ASC, table_name ASC, doc_id ASC LIMIT {d}",
+        .{ q_dep, batch_size },
+    );
+}
 
 fn quoteSql(allocator: Allocator, s: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.append(allocator, '\'');
     for (s) |c| {
+        if (c == 0) return storage_mod.StorageError.InvalidKey;
         if (c == '\'') {
             try out.appendSlice(allocator, "''");
         } else {
@@ -1477,4 +1669,29 @@ test "pg url parser handles Neon and PlanetScale connection strings" {
     try std.testing.expectEqual(@as(u16, 5432), url.port);
     try std.testing.expectEqualStrings("neondb", url.database);
     try std.testing.expect(url.use_tls);
+}
+
+test "pg pruneCommitLog cutoff math clamps cleanly without underflow" {
+    _ = &PgStore.pruneCommitLog;
+    _ = &PgStore.backfillIndexes;
+    try std.testing.expectEqual(@as(?i64, null), computePruneCutoff(0, 100));
+    try std.testing.expectEqual(@as(?i64, null), computePruneCutoff(100, 0));
+    try std.testing.expectEqual(@as(?i64, null), computePruneCutoff(50, 50));
+    try std.testing.expectEqual(@as(?i64, null), computePruneCutoff(50, 100));
+    try std.testing.expectEqual(@as(?i64, null), computePruneCutoff(50, std.math.maxInt(usize)));
+    try std.testing.expectEqual(@as(?i64, 70), computePruneCutoff(100, 30));
+    try std.testing.expectEqual(@as(?i64, 1), computePruneCutoff(2, 1));
+}
+
+test "pg backfillIndexes keyset pagination SQL escapes cursor values" {
+    const allocator = std.testing.allocator;
+
+    const first = try formatBackfillBatchSql(allocator, "'prod'", null, null, null, 500);
+    defer allocator.free(first);
+    try std.testing.expect(std.mem.indexOf(u8, first, "WHERE deployment_id = 'prod' ORDER BY namespace ASC, table_name ASC, doc_id ASC LIMIT 500") != null);
+
+    const next = try formatBackfillBatchSql(allocator, "'prod'", "", "o'reilly", "doc_500", 500);
+    defer allocator.free(next);
+    try std.testing.expect(std.mem.indexOf(u8, next, "AND (namespace, table_name, doc_id) > ('', 'o''reilly', 'doc_500')") != null);
+    try std.testing.expect(std.mem.indexOf(u8, next, "LIMIT 500") != null);
 }

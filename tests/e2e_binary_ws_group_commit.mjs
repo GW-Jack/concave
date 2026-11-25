@@ -21,7 +21,12 @@ async function startServer() {
     '--static-dir', 'examples/chat-app/frontend',
   ], {
     cwd: ROOT,
-    env: { ...process.env, CONCAVE_COMMIT_POLL_MS: '0', CONCAVE_SCHEDULER_POLL_MS: '0' },
+    env: {
+      ...process.env,
+      CONCAVE_COMMIT_POLL_MS: '0',
+      CONCAVE_SCHEDULER_POLL_MS: '0',
+      CONCAVE_ALLOW_DEV_TOKENS: 'true',
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   for (let i = 0; i < 100; i++) {

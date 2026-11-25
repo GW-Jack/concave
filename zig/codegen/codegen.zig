@@ -1,11 +1,38 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const manifest_mod = @import("../core/manifest.zig");
+const storage_mod = @import("../core/storage.zig");
 
 const AppManifest = manifest_mod.AppManifest;
 const FunctionSpec = manifest_mod.FunctionSpec;
 const SchemaType = manifest_mod.SchemaType;
 const TableSpec = manifest_mod.TableSpec;
+
+fn isSafeJsIdent(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (std.mem.eql(u8, s, "__proto__") or
+        std.mem.eql(u8, s, "constructor") or
+        std.mem.eql(u8, s, "prototype"))
+    {
+        return false;
+    }
+    const c0 = s[0];
+    if (!((c0 >= 'a' and c0 <= 'z') or (c0 >= 'A' and c0 <= 'Z') or c0 == '_' or c0 == '$')) return false;
+    for (s[1..]) |c| {
+        if (!((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '$')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn writePropKey(w: *std.Io.Writer, key: []const u8) !void {
+    if (isSafeJsIdent(key)) {
+        try w.writeAll(key);
+    } else {
+        try storage_mod.writeJsonString(w, key);
+    }
+}
 
 /// Zero-dependency codegen emitting browser-native ESM (`api.js`) + full TypeScript declarations
 /// (`api.d.ts`, `dataModel.d.ts`) directly from `--introspect` JSON IR.
@@ -75,7 +102,9 @@ pub fn generateDataModelDts(allocator: Allocator, manifest: *const AppManifest) 
         defer allocator.free(type_name);
 
         try w.print("export interface {s} {{\n", .{type_name});
-        try w.print("  id: Id<\"{s}\">;\n", .{qual});
+        try w.writeAll("  id: Id<");
+        try storage_mod.writeJsonString(w, qual);
+        try w.writeAll(">;\n");
         try w.writeAll("  created_at: number;\n");
 
         switch (entry.spec.document_schema) {
@@ -86,7 +115,9 @@ pub fn generateDataModelDts(allocator: Allocator, manifest: *const AppManifest) 
                         std.mem.eql(u8, f.name, "_id") or
                         std.mem.eql(u8, f.name, "_creationTime")) continue;
                     const opt: []const u8 = if (f.optional) "?" else "";
-                    try w.print("  {s}{s}: ", .{ f.name, opt });
+                    try w.writeAll("  ");
+                    try writePropKey(w, f.name);
+                    try w.print("{s}: ", .{opt});
                     try writeSchemaTs(w, allocator, f.schema);
                     try w.writeAll(";\n");
                 }
@@ -108,7 +139,7 @@ pub fn generateDataModelDts(allocator: Allocator, manifest: *const AppManifest) 
             if (i > 0) try w.writeAll(" | ");
             const qual = try qualifiedTableKey(allocator, entry.ns, entry.spec.name);
             defer allocator.free(qual);
-            try w.print("\"{s}\"", .{qual});
+            try storage_mod.writeJsonString(w, qual);
         }
         try w.writeAll(";\n\nexport interface DataModel {\n");
         for (all_tables.items) |entry| {
@@ -116,7 +147,9 @@ pub fn generateDataModelDts(allocator: Allocator, manifest: *const AppManifest) 
             defer allocator.free(qual);
             const type_name = try tableDocTypeName(allocator, entry.ns, entry.spec.name);
             defer allocator.free(type_name);
-            try w.print("  \"{s}\": {s};\n", .{ qual, type_name });
+            try w.writeAll("  ");
+            try storage_mod.writeJsonString(w, qual);
+            try w.print(": {s};\n", .{type_name});
         }
         try w.writeAll("}\n");
     }
@@ -132,6 +165,7 @@ const ApiNode = struct {
         var cur = self;
         var it = std.mem.splitScalar(u8, name, '.');
         while (it.next()) |seg| {
+            if (!isSafeJsIdent(seg)) return error.InvalidIdentifier;
             if (cur.children.get(seg)) |existing| {
                 cur = existing;
             } else {
@@ -157,7 +191,9 @@ const ApiNode = struct {
         var it = self.children.iterator();
         while (it.next()) |entry| {
             try writeIndent(w, indent + 1);
-            try w.print("readonly {s}: ", .{entry.key_ptr.*});
+            try w.writeAll("readonly ");
+            try writePropKey(w, entry.key_ptr.*);
+            try w.writeAll(": ");
             try entry.value_ptr.*.renderDts(w, allocator, indent + 1);
             try w.writeAll(";\n");
         }
@@ -167,14 +203,19 @@ const ApiNode = struct {
 
     fn renderJs(self: *const ApiNode, w: *std.Io.Writer, indent: usize) !void {
         if (self.leaf) |func| {
-            try w.print("makeRef(\"{s}\", \"{s}\")", .{ func.kind.toStr(), func.name });
+            try w.writeAll("makeRef(");
+            try storage_mod.writeJsonString(w, func.kind.toStr());
+            try w.writeAll(", ");
+            try storage_mod.writeJsonString(w, func.name);
+            try w.writeByte(')');
             return;
         }
         try w.writeAll("{\n");
         var it = self.children.iterator();
         while (it.next()) |entry| {
             try writeIndent(w, indent + 1);
-            try w.print("{s}: ", .{entry.key_ptr.*});
+            try writePropKey(w, entry.key_ptr.*);
+            try w.writeAll(": ");
             if (entry.value_ptr.*.leaf != null) {
                 try entry.value_ptr.*.renderJs(w, indent + 1);
             } else {
@@ -194,6 +235,7 @@ pub fn generateApiDts(allocator: Allocator, manifest: *const AppManifest) ![]u8 
     defer arena.deinit();
     var root: ApiNode = .{};
     for (manifest.functions) |*f| {
+        if (f.visibility == .internal) continue;
         try root.insert(arena.allocator(), f.name, f);
     }
 
@@ -325,6 +367,7 @@ pub fn generateApiJs(allocator: Allocator, manifest: *const AppManifest) ![]u8 {
     defer arena.deinit();
     var root: ApiNode = .{};
     for (manifest.functions) |*f| {
+        if (f.visibility == .internal) continue;
         try root.insert(arena.allocator(), f.name, f);
     }
 
@@ -359,7 +402,7 @@ pub fn generateApiJs(allocator: Allocator, manifest: *const AppManifest) ![]u8 {
         \\    }
         \\    return fn;
         \\  }
-        \\  const out = {};
+        \\  const out = Object.create(null);
         \\  for (const key of Object.keys(node)) {
         \\    out[key] = bindNode(node[key], client);
         \\  }
@@ -384,7 +427,9 @@ fn writeSchemaTs(w: *std.Io.Writer, allocator: Allocator, schema: SchemaType) !v
         .id_t => |id_s| {
             const qual = try qualifiedTableKey(allocator, id_s.namespace, id_s.table);
             defer allocator.free(qual);
-            try w.print("Id<\"{s}\">", .{qual});
+            try w.writeAll("Id<");
+            try storage_mod.writeJsonString(w, qual);
+            try w.writeByte('>');
         },
         .list_t => |item| {
             try w.writeAll("Array<");
@@ -405,7 +450,8 @@ fn writeSchemaTs(w: *std.Io.Writer, allocator: Allocator, schema: SchemaType) !v
             for (fields, 0..) |f, i| {
                 if (i > 0) try w.writeAll("; ");
                 const opt: []const u8 = if (f.optional) "?" else "";
-                try w.print("{s}{s}: ", .{ f.name, opt });
+                try writePropKey(w, f.name);
+                try w.print("{s}: ", .{opt});
                 try writeSchemaTs(w, allocator, f.schema);
             }
             try w.writeAll(" }");
@@ -419,11 +465,15 @@ fn writeSchemaTs(w: *std.Io.Writer, allocator: Allocator, schema: SchemaType) !v
             for (variants, 0..) |v, i| {
                 if (i > 0) try w.writeAll(" | ");
                 if (v.payload) |p| {
-                    try w.print("{{ tag: \"{s}\"; value: ", .{v.tag});
+                    try w.writeAll("{ tag: ");
+                    try storage_mod.writeJsonString(w, v.tag);
+                    try w.writeAll("; value: ");
                     try writeSchemaTs(w, allocator, p.*);
                     try w.writeAll(" }");
                 } else {
-                    try w.print("{{ tag: \"{s}\" }}", .{v.tag});
+                    try w.writeAll("{ tag: ");
+                    try storage_mod.writeJsonString(w, v.tag);
+                    try w.writeAll(" }");
                 }
             }
             try w.writeByte(')');

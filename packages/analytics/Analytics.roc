@@ -208,6 +208,7 @@ Analytics := [Analytics].{
     Mount : {
         namespace : Str,
         require_auth_for_admin : Bool,
+        admin_roles : List(Str),
         max_batch_size : I64,
         spec : Component.ComponentSpec,
     }
@@ -580,11 +581,11 @@ Analytics := [Analytics].{
 
     default_config : Config
     default_config = {
-        require_auth_for_admin: False,
+        require_auth_for_admin: True,
         max_batch_size: 100,
     }
 
-    ## Mount an isolated PostHog-style Analytics component under `namespace` with default config.
+    ## Mount an isolated PostHog-style Analytics component under `namespace` with secure defaults.
     mount : Str -> Mount
     mount = |namespace| mount_with(namespace, default_config)
 
@@ -593,7 +594,8 @@ Analytics := [Analytics].{
     mount_with = |namespace, cfg| {
         namespace,
         require_auth_for_admin: cfg.require_auth_for_admin,
-        max_batch_size: if cfg.max_batch_size <= 0 { 100 } else { cfg.max_batch_size },
+        admin_roles: ["admin"],
+        max_batch_size: if cfg.max_batch_size <= 0 { 100 } else if cfg.max_batch_size > 500 { 500 } else { cfg.max_batch_size },
         spec: Component.define(
             namespace,
             "concave-analytics",
@@ -606,9 +608,63 @@ Analytics := [Analytics].{
         ),
     }
 
+    ## Override the roles permitted to access Analytics admin/BI endpoints (default: `["admin"]`; empty allows any authenticated user).
+    with_admin_roles : Mount, List(Str) -> Mount
+    with_admin_roles = |m, roles| {
+        namespace: m.namespace,
+        require_auth_for_admin: m.require_auth_for_admin,
+        admin_roles: roles,
+        max_batch_size: m.max_batch_size,
+        spec: m.spec,
+    }
+
     # -------------------------------------------------------------------------
     # Internal Helpers
     # -------------------------------------------------------------------------
+
+    is_admin_identity : Ctx.AuthIdentity, List(Str) -> Bool
+    is_admin_identity = |id, admin_roles|
+        if List.is_empty(admin_roles) {
+            True
+        } else {
+            Ctx.has_any_role(id, admin_roles)
+        }
+
+    require_admin_if_needed! : Bool, List(Str), (() => Try(Ctx.AuthIdentity, [Unauthenticated])) => Try({}, Str)
+    require_admin_if_needed! = |req_auth, admin_roles, auth!|
+        if req_auth {
+            id = Ctx.require_auth!(auth!)?
+            if is_admin_identity(id, admin_roles) {
+                Ok({})
+            } else {
+                Err("Forbidden: admin role required")
+            }
+        } else {
+            Ok({})
+        }
+
+    clamp_props : List(Props.Prop) -> List(Props.Prop)
+    clamp_props = |items| Insights.take_i64(items, 64)
+
+    clamp_event_ts : I64, I64, Bool -> I64
+    clamp_event_ts = |raw_ts, now, allow_historical| {
+        if raw_ts <= 0 {
+            return now
+        }
+        max_future = now + 300000 # 5 minutes
+        if raw_ts > max_future {
+            return now
+        }
+        if allow_historical {
+            return raw_ts
+        }
+        max_past = now - 31536000000 # 365 days
+        if raw_ts < max_past {
+            now
+        } else {
+            raw_ts
+        }
+    }
 
     clamp_limit_u64 : I64, I64, I64 -> U64
     clamp_limit_u64 = |raw, default_val, max_val| {
@@ -660,16 +716,26 @@ Analytics := [Analytics].{
         Ok($cur)
     }
 
-    resolve_caller_distinct_id! : (() => Try(Ctx.AuthIdentity, [Unauthenticated])), Str => Try(Str, Str)
-    resolve_caller_distinct_id! = |auth!, provided| {
+    ## Resolve the caller's distinct_id safely:
+    ## - When authenticated and NOT an admin, bind strictly to `id.subject` (prevents cross-user spoofing).
+    ## - When authenticated as an admin (or when `require_auth_for_admin` is False and unauthenticated),
+    ##   allow explicit `provided` distinct_id.
+    resolve_caller_distinct_id! : List(Str), (() => Try(Ctx.AuthIdentity, [Unauthenticated])), Str => Try(Str, Str)
+    resolve_caller_distinct_id! = |admin_roles, auth!, provided| {
         trimmed = Str.trim(provided)
-        if !Str.is_empty(trimmed) {
-            Ok(trimmed)
-        } else {
-            match auth!() {
-                Ok(id) => Ok(id.subject)
-                Err(Unauthenticated) => Err("distinct_id is required when unauthenticated")
-            }
+        match auth!() {
+            Ok(id) =>
+                if is_admin_identity(id, admin_roles) and !Str.is_empty(trimmed) {
+                    Ok(trimmed)
+                } else {
+                    Ok(id.subject)
+                }
+            Err(Unauthenticated) =>
+                if !Str.is_empty(trimmed) {
+                    Ok(trimmed)
+                } else {
+                    Err("distinct_id is required when unauthenticated")
+                }
         }
     }
 
@@ -700,7 +766,7 @@ Analytics := [Analytics].{
 
     load_aliases! : Ctx.DbReader => Try(List(Insights.AliasEntry), Str)
     load_aliases! = |db| {
-        docs = Db.query(aliases_table) |> Db.asc() |> Db.collect!(db)?
+        docs = Db.query(aliases_table) |> Db.asc() |> Db.take(2000) |> Db.collect!(db)?
         Ok(docs |> List.map(|d| { alias_id: d.alias_id, distinct_id: d.distinct_id }))
     }
 
@@ -761,19 +827,28 @@ Analytics := [Analytics].{
     # -------------------------------------------------------------------------
 
     ## Capture a single product event and update the canonical person's activity counters.
-    capture! : Ctx.MutationCtx, CaptureArgs => Try(Str, Str)
-    capture! = |ctx, args| {
+    capture! : List(Str), Ctx.MutationCtx, CaptureArgs => Try(Str, Str)
+    capture! = |admin_roles, ctx, args| {
         event_name = Str.trim(args.event)
         if Str.is_empty(event_name) {
             return Err("Event name cannot be empty")
         }
+        if Str.count_utf8_bytes(event_name) > 256 {
+            return Err("Event name exceeds maximum length")
+        }
 
-        raw_id = resolve_caller_distinct_id!(ctx.auth!, args.distinct_id)?
+        auth! = ctx.auth!
+        caller_is_admin = match auth!() {
+            Ok(id) => is_admin_identity(id, admin_roles)
+            Err(Unauthenticated) => False
+        }
+        raw_id = resolve_caller_distinct_id!(admin_roles, ctx.auth!, args.distinct_id)?
         reader = Ctx.as_reader(ctx.db)
         canonical_id = resolve_distinct_id_db!(reader, raw_id)?
 
         now_ms! = ctx.now_ms!
-        ts = if args.timestamp_ms > 0 { args.timestamp_ms } else { now_ms!() }
+        now = now_ms!()
+        ts = clamp_event_ts(args.timestamp_ms, now, caller_is_admin)
 
         event_id = Db.insert!(ctx.db, events_table, {
             distinct_id: canonical_id,
@@ -782,7 +857,7 @@ Analytics := [Analytics].{
             session_id: Str.trim(args.session_id),
             group_type: Str.trim(args.group_type),
             group_key: Str.trim(args.group_key),
-            properties: args.properties,
+            properties: clamp_props(args.properties),
         })?
 
         # Keep canonical person profile up to date in the same ACID transaction.
@@ -818,15 +893,15 @@ Analytics := [Analytics].{
     }
 
     ## Atomically capture a batch of events (PostHog `/batch/` equivalent).
-    capture_batch! : I64, Ctx.MutationCtx, CaptureBatchArgs => Try(CaptureBatchResult, Str)
-    capture_batch! = |max_batch, ctx, args| {
+    capture_batch! : List(Str), I64, Ctx.MutationCtx, CaptureBatchArgs => Try(CaptureBatchResult, Str)
+    capture_batch! = |admin_roles, max_batch, ctx, args| {
         count = Insights.list_len_i64(args.events)
         if count > max_batch {
             return Err("Batch size ${count.to_str()} exceeds max_batch_size (${max_batch.to_str()})")
         }
         var $ids = []
         for ev in args.events {
-            ev_id = capture!(ctx, ev)?
+            ev_id = capture!(admin_roles, ctx, ev)?
             $ids = List.append($ids, ev_id)
         }
         Ok({
@@ -837,13 +912,26 @@ Analytics := [Analytics].{
 
     ## PostHog `identify`: link optional `anon_id` -> `distinct_id`, merge anonymous person profile,
     ## and apply `$set` (overwrite) and `$set_once` (initial-only) person properties.
-    ## Enforces forest acyclicity, root-only person rows, and event-count conservation.
-    identify! : Ctx.MutationCtx, IdentifyArgs => Try(PersonProfile, Str)
-    identify! = |ctx, args| {
-        raw_distinct_id = Str.trim(args.distinct_id)
-        if Str.is_empty(raw_distinct_id) {
-            return Err("distinct_id cannot be empty")
-        }
+    ## Enforces authentication (when `req_auth` is True), caller-identity binding, forest acyclicity,
+    ## root-only person rows, and event-count conservation.
+    identify! : Bool, List(Str), Ctx.MutationCtx, IdentifyArgs => Try(PersonProfile, Str)
+    identify! = |req_auth, admin_roles, ctx, args| {
+        raw_distinct_id =
+            if req_auth {
+                user = Ctx.require_auth!(ctx.auth!)?
+                trimmed = Str.trim(args.distinct_id)
+                if is_admin_identity(user, admin_roles) and !Str.is_empty(trimmed) {
+                    trimmed
+                } else {
+                    user.subject
+                }
+            } else {
+                trimmed = Str.trim(args.distinct_id)
+                if Str.is_empty(trimmed) {
+                    return Err("distinct_id cannot be empty")
+                }
+                trimmed
+            }
         anon_id = Str.trim(args.anon_id)
         reader = Ctx.as_reader(ctx.db)
         now_ms! = ctx.now_ms!
@@ -892,12 +980,16 @@ Analytics := [Analytics].{
             |> Db.eq([Key.str(canonical_id)])
             |> Db.first!(reader)?
 
+        set_once_clamped = clamp_props(args.set_once)
+        set_clamped = clamp_props(args.set)
+
         final_person = match existing_canon {
             NotFound => {
                 merged =
                     $anon_props
-                    |> Props.merge_set_once(args.set_once)
-                    |> Props.merge_set(args.set)
+                    |> Props.merge_set_once(set_once_clamped)
+                    |> Props.merge_set(set_clamped)
+                    |> clamp_props
                 first_ms = if $anon_has_seen { $anon_first } else { now }
                 last_ms = if $anon_has_seen and $anon_last > now { $anon_last } else { now }
                 _ = Db.insert!(ctx.db, persons_table, {
@@ -919,8 +1011,9 @@ Analytics := [Analytics].{
                 base_props = Props.merge_set($anon_props, cp.properties)
                 merged =
                     base_props
-                    |> Props.merge_set_once(args.set_once)
-                    |> Props.merge_set(args.set)
+                    |> Props.merge_set_once(set_once_clamped)
+                    |> Props.merge_set(set_clamped)
+                    |> clamp_props
                 first_ms =
                     if $anon_has_seen and $anon_first < cp.first_seen_ms {
                         $anon_first
@@ -964,10 +1057,10 @@ Analytics := [Analytics].{
     }
 
     ## Explicitly alias `alias_id` -> `distinct_id`.
-    ## Enforces strict forest acyclicity, rejects re-aliasing an already-bound ID to a different root,
-    ## and merges any existing `persons` row for `alias_id` into `canonical_target` to preserve event conservation.
-    alias! : Ctx.MutationCtx, AliasArgs => Try(Bool, Str)
-    alias! = |ctx, args| {
+    ## Requires admin auth (when `req_auth` is True) to prevent cross-account identity hijacking.
+    alias! : Bool, List(Str), Ctx.MutationCtx, AliasArgs => Try(Bool, Str)
+    alias! = |req_auth, admin_roles, ctx, args| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         alias_id = Str.trim(args.alias_id)
         distinct_id = Str.trim(args.distinct_id)
         if Str.is_empty(alias_id) or Str.is_empty(distinct_id) {
@@ -1019,7 +1112,7 @@ Analytics := [Analytics].{
                         })?
                     }
                     Found(dp) => {
-                        merged_props = Props.merge_set(sp.properties, dp.properties)
+                        merged_props = Props.merge_set(sp.properties, dp.properties) |> clamp_props
                         first_ms = if sp.first_seen_ms < dp.first_seen_ms { sp.first_seen_ms } else { dp.first_seen_ms }
                         last_ms = if sp.last_seen_ms > dp.last_seen_ms { sp.last_seen_ms } else { dp.last_seen_ms }
                         Db.patch!(ctx.db, persons_table, dp.id, {
@@ -1037,11 +1130,9 @@ Analytics := [Analytics].{
     }
 
     ## Create or update a Feature Flag / A/B Experiment definition.
-    upsert_flag! : Bool, Ctx.MutationCtx, UpsertFlagArgs => Try(Str, Str)
-    upsert_flag! = |require_auth, ctx, args| {
-        if require_auth {
-            _ = Ctx.require_auth!(ctx.auth!)?
-        }
+    upsert_flag! : Bool, List(Str), Ctx.MutationCtx, UpsertFlagArgs => Try(Str, Str)
+    upsert_flag! = |require_auth, admin_roles, ctx, args| {
+        _ = require_admin_if_needed!(require_auth, admin_roles, ctx.auth!)?
         key = Str.trim(args.key)
         rule : Flags.FlagRule
         rule = {
@@ -1088,11 +1179,9 @@ Analytics := [Analytics].{
     }
 
     ## Delete a Feature Flag by `key`.
-    delete_flag! : Bool, Ctx.MutationCtx, DeleteFlagArgs => Try(Bool, Str)
-    delete_flag! = |require_auth, ctx, args| {
-        if require_auth {
-            _ = Ctx.require_auth!(ctx.auth!)?
-        }
+    delete_flag! : Bool, List(Str), Ctx.MutationCtx, DeleteFlagArgs => Try(Bool, Str)
+    delete_flag! = |require_auth, admin_roles, ctx, args| {
+        _ = require_admin_if_needed!(require_auth, admin_roles, ctx.auth!)?
         key = Str.trim(args.key)
         existing =
             Db.from_index(flags_by_key)
@@ -1109,16 +1198,16 @@ Analytics := [Analytics].{
     }
 
     ## Evaluate a flag AND atomically record a `$feature_flag_called` exposure event for experiment analysis.
-    evaluate_flag_and_track! : Ctx.MutationCtx, EvaluateFlagAndTrackArgs => Try(Flags.Evaluation, Str)
-    evaluate_flag_and_track! = |ctx, args| {
-        eval = evaluate_flag!(Ctx.as_query_ctx(ctx), {
+    evaluate_flag_and_track! : List(Str), Ctx.MutationCtx, EvaluateFlagAndTrackArgs => Try(Flags.Evaluation, Str)
+    evaluate_flag_and_track! = |admin_roles, ctx, args| {
+        eval = evaluate_flag!(admin_roles, Ctx.as_query_ctx(ctx), {
             key: args.key,
             distinct_id: args.distinct_id,
             override_properties: args.override_properties,
         })?
 
         enabled_str = if eval.enabled { "true" } else { "false" }
-        _ = capture!(ctx, {
+        _ = capture!(admin_roles, ctx, {
             distinct_id: args.distinct_id,
             event: "$feature_flag_called",
             properties: [
@@ -1140,9 +1229,10 @@ Analytics := [Analytics].{
     # Core Reactive Queries (Scoped to Component Namespace)
     # -------------------------------------------------------------------------
 
-    ## Stream the most recent captured events (optionally filtered to a single `event` name for surgical reactivity).
-    recent_events! : Ctx.QueryCtx, RecentEventsArgs => Try(List(EventDoc), Str)
-    recent_events! = |ctx, args| {
+    ## Stream the most recent captured events (admin-gated when `req_auth` is True).
+    recent_events! : Bool, List(Str), Ctx.QueryCtx, RecentEventsArgs => Try(List(EventDoc), Str)
+    recent_events! = |req_auth, admin_roles, ctx, args| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         lim = clamp_limit_u64(args.limit, 50, 500)
         ev_filter = Str.trim(args.event)
         if Str.is_empty(ev_filter) {
@@ -1160,11 +1250,19 @@ Analytics := [Analytics].{
     }
 
     ## Fetch a person's unified event timeline across their canonical ID and all linked aliases.
-    person_events! : Ctx.QueryCtx, PersonEventsArgs => Try(List(EventDoc), Str)
-    person_events! = |ctx, args| {
+    ## When `req_auth` is True, requires caller to be an admin or querying their own canonical ID.
+    person_events! : Bool, List(Str), Ctx.QueryCtx, PersonEventsArgs => Try(List(EventDoc), Str)
+    person_events! = |req_auth, admin_roles, ctx, args| {
         lim_i64 = if args.limit <= 0 { 50 } else if args.limit > 500 { 500 } else { args.limit }
         lim_u64 = clamp_limit_u64(lim_i64, 50, 500)
         canonical_id = resolve_distinct_id_db!(ctx.db, Str.trim(args.distinct_id))?
+        if req_auth {
+            user = Ctx.require_auth!(ctx.auth!)?
+            user_canon = resolve_distinct_id_db!(ctx.db, user.subject)?
+            if !is_admin_identity(user, admin_roles) and canonical_id != user_canon {
+                return Err("Forbidden: cannot access another person's events")
+            }
+        }
 
         alias_ids = collect_linked_aliases!(ctx.db, canonical_id)?
 
@@ -1187,9 +1285,10 @@ Analytics := [Analytics].{
         Ok($all_events |> sort_events_desc |> take_events(lim_i64))
     }
 
-    ## Fetch all events for a session in chronological order.
-    session_events! : Ctx.QueryCtx, SessionEventsArgs => Try(List(EventDoc), Str)
-    session_events! = |ctx, args| {
+    ## Fetch all events for a session in chronological order (admin-gated when `req_auth` is True).
+    session_events! : Bool, List(Str), Ctx.QueryCtx, SessionEventsArgs => Try(List(EventDoc), Str)
+    session_events! = |req_auth, admin_roles, ctx, args| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         lim = clamp_limit_u64(args.limit, 100, 500)
         Db.from_index(events_by_session_time)
         |> Db.eq([Key.str(Str.trim(args.session_id))])
@@ -1198,9 +1297,10 @@ Analytics := [Analytics].{
         |> Db.collect!(ctx.db)
     }
 
-    ## Fetch recent events for a B2B group (`group_type`, `group_key`).
-    group_events! : Ctx.QueryCtx, GroupEventsArgs => Try(List(EventDoc), Str)
-    group_events! = |ctx, args| {
+    ## Fetch recent events for a B2B group (`group_type`, `group_key`) (admin-gated when `req_auth` is True).
+    group_events! : Bool, List(Str), Ctx.QueryCtx, GroupEventsArgs => Try(List(EventDoc), Str)
+    group_events! = |req_auth, admin_roles, ctx, args| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         lim = clamp_limit_u64(args.limit, 100, 500)
         Db.from_index(events_by_group_time)
         |> Db.eq([Key.str(Str.trim(args.group_type)), Key.str(Str.trim(args.group_key))])
@@ -1209,10 +1309,17 @@ Analytics := [Analytics].{
         |> Db.collect!(ctx.db)
     }
 
-    ## Look up a person's profile (resolving aliases automatically).
-    get_person! : Ctx.QueryCtx, GetPersonArgs => Try(PersonProfile, Str)
-    get_person! = |ctx, args| {
+    ## Look up a person's profile (admin or self-only when `req_auth` is True).
+    get_person! : Bool, List(Str), Ctx.QueryCtx, GetPersonArgs => Try(PersonProfile, Str)
+    get_person! = |req_auth, admin_roles, ctx, args| {
         canonical_id = resolve_distinct_id_db!(ctx.db, Str.trim(args.distinct_id))?
+        if req_auth {
+            user = Ctx.require_auth!(ctx.auth!)?
+            user_canon = resolve_distinct_id_db!(ctx.db, user.subject)?
+            if !is_admin_identity(user, admin_roles) and canonical_id != user_canon {
+                return Err("Forbidden: cannot access another person's profile")
+            }
+        }
         person_lookup =
             Db.from_index(persons_by_distinct_id)
             |> Db.eq([Key.str(canonical_id)])
@@ -1244,9 +1351,10 @@ Analytics := [Analytics].{
         }
     }
 
-    ## List most recently active persons.
-    list_persons! : Ctx.QueryCtx, ListPersonsArgs => Try(List(PersonDoc), Str)
-    list_persons! = |ctx, args| {
+    ## List most recently active persons (admin-gated when `req_auth` is True).
+    list_persons! : Bool, List(Str), Ctx.QueryCtx, ListPersonsArgs => Try(List(PersonDoc), Str)
+    list_persons! = |req_auth, admin_roles, ctx, args| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         lim = clamp_limit_u64(args.limit, 50, 500)
         Db.from_index(persons_by_last_seen)
         |> Db.desc()
@@ -1254,18 +1362,23 @@ Analytics := [Analytics].{
         |> Db.collect!(ctx.db)
     }
 
-    ## List all configured feature flags and experiments.
-    list_flags! : Ctx.QueryCtx, {} => Try(List(FeatureFlagDoc), Str)
-    list_flags! = |ctx, _|
+    ## List all configured feature flags and experiments (admin-gated when `req_auth` is True).
+    list_flags! : Bool, List(Str), Ctx.QueryCtx, {} => Try(List(FeatureFlagDoc), Str)
+    list_flags! = |req_auth, admin_roles, ctx, _| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         Db.from_index(flags_by_key)
         |> Db.asc()
+        |> Db.take(500)
         |> Db.collect!(ctx.db)
+    }
 
-    ## Evaluate a single feature flag for `distinct_id` (merging stored person properties + caller overrides).
-    evaluate_flag! : Ctx.QueryCtx, EvaluateFlagArgs => Try(Flags.Evaluation, Str)
-    evaluate_flag! = |ctx, args| {
+    ## Evaluate a single feature flag for `distinct_id`.
+    ## Server-stored person properties take precedence over caller-supplied `override_properties`
+    ## so untrusted clients cannot spoof premium/plan targeting rules.
+    evaluate_flag! : List(Str), Ctx.QueryCtx, EvaluateFlagArgs => Try(Flags.Evaluation, Str)
+    evaluate_flag! = |admin_roles, ctx, args| {
         key = Str.trim(args.key)
-        raw_id = resolve_caller_distinct_id!(ctx.auth!, args.distinct_id)?
+        raw_id = resolve_caller_distinct_id!(admin_roles, ctx.auth!, args.distinct_id)?
         canonical_id = resolve_distinct_id_db!(ctx.db, raw_id)?
 
         flag_lookup =
@@ -1291,16 +1404,16 @@ Analytics := [Analytics].{
                     NotFound => []
                     Found(p) => p.properties
                 }
-                effective_props = Props.merge_set(stored_props, args.override_properties)
+                effective_props = Props.merge_set(clamp_props(args.override_properties), stored_props)
                 Ok(Flags.evaluate(flag_doc_to_rule(flag_doc), canonical_id, effective_props))
             }
         }
     }
 
     ## Evaluate all feature flags for `distinct_id` (reactive PostHog `/decide` equivalent).
-    evaluate_all_flags! : Ctx.QueryCtx, EvaluateAllFlagsArgs => Try(List(Flags.Evaluation), Str)
-    evaluate_all_flags! = |ctx, args| {
-        raw_id = resolve_caller_distinct_id!(ctx.auth!, args.distinct_id)?
+    evaluate_all_flags! : List(Str), Ctx.QueryCtx, EvaluateAllFlagsArgs => Try(List(Flags.Evaluation), Str)
+    evaluate_all_flags! = |admin_roles, ctx, args| {
+        raw_id = resolve_caller_distinct_id!(admin_roles, ctx.auth!, args.distinct_id)?
         canonical_id = resolve_distinct_id_db!(ctx.db, raw_id)?
 
         person_lookup =
@@ -1312,49 +1425,50 @@ Analytics := [Analytics].{
             NotFound => []
             Found(p) => p.properties
         }
-        effective_props = Props.merge_set(stored_props, args.override_properties)
+        effective_props = Props.merge_set(clamp_props(args.override_properties), stored_props)
 
-        all_flags = Db.from_index(flags_by_key) |> Db.asc() |> Db.collect!(ctx.db)?
+        all_flags = Db.from_index(flags_by_key) |> Db.asc() |> Db.take(500) |> Db.collect!(ctx.db)?
         evals =
             all_flags
             |> List.map(|f| Flags.evaluate(flag_doc_to_rule(f), canonical_id, effective_props))
         Ok(evals)
     }
 
-    ## Real-time overview KPIs (`total_events`, `unique_persons`, `active_sessions`, `top_events`).
-    ## When `to_ms <= 0`, scans `[from_ms, +∞)` so live WebSocket subscriptions automatically
-    ## receive every newly captured event without needing to advance `to_ms`.
-    summary! : Ctx.QueryCtx, SummaryArgs => Try(Insights.SummaryResult, Str)
-    summary! = |ctx, args| {
+    ## Real-time overview KPIs (admin-gated when `req_auth` is True, bounded scan).
+    summary! : Bool, List(Str), Ctx.QueryCtx, SummaryArgs => Try(Insights.SummaryResult, Str)
+    summary! = |req_auth, admin_roles, ctx, args| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         now_ms! = ctx.now_ms!
         is_live = args.to_ms <= 0
         to_ms = if is_live { now_ms!() } else { args.to_ms }
         from_ms = if is_live and args.from_ms <= 0 { to_ms - 86400000 } else { args.from_ms }
+        top_n = if args.top_n <= 0 { 10 } else if args.top_n > 100 { 100 } else { args.top_n }
 
         docs =
             if is_live or to_ms == Insights.max_i64 {
                 Db.from_index(events_by_timestamp)
                 |> Db.gte([Key.int(from_ms)])
                 |> Db.asc()
+                |> Db.take(2000)
                 |> Db.collect!(ctx.db)?
             } else {
                 Db.from_index(events_by_timestamp)
                 |> Db.gte([Key.int(from_ms)])
                 |> Db.lt([Key.int(to_ms + 1)])
                 |> Db.asc()
+                |> Db.take(2000)
                 |> Db.collect!(ctx.db)?
             }
 
         aliases = load_aliases!(ctx.db)?
         records = docs |> List.map(event_doc_to_record)
-        Ok(Insights.compute_summary(records, aliases, args.top_n))
+        Ok(Insights.compute_summary(records, aliases, top_n))
     }
 
-    ## Real-time time-bucketed event Trends (uses `by_event_time` index for surgical ReadSet isolation!).
-    ## When `to_ms <= 0`, brackets `[ (event, from_ms), Prefix(event) )` so new events of the same name
-    ## trigger live WebSocket updates while unrelated event names never invalidate the subscription.
-    trends! : Ctx.QueryCtx, TrendsArgs => Try(Insights.TrendResult, Str)
-    trends! = |ctx, args| {
+    ## Real-time time-bucketed event Trends (admin-gated when `req_auth` is True, bounded scan).
+    trends! : Bool, List(Str), Ctx.QueryCtx, TrendsArgs => Try(Insights.TrendResult, Str)
+    trends! = |req_auth, admin_roles, ctx, args| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         event_name = Str.trim(args.event)
         if Str.is_empty(event_name) {
             return Err("Trend event name cannot be empty")
@@ -1370,12 +1484,14 @@ Analytics := [Analytics].{
                 |> Db.eq([Key.str(event_name)])
                 |> Db.gte([Key.str(event_name), Key.int(from_ms)])
                 |> Db.asc()
+                |> Db.take(2000)
                 |> Db.collect!(ctx.db)?
             } else {
                 Db.from_index(events_by_event_time)
                 |> Db.gte([Key.str(event_name), Key.int(from_ms)])
                 |> Db.lt([Key.str(event_name), Key.int(to_ms + 1)])
                 |> Db.asc()
+                |> Db.take(2000)
                 |> Db.collect!(ctx.db)?
             }
 
@@ -1395,10 +1511,10 @@ Analytics := [Analytics].{
         )
     }
 
-    ## Real-time multi-step Conversion Funnel with conversion window & avg time-to-convert.
-    ## When `to_ms <= 0`, scans `[from_ms, +∞)` so live WebSocket subscriptions stay reactive.
-    funnel! : Ctx.QueryCtx, FunnelArgs => Try(Insights.FunnelResult, Str)
-    funnel! = |ctx, args| {
+    ## Real-time multi-step Conversion Funnel (admin-gated when `req_auth` is True, bounded scan).
+    funnel! : Bool, List(Str), Ctx.QueryCtx, FunnelArgs => Try(Insights.FunnelResult, Str)
+    funnel! = |req_auth, admin_roles, ctx, args| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         now_ms! = ctx.now_ms!
         is_live = args.to_ms <= 0
         to_ms = if is_live { now_ms!() } else { args.to_ms }
@@ -1411,12 +1527,14 @@ Analytics := [Analytics].{
                 Db.from_index(events_by_timestamp)
                 |> Db.gte([Key.int(from_ms)])
                 |> Db.asc()
+                |> Db.take(2000)
                 |> Db.collect!(ctx.db)?
             } else {
                 Db.from_index(events_by_timestamp)
                 |> Db.gte([Key.int(from_ms)])
                 |> Db.lt([Key.int(scan_end + 1)])
                 |> Db.asc()
+                |> Db.take(2000)
                 |> Db.collect!(ctx.db)?
             }
 
@@ -1425,10 +1543,10 @@ Analytics := [Analytics].{
         Ok(Insights.compute_funnel(args.steps, records, aliases, from_ms, to_ms, window_ms, args.filters))
     }
 
-    ## Real-time Cohort Retention table.
-    ## Pass `from_ms < 0` to default to the trailing `num_periods * period_ms` window with live reactivity.
-    retention! : Ctx.QueryCtx, RetentionArgs => Try(Insights.RetentionResult, Str)
-    retention! = |ctx, args| {
+    ## Real-time Cohort Retention table (admin-gated when `req_auth` is True, bounded scan).
+    retention! : Bool, List(Str), Ctx.QueryCtx, RetentionArgs => Try(Insights.RetentionResult, Str)
+    retention! = |req_auth, admin_roles, ctx, args| {
+        _ = require_admin_if_needed!(req_auth, admin_roles, ctx.auth!)?
         cohort_ev = Str.trim(args.cohort_event)
         return_ev = if Str.is_empty(Str.trim(args.return_event)) { cohort_ev } else { Str.trim(args.return_event) }
         if Str.is_empty(cohort_ev) {
@@ -1456,12 +1574,14 @@ Analytics := [Analytics].{
                 Db.from_index(events_by_timestamp)
                 |> Db.gte([Key.int(from_ms)])
                 |> Db.asc()
+                |> Db.take(2000)
                 |> Db.collect!(ctx.db)?
             } else {
                 Db.from_index(events_by_timestamp)
                 |> Db.gte([Key.int(from_ms)])
                 |> Db.lt([Key.int(end_ms)])
                 |> Db.asc()
+                |> Db.take(2000)
                 |> Db.collect!(ctx.db)?
             }
 
@@ -1475,11 +1595,10 @@ Analytics := [Analytics].{
     # -------------------------------------------------------------------------
 
     ## Record an analytics event inside a parent app mutation's EXACT SAME ACID transaction.
-    ## If the parent mutation fails or rolls back, the analytics event rolls back too!
     track! : Mount, Ctx.MutationCtx, CaptureArgs => Try(Str, Str)
     track! = |m, parent_ctx, args| {
         scoped = Ctx.scope_mutation(parent_ctx, m.namespace)
-        capture!(scoped, args)
+        capture!([], scoped, args)
     }
 
     ## Ergonomic one-liner to track an event inside a parent mutation's ACID transaction
@@ -1496,18 +1615,18 @@ Analytics := [Analytics].{
             timestamp_ms: 0,
         })
 
-    ## Identify a user inside a parent app mutation's ACID transaction.
+    ## Identify a user inside a parent app mutation's ACID transaction (trusted server-side caller).
     identify_in_tx! : Mount, Ctx.MutationCtx, IdentifyArgs => Try(PersonProfile, Str)
     identify_in_tx! = |m, parent_ctx, args| {
         scoped = Ctx.scope_mutation(parent_ctx, m.namespace)
-        identify!(scoped, args)
+        identify!(False, [], scoped, args)
     }
 
-    ## Evaluate a feature flag from inside a parent app query (or mutation via `Ctx.as_query_ctx`).
+    ## Evaluate a feature flag from inside a parent app query (trusted server-side caller).
     evaluate_flag_in_query! : Mount, Ctx.QueryCtx, EvaluateFlagArgs => Try(Flags.Evaluation, Str)
     evaluate_flag_in_query! = |m, parent_ctx, args| {
         scoped = Ctx.scope_query(parent_ctx, m.namespace)
-        evaluate_flag!(scoped, args)
+        evaluate_flag!([], scoped, args)
     }
 
     ## Convenience boolean check for a feature flag from inside backend queries/mutations.
@@ -1525,14 +1644,14 @@ Analytics := [Analytics].{
     upsert_flag_in_tx! : Mount, Ctx.MutationCtx, UpsertFlagArgs => Try(Str, Str)
     upsert_flag_in_tx! = |m, parent_ctx, args| {
         scoped = Ctx.scope_mutation(parent_ctx, m.namespace)
-        upsert_flag!(False, scoped, args)
+        upsert_flag!(False, [], scoped, args)
     }
 
-    ## List all feature flags from inside a parent app query or mutation (via `Ctx.as_query_ctx`).
+    ## List all feature flags from inside a parent app query or mutation (trusted server-side caller).
     list_flags_in_query! : Mount, Ctx.QueryCtx => Try(List(FeatureFlagDoc), Str)
     list_flags_in_query! = |m, parent_ctx| {
         scoped = Ctx.scope_query(parent_ctx, m.namespace)
-        list_flags!(scoped, {})
+        list_flags!(False, [], scoped, {})
     }
 
     # -------------------------------------------------------------------------
@@ -1544,6 +1663,7 @@ Analytics := [Analytics].{
     attach = |spec, m| {
         ns = m.namespace
         req_auth = m.require_auth_for_admin
+        admin_roles = m.admin_roles
         max_batch = m.max_batch_size
 
         event_doc_schema = Table.doc_schema_scoped(events_table, ns)
@@ -1558,49 +1678,49 @@ Analytics := [Analytics].{
             "${ns}.capture",
             capture_args_schema,
             Schema.scoped_id(ns, "events"),
-            capture!,
+            |ctx, args| capture!(admin_roles, ctx, args),
         )
         |> App.component_mutation(
             ns,
             "${ns}.captureBatch",
             capture_batch_args_schema,
             capture_batch_result_schema,
-            |ctx, args| capture_batch!(max_batch, ctx, args),
+            |ctx, args| capture_batch!(admin_roles, max_batch, ctx, args),
         )
         |> App.component_mutation(
             ns,
             "${ns}.identify",
             identify_args_schema,
             person_profile_schema,
-            identify!,
+            |ctx, args| identify!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_mutation(
             ns,
             "${ns}.alias",
             alias_args_schema,
             Schema.bool,
-            alias!,
+            |ctx, args| alias!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_mutation(
             ns,
             "${ns}.upsertFlag",
             upsert_flag_args_schema,
             Schema.scoped_id(ns, "feature_flags"),
-            |ctx, args| upsert_flag!(req_auth, ctx, args),
+            |ctx, args| upsert_flag!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_mutation(
             ns,
             "${ns}.deleteFlag",
             delete_flag_args_schema,
             Schema.bool,
-            |ctx, args| delete_flag!(req_auth, ctx, args),
+            |ctx, args| delete_flag!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_mutation(
             ns,
             "${ns}.evaluateFlagAndTrack",
             evaluate_flag_and_track_args_schema,
             flag_eval_schema,
-            evaluate_flag_and_track!,
+            |ctx, args| evaluate_flag_and_track!(admin_roles, ctx, args),
         )
         # Reactive Queries
         |> App.component_query(
@@ -1608,91 +1728,91 @@ Analytics := [Analytics].{
             "${ns}.recentEvents",
             recent_events_args_schema,
             Schema.list(event_doc_schema),
-            recent_events!,
+            |ctx, args| recent_events!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_query(
             ns,
             "${ns}.personEvents",
             person_events_args_schema,
             Schema.list(event_doc_schema),
-            person_events!,
+            |ctx, args| person_events!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_query(
             ns,
             "${ns}.sessionEvents",
             session_events_args_schema,
             Schema.list(event_doc_schema),
-            session_events!,
+            |ctx, args| session_events!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_query(
             ns,
             "${ns}.groupEvents",
             group_events_args_schema,
             Schema.list(event_doc_schema),
-            group_events!,
+            |ctx, args| group_events!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_query(
             ns,
             "${ns}.getPerson",
             get_person_args_schema,
             person_profile_schema,
-            get_person!,
+            |ctx, args| get_person!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_query(
             ns,
             "${ns}.listPersons",
             list_persons_args_schema,
             Schema.list(person_doc_schema),
-            list_persons!,
+            |ctx, args| list_persons!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_query(
             ns,
             "${ns}.listFlags",
             Schema.record([]),
             Schema.list(flag_doc_schema),
-            list_flags!,
+            |ctx, args| list_flags!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_query(
             ns,
             "${ns}.evaluateFlag",
             evaluate_flag_args_schema,
             flag_eval_schema,
-            evaluate_flag!,
+            |ctx, args| evaluate_flag!(admin_roles, ctx, args),
         )
         |> App.component_query(
             ns,
             "${ns}.evaluateAllFlags",
             evaluate_all_flags_args_schema,
             Schema.list(flag_eval_schema),
-            evaluate_all_flags!,
+            |ctx, args| evaluate_all_flags!(admin_roles, ctx, args),
         )
         |> App.component_query(
             ns,
             "${ns}.summary",
             summary_args_schema,
             summary_result_schema,
-            summary!,
+            |ctx, args| summary!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_query(
             ns,
             "${ns}.trends",
             trends_args_schema,
             trends_result_schema,
-            trends!,
+            |ctx, args| trends!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_query(
             ns,
             "${ns}.funnel",
             funnel_args_schema,
             funnel_result_schema,
-            funnel!,
+            |ctx, args| funnel!(req_auth, admin_roles, ctx, args),
         )
         |> App.component_query(
             ns,
             "${ns}.retention",
             retention_args_schema,
             retention_result_schema,
-            retention!,
+            |ctx, args| retention!(req_auth, admin_roles, ctx, args),
         )
     }
 }

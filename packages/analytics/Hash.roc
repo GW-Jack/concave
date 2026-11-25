@@ -38,9 +38,12 @@ Hash := [Hash].{
     }
 
     ## Map `(salt, distinct_id)` into a deterministic bucket in `[0, 10000)` (basis points, 0.01% precision).
+    ## Length-prefixes `salt` so `("a:b", "c")` and `("a", "b:c")` never collide.
     bucket_bps : Str, Str -> I64
-    bucket_bps = |salt, distinct_id|
-        hash_str("${salt}:${distinct_id}") % 10000
+    bucket_bps = |salt, distinct_id| {
+        salt_len = Str.count_utf8_bytes(salt).to_str()
+        hash_str("${salt_len}:${salt}:${distinct_id}") % 10000
+    }
 
     ## Map `(flag_key, distinct_id)` into a deterministic percentage bucket in `[0, 100)`.
     bucket_pct : Str, Str -> I64

@@ -2,7 +2,7 @@ platform ""
     requires {
         concave_app : () -> App
     }
-    exposes [Host]
+    exposes []
     packages {
         sdk: "../packages/concave-sdk/main.roc",
     }
@@ -29,6 +29,9 @@ platform ""
         "roc_host_storage_delete": Host.storage_delete!,
         "roc_host_auth_identity": Host.auth_identity!,
         "roc_host_http_fetch": Host.http_fetch!,
+        "roc_host_http_request": Host.http_request!,
+        "roc_host_secret_get": Host.secret_get!,
+        "roc_host_crypto_op": Host.crypto_op!,
         "roc_host_run_query": Host.run_query!,
         "roc_host_run_mutation": Host.run_mutation!,
         "roc_host_now_ms": Host.now_ms!,
@@ -109,7 +112,14 @@ make_db_writer = |namespace| {
 make_scheduler : () -> Ctx.Scheduler
 make_scheduler = || {
     run_after!: |delay_ms, fn_name, args_json| {
+        if delay_ms < 0 {
+            return Err("delay_ms must be non-negative")
+        }
         now = Host.now_ms!()
+        max_i64 = 9223372036854775807
+        if now > 0 and delay_ms > max_i64 - now {
+            return Err("delay_ms overflow")
+        }
         unwrap_wire(Host.schedule_job!(now + delay_ms, fn_name, args_json))
     },
     run_at!: |run_at_ms, fn_name, args_json|
@@ -146,6 +156,72 @@ make_mutation_ctx = || {
     now_ms!: Host.now_ms!,
 }
 
+parse_json_str : Str -> Try(Str, Str)
+parse_json_str = |raw|
+    match Json.parse(raw) {
+        Ok(s) => Ok(s)
+        Err(InvalidJson(msg)) => Err("failed to decode crypto string response: ${msg}")
+    }
+
+parse_json_bool : Str -> Try(Bool, Str)
+parse_json_bool = |raw|
+    match Json.parse(raw) {
+        Ok(b) => Ok(b)
+        Err(InvalidJson(msg)) => Err("failed to decode crypto bool response: ${msg}")
+    }
+
+make_secrets : () -> Ctx.Secrets
+make_secrets = || {
+    get!: |name| unwrap_wire(Host.secret_get!(name)),
+}
+
+make_crypto : () -> Ctx.CryptoCap
+make_crypto = || {
+    op!: |req_json| unwrap_wire(Host.crypto_op!(req_json)),
+    random_bytes!: |len| {
+        raw = unwrap_wire(Host.crypto_op!("{\"op\":\"random_bytes\",\"len\":${len.to_str()}}"))?
+        parse_json_str(raw)
+    },
+    sha256!: |data| {
+        raw = unwrap_wire(Host.crypto_op!("{\"op\":\"sha256\",\"data\":${Json.to_str(data)},\"encoding\":\"hex\"}"))?
+        parse_json_str(raw)
+    },
+    sha256_b64url!: |data| {
+        raw = unwrap_wire(Host.crypto_op!("{\"op\":\"sha256\",\"data\":${Json.to_str(data)},\"encoding\":\"base64url\"}"))?
+        parse_json_str(raw)
+    },
+    hmac_sha256!: |key, data| {
+        raw = unwrap_wire(Host.crypto_op!("{\"op\":\"hmac_sha256\",\"key\":${Json.to_str(key)},\"data\":${Json.to_str(data)},\"encoding\":\"hex\"}"))?
+        parse_json_str(raw)
+    },
+    ct_eq!: |a, b| {
+        raw = unwrap_wire(Host.crypto_op!("{\"op\":\"ct_eq\",\"a\":${Json.to_str(a)},\"b\":${Json.to_str(b)}}"))?
+        parse_json_bool(raw)
+    },
+    hash_password!: |password| {
+        raw = unwrap_wire(Host.crypto_op!("{\"op\":\"hash_password\",\"password\":${Json.to_str(password)}}"))?
+        parse_json_str(raw)
+    },
+    verify_password!: |password, hash| {
+        raw = unwrap_wire(Host.crypto_op!("{\"op\":\"verify_password\",\"password\":${Json.to_str(password)},\"hash\":${Json.to_str(hash)}}"))?
+        parse_json_bool(raw)
+    },
+    ed25519_jwk!: |seed, kid|
+        unwrap_wire(Host.crypto_op!("{\"op\":\"ed25519_jwk\",\"seed\":${Json.to_str(seed)},\"kid\":${Json.to_str(kid)}}")),
+    jwt_sign_ed25519!: |seed, kid, claims_json| {
+        raw = unwrap_wire(Host.crypto_op!("{\"op\":\"jwt_sign_ed25519\",\"seed\":${Json.to_str(seed)},\"kid\":${Json.to_str(kid)},\"claims\":${claims_json}}"))?
+        parse_json_str(raw)
+    },
+    aead_encrypt!: |key, plaintext, aad| {
+        raw = unwrap_wire(Host.crypto_op!("{\"op\":\"aead_encrypt\",\"key\":${Json.to_str(key)},\"plaintext\":${Json.to_str(plaintext)},\"aad\":${Json.to_str(aad)}}"))?
+        parse_json_str(raw)
+    },
+    aead_decrypt!: |key, ciphertext, aad| {
+        raw = unwrap_wire(Host.crypto_op!("{\"op\":\"aead_decrypt\",\"key\":${Json.to_str(key)},\"ciphertext\":${Json.to_str(ciphertext)},\"aad\":${Json.to_str(aad)}}"))?
+        parse_json_str(raw)
+    },
+}
+
 make_action_ctx : () -> Ctx.ActionCtx
 make_action_ctx = || {
     storage: make_storage_writer(),
@@ -158,6 +234,19 @@ make_action_ctx = || {
             Err(InvalidJson(msg)) => Err("failed to decode http_fetch response: ${msg}")
         }
     },
+    http_request!: |req| {
+        req_json = match Json.to_str_try(req) {
+            Ok(s) => s
+            Err(_) => return Err("failed to encode http_request payload")
+        }
+        raw = unwrap_wire(Host.http_request!(req_json))?
+        match Json.parse(raw) {
+            Ok(resp) => Ok(resp)
+            Err(InvalidJson(msg)) => Err("failed to decode http_request response: ${msg}")
+        }
+    },
+    secrets: make_secrets(),
+    crypto: make_crypto(),
     run_query!: |name, args_json| unwrap_wire(Host.run_query!(name, args_json)),
     run_mutation!: |name, args_json| unwrap_wire(Host.run_mutation!(name, args_json)),
 }

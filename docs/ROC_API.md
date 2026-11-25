@@ -55,10 +55,27 @@ Roc's type & effect system statically enforces what each function kind can do:
 | --- | --- | --- |
 | **`Ctx.QueryCtx`** | `db : DbReader`, `storage : StorageReader`, `auth!`, `now_ms!` | Read-only, deterministic snapshot, automatically reactive over WebSockets. |
 | **`Ctx.MutationCtx`** | `db : DbWriter`, `scheduler : Scheduler`, `storage : StorageWriter`, `auth!`, `now_ms!` | ACID transaction with serializable OCC retries, read-your-own-writes, and atomic scheduled jobs. |
-| **`Ctx.ActionCtx`** | `http_fetch!`, `run_query!`, `run_mutation!`, `storage : StorageWriter`, `auth!`, `now_ms!` | Non-deterministic external HTTP/HTTPS I/O; invokes transactional queries & mutations re-entrantly. |
+| **`Ctx.ActionCtx`** | `http_fetch!`, `http_request!`, `secrets : Secrets`, `crypto : CryptoCap`, `run_query!`, `run_mutation!`, `storage : StorageWriter`, `auth!`, `now_ms!` | Non-deterministic external HTTP/HTTPS I/O, allowlisted secrets, and host crypto; invokes transactional queries & mutations re-entrantly. |
 
-### Helpers on `Ctx`
-- `Ctx.require_auth!(ctx.auth!)` — returns `Try(Ctx.AuthIdentity, Str)` (`{ subject, issuer, name }`).
+### `AuthIdentity` & Role Helpers on `Ctx`
+
+`Ctx.AuthIdentity` carries verified JWT / dev-token identity claims:
+
+```roc
+AuthIdentity : {
+    subject : Str,
+    issuer : Str,
+    name : Str,
+    email : Str,
+    email_verified : Bool,
+    session_id : Str,
+    roles : List(Str),
+}
+```
+
+- `Ctx.require_auth!(ctx.auth!)` — returns `Try(Ctx.AuthIdentity, Str)` (returns `Err("Unauthenticated")` if missing).
+- `Ctx.has_role(id, role)` / `Ctx.has_any_role(id, roles)` — pure `Bool` checks against `id.roles`.
+- `Ctx.require_role!(ctx.auth!, role)` / `Ctx.require_any_role!(ctx.auth!, roles)` — require authentication plus role membership.
 - `Ctx.as_reader(ctx.db)` — derives a `DbReader` from a `DbWriter`.
 - `Ctx.as_query_ctx(ctx)` — derives a `QueryCtx` from a `MutationCtx` so read helpers work in both.
 - `Ctx.scope_query(ctx, ns)` / `Ctx.scope_mutation(ctx, ns)` — scopes DB access to a component's isolated namespace while staying in the same ACID transaction.
@@ -147,29 +164,117 @@ Scheduled jobs and crons are stored in `_system._scheduled_jobs` and claimed ato
 
 ---
 
-## 6. Custom HTTP Routes / Webhooks (`App.http_route`)
+## 6. Outbound HTTP & Custom HTTP Routes / Webhooks
 
-Route handlers receive `Ctx.ActionCtx` and `App.HttpRouteRequest` (`{ method, path, query, body, content_type }`), and return `Try(App.HttpRouteResponse, Str)` (`{ status, content_type, body }`):
+### Outbound HTTP from Actions (`Ctx.http_fetch!` & `Ctx.http_request!`)
+
+Inside any `Ctx.ActionCtx`:
+- `Ctx.http_fetch!(ctx, { method: "GET", url, body: "" })` -> `Try(Ctx.HttpResponse, Str)` (`{ status : U64, body : Str }`).
+- `Ctx.http_request!(ctx, { method, url, headers, body })` -> `Try(Ctx.HttpResponseEx, Str)` (`{ status : U64, headers : List(Ctx.HttpHeader), body : Str }`), supporting arbitrary request/response headers (`{ name : Str, value : Str }`):
+
+```roc
+resp = Ctx.http_request!(ctx, {
+    method: "POST",
+    url: "https://api.example.com/v1/events",
+    headers: [
+        { name: "Authorization", value: "Bearer ${api_key}" },
+        { name: "Content-Type", value: "application/json" },
+    ],
+    body: payload_json,
+})?
+```
+
+### Custom HTTP Routes (`App.http_route` & `App.http_route_with_headers`)
+
+Route handlers receive `Ctx.ActionCtx` and `App.HttpRouteRequest` (`{ method, path, query, body, content_type, headers : List(App.HttpHeader) }`). Use `App.header_value(req, "stripe-signature")` for case-insensitive request header lookup.
+
+- `App.http_route(method, path, handler!)` returns `Try(App.HttpRouteResponse, Str)` (`{ status, content_type, body }`).
+- `App.http_route_with_headers(method, path, handler!)` returns `Try(App.HttpRouteResponseEx, Str)` (`{ status, content_type, headers : List(App.HttpHeader), body }`) for setting `Location`, `Set-Cookie`, `Cache-Control`, etc.
+- Component-scoped variants `App.component_http_route`, `App.component_http_route_with_headers`, `App.component_action`, and `App.component_internal_action` bind the route or action to a component's namespace so secret allowlists are isolated per component.
 
 ```roc
 stripe_webhook! : Ctx.ActionCtx, App.HttpRouteRequest => Try(App.HttpRouteResponse, Str)
 stripe_webhook! = |ctx, req| {
+    sig = match App.header_value(req, "stripe-signature") {
+        Ok(v) => v
+        Err(NotFound) => return Err("Missing signature")
+    }
+    secret = Ctx.secret_get!(ctx, "STRIPE_WEBHOOK_SECRET")?
+    hmac! = ctx.crypto.hmac_sha256!
+    ct_eq! = ctx.crypto.ct_eq!
+    expected = hmac!(secret, req.body)?
+    if !ct_eq!(sig, expected)? {
+        return Err("Invalid webhook signature")
+    }
     _ = Ctx.run_mutation_raw!(ctx, "billing.handle_event", req.body)?
     Ok({ status: 200, content_type: "application/json", body: "{\"ok\":true}" })
 }
 
 # Exact or trailing `*` prefix paths; method `"*"` matches any HTTP method:
 |> App.http_route("POST", "/webhooks/stripe", stripe_webhook!)
-|> App.http_route("GET", "/public/v1/*", public_api!)
+|> App.http_route_with_headers("GET", "/redirect/*", redirect_handler!)
 ```
 
 ---
 
-## 7. Capability-Injected Components
+## 7. Action Secrets Capability (`ctx.secrets`)
+
+Secrets are available **only** inside `Ctx.ActionCtx` (Actions and HTTP routes) — never in Queries or Mutations — and are statically enforced against per-namespace allowlists declared in `AppManifest`:
+
+```roc
+concave_app : () -> App
+concave_app = ||
+    App.new("my-app")
+    |> App.with_secret("STRIPE_WEBHOOK_SECRET")
+    |> App.with_secrets(["RESEND_API_KEY", "OPENAI_API_KEY@3"])
+```
+
+- **Root app allowlist**: `App.with_secret(app, name)` / `App.with_secrets(app, names)`.
+- **Component allowlist**: `Component.with_secrets(spec, names)` — strictly isolated to that component's actions and HTTP routes (root app actions cannot read a component's secrets and vice versa).
+- **Reading in an Action / HTTP route**: `Ctx.secret_get!(ctx, "RESEND_API_KEY")?` (or bind `get_secret! = ctx.secrets.get!`).
+
+### Supported Secret Reference Formats
+- Short name: `"STRIPE_KEY"` -> version `"latest"` in `CONCAVE_GCP_PROJECT` (or `GOOGLE_CLOUD_PROJECT`).
+- Pinned version: `"STRIPE_KEY@3"` -> version `"3"`.
+- Full Google Cloud Secret Manager resource path: `"projects/<proj>/secrets/<name>/versions/<ver>"`.
+
+### Resolution Precedence & Bootstrap (`gcp-secret://...`)
+1. In-memory TTL cache (5-minute default, zeroized on eviction/shutdown).
+2. Mounted tmpfs directory: `CONCAVE_SECRETS_DIR/<name>` (e.g. Cloud Run `--set-secrets=/run/secrets/...`).
+3. Google Cloud Secret Manager REST API (`CONCAVE_GCP_PROJECT`, authenticating via `GOOGLE_APPLICATION_CREDENTIALS`, ADC, or GCE/Cloud Run metadata server).
+4. Offline encrypted local dev vault (`CONCAVE_SECRETS_VAULT`, XChaCha20-Poly1305 + PBKDF2-HMAC-SHA256, managed via `concave secrets set|list|delete`).
+
+Bootstrap server env vars (`DATABASE_URL`, `CONCAVE_JWT_SECRET`, `CONCAVE_JWT_ED25519_PUBLIC_KEY`, `CONCAVE_STORAGE_SECRET`, `CONCAVE_ADMIN_KEY`, `CONCAVE_OPERATOR_TOKEN`) also accept `"gcp-secret://<ref>"` values, which are resolved through the same provider at startup.
+
+---
+
+## 8. Action Crypto Capability (`ctx.crypto`)
+
+Zero-dependency host cryptography is available on `Ctx.ActionCtx` (`ctx.crypto : Ctx.CryptoCap`) backed by Zig's `std.crypto`. Remember to bind record-field functions to a local variable (`f! = ctx.crypto.sha256!`) before calling them in Roc `0.1.0_RC1`:
+
+| Field | Signature | Behavior |
+| --- | --- | --- |
+| `random_bytes!` | `U64 => Try(Str, Str)` | CSPRNG `1..=1024` bytes encoded as unpadded base64url. |
+| `sha256!` | `Str => Try(Str, Str)` | Lowercase hex SHA-256 digest. |
+| `sha256_b64url!` | `Str => Try(Str, Str)` | Unpadded base64url SHA-256 digest (ideal for PKCE S256). |
+| `hmac_sha256!` | `Str, Str => Try(Str, Str)` | Lowercase hex HMAC-SHA-256 (`key, data`). |
+| `ct_eq!` | `Str, Str => Try(Bool, Str)` | Constant-time string equality (`a, b`). |
+| `hash_password!` | `Str => Try(Str, Str)` | Argon2id PHC string hash (`t=2, m=19456 KiB, p=1`). |
+| `verify_password!` | `Str, Str => Try(Bool, Str)` | Constant-time Argon2id verification (`password, phc_hash`). |
+| `ed25519_jwk!` | `Str, Str => Try(Str, Str)` | Derive public Ed25519 JWK JSON from 32-byte seed (hex/b64) & `kid`. |
+| `jwt_sign_ed25519!` | `Str, Str, Str => Try(Str, Str)` | Sign an `EdDSA` JWT (`seed, kid, claims_json`). |
+| `aead_encrypt!` | `Str, Str, Str => Try(Str, Str)` | XChaCha20-Poly1305 AEAD encrypt (`key32, plaintext, aad`) -> `"v1.<nonce>.<ct_tag>"`. |
+| `aead_decrypt!` | `Str, Str, Str => Try(Str, Str)` | XChaCha20-Poly1305 AEAD decrypt (`key32, ciphertext, aad`). |
+
+---
+
+## 9. Capability-Injected Components
 
 Components are pure Roc packages exposing `mount` and `attach` helpers:
 
 ```roc
+app_auth = Auth.mount("auth")
+app_migrations = Migrations.mount("migrations")
 chat_presence = Presence.mount("presence", 30000)
 send_limiter = RateLimiter.mount("rate_limit", 12, 60000)
 analytics = Analytics.mount("analytics")
@@ -179,6 +284,8 @@ concave_app : () -> App
 concave_app = ||
     App.new("my-app")
     |> App.table(rooms_table)
+    |> Auth.attach_with_cron(app_auth, 3600000)
+    |> Migrations.attach(app_migrations)
     |> Presence.attach(chat_presence)
     |> RateLimiter.attach(send_limiter)
     |> Analytics.attach(analytics)
@@ -186,4 +293,15 @@ concave_app = ||
     |> App.query("rooms.list", Schema.record([]), Schema.list(Table.doc_schema(rooms_table)), list_rooms!)
 ```
 
-Multiple instances of the same component can be mounted under distinct namespaces with host-enforced table isolation inside the same ACID transaction.
+Multiple instances of the same component can be mounted under distinct namespaces with host-enforced table and secret isolation inside the same ACID transaction.
+
+---
+
+## 10. Roc `0.1.0_RC1` Serialization & Syntax Notes
+
+Keep these Roc `0.1.0_RC1` quirks in mind when writing handlers and polymorphic `Json.Encodable` calls (`Db.insert!`, `Db.patch!`, `Ctx.run_query!`, `Ctx.run_mutation!`, `Ctx.run_after!`):
+
+- **Use `Bool.True` / `Bool.False` inside polymorphic record literals**: Plain `True`/`False` are open tag literals unless constrained to `Bool`. Inside inline records passed to `Db.insert!`, `Db.patch!`, or `Ctx.run_mutation!`, write `Bool.True` / `Bool.False` so JSON encodes `true`/`false` instead of `"True"`/`"False"`.
+- **Single-field records require an explicit colon**: Write `{ id: id }` or `{ email: email }` — `{ id }` without a colon is parsed as a block returning `id`!
+- **Annotate integer literals when polymorphic**: Inside untyped records passed directly to `Json.Encodable` helpers (e.g. `Db.insert!` or `Ctx.run_mutation!`), use typed values (e.g. `0.I64` or a typed variable) if Roc cannot infer a concrete integer type.
+- **No dot-calls on record function fields**: `ctx.http_fetch!(req)` is UFCS dispatch in Roc `0.1.0_RC1`; use `Ctx.http_fetch!(ctx, req)` or bind `f! = ctx.crypto.sha256!` first.

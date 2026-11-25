@@ -63,12 +63,12 @@ RateLimiter := [RateLimiter].{
         Schema.field("key", Schema.str),
     ])
 
-    ## Mount an isolated RateLimiter component with `max_requests` per `window_ms`.
+    ## Mount an isolated RateLimiter component with `max_requests` (>= 1) per `window_ms` (>= 1).
     mount : Str, I64, I64 -> Mount
     mount = |namespace, max_requests, window_ms| {
         namespace,
-        max_requests,
-        window_ms,
+        max_requests: if max_requests < 1 { 1 } else { max_requests },
+        window_ms: if window_ms < 1 { 1 } else { window_ms },
         spec: Component.define(
             namespace,
             "concave-rate-limiter",
@@ -135,6 +135,10 @@ RateLimiter := [RateLimiter].{
     }
 
     ## Convenience helper that returns `Err("Rate limit exceeded...")` when quota is exhausted.
+    ## Note: because Concave mutations are ACID transactions, returning `Err(...)` rolls back
+    ## the enclosing mutation (including counter increments). For failed-attempt throttling
+    ## (e.g. login brute-force protection), call `check_and_consume!` and return an `Ok(...)`
+    ## error value so the consumed token commits.
     enforce! : Mount, Ctx.MutationCtx, Str => Try(LimitResult, Str)
     enforce! = |m, ctx, key| {
         res = check_and_consume!(m, ctx, key)?
@@ -145,14 +149,25 @@ RateLimiter := [RateLimiter].{
         }
     }
 
-    ## Inspect the remaining quota for `key` without consuming a token.
+    ## Inspect the remaining quota for the caller's own key (or any key for `"admin"` role)
+    ## without consuming a token.
     status! : Mount, Ctx.QueryCtx, StatusArgs => Try(LimitResult, Str)
     status! = |m, ctx, args| {
+        user = Ctx.require_auth!(ctx.auth!)?
+        target_key =
+            if Ctx.has_role(user, "admin") and !Str.is_empty(Str.trim(args.key)) {
+                Str.trim(args.key)
+            } else if Str.is_empty(Str.trim(args.key)) or Str.trim(args.key) == user.subject {
+                user.subject
+            } else {
+                return Err("Forbidden: cannot inspect another user's rate-limit quota")
+            }
+
         now_ms! = ctx.now_ms!
         now = now_ms!()
         existing =
             Db.from_index(by_key)
-            |> Db.eq([Key.str(args.key)])
+            |> Db.eq([Key.str(target_key)])
             |> Db.first!(ctx.db)?
 
         match existing {

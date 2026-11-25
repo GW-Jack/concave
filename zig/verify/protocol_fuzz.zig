@@ -80,8 +80,13 @@ test "auth security: rejects alg:none, RS256, tampered sig, expired exp, future 
     defer allocator.free(expired);
     try std.testing.expectError(error.ExpiredToken, auth_mod.verifyToken(allocator, io, cfg, expired));
 
-    // Future `nbf` token (`nbf: 4102444800`, year 2100)
-    const future = try signJwt(allocator, secret, "{\"alg\":\"HS256\"}", "{\"sub\":\"alice\",\"nbf\":4102444800}");
+    // Missing `exp` must be rejected when `require_exp` is enabled (default).
+    const no_exp = try signJwt(allocator, secret, "{\"alg\":\"HS256\"}", "{\"sub\":\"alice\"}");
+    defer allocator.free(no_exp);
+    try std.testing.expectError(error.MissingExpiration, auth_mod.verifyToken(allocator, io, cfg, no_exp));
+
+    // Future `nbf` token (`nbf: 4102444800`, year 2100) with valid `exp`
+    const future = try signJwt(allocator, secret, "{\"alg\":\"HS256\"}", "{\"sub\":\"alice\",\"exp\":4200000000,\"nbf\":4102444800}");
     defer allocator.free(future);
     try std.testing.expectError(error.NotYetValid, auth_mod.verifyToken(allocator, io, cfg, future));
 
@@ -90,8 +95,8 @@ test "auth security: rejects alg:none, RS256, tampered sig, expired exp, future 
     defer allocator.free(bad_exp);
     try std.testing.expectError(error.MalformedJwt, auth_mod.verifyToken(allocator, io, cfg, bad_exp));
 
-    // Missing/empty `sub`
-    const no_sub = try signJwt(allocator, secret, "{\"alg\":\"HS256\"}", "{\"name\":\"ghost\"}");
+    // Missing/empty `sub` (with valid `exp`)
+    const no_sub = try signJwt(allocator, secret, "{\"alg\":\"HS256\"}", "{\"name\":\"ghost\",\"exp\":4102444800}");
     defer allocator.free(no_sub);
     try std.testing.expectError(error.MissingSubject, auth_mod.verifyToken(allocator, io, cfg, no_sub));
 }
@@ -195,8 +200,11 @@ test "ws framing: masked 16-bit & 64-bit lengths, fragmented messages with inter
     // Unexpected continuation frame when not fragmented
     var r_cont = std.Io.Reader.fixed(&[_]u8{ 0x80, 0x00 });
     try std.testing.expectError(error.ProtocolError, ws_mod.readFrame(allocator, &r_cont));
-    // Oversized frame > 16 MiB
-    var r_huge = std.Io.Reader.fixed(&[_]u8{ 0x81, 127, 0, 0, 0, 0, 0x02, 0, 0, 0 });
+    // Unmasked client-to-server frame MUST be rejected (RFC 6455 §5.1)
+    var r_unmasked = std.Io.Reader.fixed(&[_]u8{ 0x81, 0x02, 'h', 'i' });
+    try std.testing.expectError(error.ProtocolError, ws_mod.readFrame(allocator, &r_unmasked));
+    // Oversized masked frame > 16 MiB (mask bit 0x80 | 127 = 0xFF)
+    var r_huge = std.Io.Reader.fixed(&[_]u8{ 0x81, 0xFF, 0, 0, 0, 0, 0x02, 0, 0, 0 });
     try std.testing.expectError(error.FrameTooLarge, ws_mod.readFrame(allocator, &r_huge));
 }
 

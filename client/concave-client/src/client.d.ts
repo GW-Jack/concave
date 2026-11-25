@@ -53,9 +53,15 @@ export interface MutateOptions {
   optimisticUpdate?: (store: OptimisticLocalStore) => void;
 }
 
+export type TokenFetcher = (opts: {
+  forceRefresh: boolean;
+}) => Promise<string | null> | string | null;
+
 export interface ConcaveClientOptions {
   webSocketImpl?: typeof WebSocket;
   authToken?: string | null;
+  fetchToken?: TokenFetcher;
+  refreshMarginMs?: number;
   protocol?: "binary" | "json";
   liveReload?: boolean;
   onReload?: (event: ReloadEvent) => void;
@@ -71,10 +77,13 @@ export declare class ConcaveClient {
   readonly status: Signal<ConnectionStatus>;
   readonly commitTs: Signal<number>;
   readonly identity: Signal<AuthIdentity | null>;
+  readonly isAuthenticated: Signal<boolean>;
 
   constructor(url: string, options?: ConcaveClientOptions);
 
   setAuth(token: string | null): void;
+  getToken(): string | null;
+  setTokenFetcher(fn: TokenFetcher | null): void;
 
   query<Args, Result>(
     ref: FunctionReferenceLike<"query", Args, Result>,

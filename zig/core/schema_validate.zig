@@ -70,6 +70,20 @@ fn validateValue(schema: SchemaType, val: std.json.Value, is_doc_root: bool) boo
                     if (!f.optional and f.schema != .optional_t) return false;
                 }
             }
+            // Reject undeclared extra fields to prevent mass-assignment / schema drift.
+            var oit = val.object.iterator();
+            while (oit.next()) |entry| {
+                const k = entry.key_ptr.*;
+                if (is_doc_root and isSystemField(k)) continue;
+                var known = false;
+                for (fields) |f| {
+                    if (std.mem.eql(u8, f.name, k)) {
+                        known = true;
+                        break;
+                    }
+                }
+                if (!known) return false;
+            }
             return true;
         },
         .union_t => |variants| {
@@ -359,6 +373,11 @@ test "runtime schema validator accepts valid docs and rejects type mismatches or
     try std.testing.expectError(
         storage_mod.StorageError.SchemaViolation,
         validateDocumentJson(allocator, tbl.document_schema, "{\"title\":\"Bad\",\"priority\":1,\"done\":false,\"tags\":[123]}"),
+    );
+    // Undeclared extra field rejected
+    try std.testing.expectError(
+        storage_mod.StorageError.SchemaViolation,
+        validateDocumentJson(allocator, tbl.document_schema, "{\"title\":\"Bad\",\"priority\":1,\"done\":false,\"tags\":[],\"extra\":\"nope\"}"),
     );
 }
 

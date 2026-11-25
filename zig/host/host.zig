@@ -4,6 +4,7 @@ const abi = @import("roc_platform_abi.zig");
 const key_mod = @import("../core/key.zig");
 const manifest_mod = @import("../core/manifest.zig");
 const readset_mod = @import("../core/readset.zig");
+const secrets_mod = @import("../core/secrets.zig");
 const storage_mod = @import("../core/storage.zig");
 const BlobStore = @import("../core/blob_store.zig").BlobStore;
 const S3Config = @import("../core/sigv4.zig").S3Config;
@@ -11,6 +12,7 @@ const WalStore = @import("../core/wal_store.zig").WalStore;
 const PgStore = @import("../core/pg_wire.zig").PgStore;
 const auth_mod = @import("../runtime/auth.zig");
 const engine_mod = @import("../runtime/engine.zig");
+const http_client = @import("../runtime/http_client.zig");
 const server_mod = @import("../runtime/server.zig");
 
 const RocStr = abi.RocStr;
@@ -81,26 +83,10 @@ var g_roc_mutex: std.Io.Mutex = .init;
 threadlocal var t_roc_lock_depth: usize = 0;
 threadlocal var t_env_stack: [16]*engine_mod.ExecutionEnv = undefined;
 threadlocal var t_env_depth: usize = 0;
-threadlocal var t_host_arena_inited: bool = false;
-threadlocal var t_host_arena: std.heap.ArenaAllocator = undefined;
-
-fn getThreadArena() *std.heap.ArenaAllocator {
-    if (!t_host_arena_inited) {
-        t_host_arena = std.heap.ArenaAllocator.init(g_alloc);
-        t_host_arena_inited = true;
-    }
-    return &t_host_arena;
-}
 
 fn currentEnv() ?*engine_mod.ExecutionEnv {
     if (t_env_depth == 0) return null;
     return t_env_stack[t_env_depth - 1];
-}
-
-fn takeRocStr(alloc: Allocator, s: RocStr) ![]u8 {
-    const owned = try alloc.dupe(u8, s.asSlice());
-    s.decref(&g_roc_host);
-    return owned;
 }
 
 fn wireOk(payload: []const u8) RocStr {
@@ -209,7 +195,7 @@ const WireCursor = struct {
 
     fn readLenStr(self: *WireCursor) ![]const u8 {
         const len = try self.readUsize();
-        if (self.pos + len > self.buf.len) return error.InvalidWire;
+        if (len > self.buf.len - self.pos) return error.InvalidWire;
         const slice = self.buf[self.pos .. self.pos + len];
         self.pos += len;
         return slice;
@@ -264,8 +250,8 @@ export fn roc_host_db_query(req_raw: RocStr) callconv(.c) RocStr {
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
 
-    const arena = getThreadArena();
-    defer _ = arena.reset(.retain_capacity);
+    var arena = std.heap.ArenaAllocator.init(g_alloc);
+    defer arena.deinit();
     const a = arena.allocator();
 
     var ns: []const u8 = "";
@@ -334,8 +320,8 @@ export fn roc_host_db_paginate(req_raw: RocStr) callconv(.c) RocStr {
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
 
-    const arena = getThreadArena();
-    defer _ = arena.reset(.retain_capacity);
+    var arena = std.heap.ArenaAllocator.init(g_alloc);
+    defer arena.deinit();
     const a = arena.allocator();
 
     var ns: []const u8 = "";
@@ -412,8 +398,8 @@ export fn roc_host_db_search(req_raw: RocStr) callconv(.c) RocStr {
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
 
-    const arena = getThreadArena();
-    defer _ = arena.reset(.retain_capacity);
+    var arena = std.heap.ArenaAllocator.init(g_alloc);
+    defer arena.deinit();
     const a = arena.allocator();
 
     var ns: []const u8 = "";
@@ -509,23 +495,20 @@ export fn roc_host_db_delete(ns_raw: RocStr, table_raw: RocStr, id_raw: RocStr) 
 }
 
 export fn roc_host_schedule_job(run_at_ms: i64, fn_raw: RocStr, args_raw: RocStr) callconv(.c) RocStr {
-    const fn_name = takeRocStr(g_alloc, fn_raw) catch return wireErr("oom");
-    defer g_alloc.free(fn_name);
-    const args_json = takeRocStr(g_alloc, args_raw) catch return wireErr("oom");
-    defer g_alloc.free(args_json);
+    defer fn_raw.decref(&g_roc_host);
+    defer args_raw.decref(&g_roc_host);
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
-    const job_id = env.scheduleJob(g_alloc, run_at_ms, fn_name, args_json) catch |err| return wireErr(@errorName(err));
+    const job_id = env.scheduleJob(g_alloc, run_at_ms, fn_raw.asSlice(), args_raw.asSlice()) catch |err| return wireErr(@errorName(err));
     defer g_alloc.free(job_id);
     return wireOk(job_id);
 }
 
 export fn roc_host_cancel_job(id_raw: RocStr) callconv(.c) RocStr {
-    const job_id = takeRocStr(g_alloc, id_raw) catch return wireErr("oom");
-    defer g_alloc.free(job_id);
+    defer id_raw.decref(&g_roc_host);
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
-    env.cancelJob(job_id) catch |err| return wireErr(@errorName(err));
+    env.cancelJob(id_raw.asSlice()) catch |err| return wireErr(@errorName(err));
     return wireOk("ok");
 }
 
@@ -537,21 +520,19 @@ export fn roc_host_storage_upload_url() callconv(.c) RocStr {
 }
 
 export fn roc_host_storage_get_url(id_raw: RocStr) callconv(.c) RocStr {
-    const storage_id = takeRocStr(g_alloc, id_raw) catch return wireErr("oom");
-    defer g_alloc.free(storage_id);
+    defer id_raw.decref(&g_roc_host);
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
-    const url = env.storageGetUrl(g_alloc, storage_id) catch |err| return wireErr(@errorName(err));
+    const url = env.storageGetUrl(g_alloc, id_raw.asSlice()) catch |err| return wireErr(@errorName(err));
     defer g_alloc.free(url);
     return wireOk(url);
 }
 
 export fn roc_host_storage_delete(id_raw: RocStr) callconv(.c) RocStr {
-    const storage_id = takeRocStr(g_alloc, id_raw) catch return wireErr("oom");
-    defer g_alloc.free(storage_id);
+    defer id_raw.decref(&g_roc_host);
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
-    env.storageDelete(storage_id) catch |err| return wireErr(@errorName(err));
+    env.storageDelete(id_raw.asSlice()) catch |err| return wireErr(@errorName(err));
     return wireOk("ok");
 }
 
@@ -586,21 +567,19 @@ fn reacquireRocLockAfterHostCall(saved: usize) void {
 }
 
 export fn roc_host_http_fetch(method_raw: RocStr, url_raw: RocStr, body_raw: RocStr) callconv(.c) RocStr {
-    const method = takeRocStr(g_alloc, method_raw) catch return wireErr("oom");
-    defer g_alloc.free(method);
-    const url = takeRocStr(g_alloc, url_raw) catch return wireErr("oom");
-    defer g_alloc.free(url);
-    const body = takeRocStr(g_alloc, body_raw) catch return wireErr("oom");
-    defer g_alloc.free(body);
+    defer method_raw.decref(&g_roc_host);
+    defer url_raw.decref(&g_roc_host);
+    defer body_raw.decref(&g_roc_host);
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
+    const body_slice = body_raw.asSlice();
     const fetch_res = blk: {
         const saved = releaseRocLockForHostCall();
         defer reacquireRocLockAfterHostCall(saved);
         break :blk env.httpFetch(g_alloc, .{
-            .method = method,
-            .url = url,
-            .body = if (body.len > 0) body else null,
+            .method = method_raw.asSlice(),
+            .url = url_raw.asSlice(),
+            .body = if (body_slice.len > 0) body_slice else null,
         });
     };
     const resp = fetch_res catch |err| return wireErr(@errorName(err));
@@ -614,17 +593,112 @@ export fn roc_host_http_fetch(method_raw: RocStr, url_raw: RocStr, body_raw: Roc
     return wireOk(out.written());
 }
 
+export fn roc_host_http_request(req_raw: RocStr) callconv(.c) RocStr {
+    defer req_raw.decref(&g_roc_host);
+
+    const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
+
+    var arena = std.heap.ArenaAllocator.init(g_alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, req_raw.asSlice(), .{}) catch
+        return wireErr("invalid http_request JSON");
+    if (parsed != .object) return wireErr("invalid http_request JSON object");
+    const obj = parsed.object;
+
+    const method_v = obj.get("method") orelse return wireErr("missing method");
+    const url_v = obj.get("url") orelse return wireErr("missing url");
+    if (method_v != .string or url_v != .string) return wireErr("invalid method or url");
+    const body_slice: []const u8 = if (obj.get("body")) |bv| (if (bv == .string) bv.string else "") else "";
+
+    var req_headers: std.ArrayList(http_client.Header) = .empty;
+    if (obj.get("headers")) |hv| {
+        if (hv == .array) {
+            for (hv.array.items) |item| {
+                if (item != .object) continue;
+                const nv = item.object.get("name") orelse continue;
+                const vv = item.object.get("value") orelse continue;
+                if (nv == .string and vv == .string) {
+                    req_headers.append(a, .{ .name = nv.string, .value = vv.string }) catch return wireErr("oom");
+                }
+            }
+        }
+    }
+
+    const fetch_res = blk: {
+        const saved = releaseRocLockForHostCall();
+        defer reacquireRocLockAfterHostCall(saved);
+        break :blk env.httpRequest(g_alloc, .{
+            .method = method_v.string,
+            .url = url_v.string,
+            .headers = req_headers.items,
+            .body = if (body_slice.len > 0) body_slice else null,
+        });
+    };
+    const resp = fetch_res catch |err| return wireErr(@errorName(err));
+    defer resp.deinit(g_alloc);
+
+    var out: std.Io.Writer.Allocating = .init(g_alloc);
+    defer out.deinit();
+    out.writer.print("{{\"status\":{d},\"headers\":[", .{resp.status}) catch return wireErr("oom");
+    for (resp.headers, 0..) |h, i| {
+        if (i > 0) out.writer.writeByte(',') catch return wireErr("oom");
+        out.writer.writeAll("{\"name\":") catch return wireErr("oom");
+        storage_mod.writeJsonString(&out.writer, h.name) catch return wireErr("oom");
+        out.writer.writeAll(",\"value\":") catch return wireErr("oom");
+        storage_mod.writeJsonString(&out.writer, h.value) catch return wireErr("oom");
+        out.writer.writeByte('}') catch return wireErr("oom");
+    }
+    out.writer.writeAll("],\"body\":") catch return wireErr("oom");
+    storage_mod.writeJsonString(&out.writer, resp.body) catch return wireErr("oom");
+    out.writer.writeByte('}') catch return wireErr("oom");
+    return wireOk(out.written());
+}
+
+export fn roc_host_secret_get(name_raw: RocStr) callconv(.c) RocStr {
+    defer name_raw.decref(&g_roc_host);
+
+    const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
+    const secret_res = blk: {
+        const saved = releaseRocLockForHostCall();
+        defer reacquireRocLockAfterHostCall(saved);
+        break :blk env.getSecret(g_alloc, name_raw.asSlice());
+    };
+    const val = secret_res catch |err| return wireErr(@errorName(err));
+    defer {
+        std.crypto.secureZero(u8, val);
+        g_alloc.free(val);
+    }
+    return wireOk(val);
+}
+
+export fn roc_host_crypto_op(req_raw: RocStr) callconv(.c) RocStr {
+    defer req_raw.decref(&g_roc_host);
+
+    const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
+    const op_res = blk: {
+        const saved = releaseRocLockForHostCall();
+        defer reacquireRocLockAfterHostCall(saved);
+        break :blk env.cryptoOp(g_alloc, req_raw.asSlice());
+    };
+    const out = op_res catch |err| return wireErr(@errorName(err));
+    defer {
+        std.crypto.secureZero(u8, out);
+        g_alloc.free(out);
+    }
+    return wireOk(out);
+}
+
 export fn roc_host_run_query(name_raw: RocStr, args_raw: RocStr) callconv(.c) RocStr {
-    const name = takeRocStr(g_alloc, name_raw) catch return wireErr("oom");
-    defer g_alloc.free(name);
-    const args_json = takeRocStr(g_alloc, args_raw) catch return wireErr("oom");
-    defer g_alloc.free(args_json);
+    defer name_raw.decref(&g_roc_host);
+    defer args_raw.decref(&g_roc_host);
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
     const qres = blk: {
         const saved = releaseRocLockForHostCall();
         defer reacquireRocLockAfterHostCall(saved);
-        break :blk env.runQuery(g_alloc, name, args_json);
+        break :blk env.runQuery(g_alloc, name_raw.asSlice(), args_raw.asSlice());
     };
     const res = qres catch |err| return wireErr(@errorName(err));
     defer res.deinit(g_alloc);
@@ -635,16 +709,14 @@ export fn roc_host_run_query(name_raw: RocStr, args_raw: RocStr) callconv(.c) Ro
 }
 
 export fn roc_host_run_mutation(name_raw: RocStr, args_raw: RocStr) callconv(.c) RocStr {
-    const name = takeRocStr(g_alloc, name_raw) catch return wireErr("oom");
-    defer g_alloc.free(name);
-    const args_json = takeRocStr(g_alloc, args_raw) catch return wireErr("oom");
-    defer g_alloc.free(args_json);
+    defer name_raw.decref(&g_roc_host);
+    defer args_raw.decref(&g_roc_host);
 
     const env = currentEnv() orelse return wireErr("no active ExecutionEnv");
     const mut_res = blk: {
         const saved = releaseRocLockForHostCall();
         defer reacquireRocLockAfterHostCall(saved);
-        break :blk env.runMutation(g_alloc, name, args_json);
+        break :blk env.runMutation(g_alloc, name_raw.asSlice(), args_raw.asSlice());
     };
     const mres = mut_res catch |err| return wireErr(@errorName(err));
     defer mres.deinit(g_alloc);
@@ -834,6 +906,7 @@ export fn main(argc: c_int, argv: [*]const [*:0]const u8, envp: [*:null]const ?[
     initRocRuntime();
 
     var introspect = false;
+    var backfill_indexes = false;
     const env_port_str = getEnvSlice("PORT");
     var port: u16 = if (env_port_str) |ps| std.fmt.parseInt(u16, ps, 10) catch 3210 else 3210;
     var host: []const u8 = getEnvSlice("CONCAVE_HOST") orelse
@@ -860,6 +933,8 @@ export fn main(argc: c_int, argv: [*]const [*:0]const u8, envp: [*:null]const ?[
             return 0;
         } else if (std.mem.eql(u8, arg, "--introspect")) {
             introspect = true;
+        } else if (std.mem.eql(u8, arg, "--backfill-indexes")) {
+            backfill_indexes = true;
         } else if (std.mem.eql(u8, arg, "--serve")) {
             // default mode
         } else if (std.mem.eql(u8, arg, "--live-reload")) {
@@ -879,6 +954,7 @@ export fn main(argc: c_int, argv: [*]const [*:0]const u8, envp: [*:null]const ?[
         } else if (std.mem.eql(u8, arg, "--database-url") and i + 1 < count) {
             i += 1;
             database_url = std.mem.span(argv[i]);
+            std.debug.print("[concave] WARNING: --database-url exposes credentials in process listings; prefer the DATABASE_URL environment variable.\n", .{});
         } else if (std.mem.eql(u8, arg, "--deployment-id") and i + 1 < count) {
             i += 1;
             deployment_id = std.mem.span(argv[i]);
@@ -907,11 +983,55 @@ export fn main(argc: c_int, argv: [*]const [*:0]const u8, envp: [*:null]const ?[
         return 0;
     }
 
+    if (backfill_indexes) {
+        runBackfillIndexes(database_url, deployment_id) catch |err| {
+            std.debug.print("concave backfill-indexes error: {s}\n", .{@errorName(err)});
+            return 1;
+        };
+        return 0;
+    }
+
     runServer(host, port, db_path, database_url, deployment_id, static_dir, commit_poll_ms, live_reload) catch |err| {
         std.debug.print("concave host error: {s}\n", .{@errorName(err)});
         return 1;
     };
     return 0;
+}
+
+fn runBackfillIndexes(database_url: ?[]const u8, deployment_id: []const u8) !void {
+    const io = getIo();
+    var exec = try RocAppExecutor.init();
+    defer exec.deinit();
+
+    const allow_private_http = if (getEnvSlice("CONCAVE_ALLOW_PRIVATE_HTTP")) |v|
+        std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true")
+    else
+        false;
+    const secret_provider = try secrets_mod.SecretProvider.init(g_alloc, io, .{
+        .gcp_project = getEnvSlice("CONCAVE_GCP_PROJECT") orelse getEnvSlice("GOOGLE_CLOUD_PROJECT"),
+        .secrets_dir = getEnvSlice("CONCAVE_SECRETS_DIR"),
+        .local_vault_path = getEnvSlice("CONCAVE_SECRETS_VAULT"),
+        .vault_passphrase = getEnvSlice("CONCAVE_VAULT_PASSPHRASE"),
+        .gcp_api_base = getEnvSlice("CONCAVE_GCP_SECRET_API_URL"),
+        .gcp_access_token_override = getEnvSlice("CONCAVE_GCP_ACCESS_TOKEN"),
+        .google_application_credentials = getEnvSlice("GOOGLE_APPLICATION_CREDENTIALS"),
+        .home_dir = getEnvSlice("HOME"),
+        .allow_insecure_api = allow_private_http,
+    });
+    defer secret_provider.deinit();
+
+    const resolved_url = try resolveOptSecret(secret_provider, database_url);
+    defer freeSecretOpt(resolved_url);
+    const url = resolved_url orelse {
+        std.debug.print("--backfill-indexes requires DATABASE_URL (WalStore rebuilds indexes automatically on startup)\n", .{});
+        return error.MissingDatabaseUrl;
+    };
+
+    const pg = try PgStore.connectWithPoolSize(g_alloc, io, url, deployment_id, 2);
+    defer pg.deinit();
+    try pg.initSchema(&exec.manifest);
+    const count = try pg.backfillIndexes(&exec.manifest);
+    std.debug.print("Backfilled secondary indexes for {d} document(s) in deployment `{s}`\n", .{ count, deployment_id });
 }
 
 fn printServerUsage(prog: []const u8) void {
@@ -921,6 +1041,7 @@ fn printServerUsage(prog: []const u8) void {
         \\Options:
         \\  --serve                  Run HTTP/WS server (default)
         \\  --introspect             Print AppManifest JSON to stdout and exit
+        \\  --backfill-indexes       Backfill declared secondary indexes in PostgreSQL and exit
         \\  --host <addr>            Bind address (default: 127.0.0.1)
         \\  --port <port>            Listen port (default: 3210)
         \\  --db <path>              Local WAL database path (default: .concave/dev.wal)
@@ -990,6 +1111,18 @@ fn computeStaticFingerprints(allocator: Allocator, io: std.Io, dir_path: []const
     return res;
 }
 
+fn freeSecretOpt(val: ?[]u8) void {
+    if (val) |v| {
+        std.crypto.secureZero(u8, v);
+        g_alloc.free(v);
+    }
+}
+
+fn resolveOptSecret(sp: *secrets_mod.SecretProvider, raw: ?[]const u8) !?[]u8 {
+    const r = raw orelse return null;
+    return try sp.resolveBootstrapValue(g_alloc, r);
+}
+
 fn runServer(
     host: []const u8,
     port: u16,
@@ -1006,12 +1139,49 @@ fn runServer(
     var exec = try RocAppExecutor.init();
     defer exec.deinit();
 
+    const allow_dev = if (getEnvSlice("CONCAVE_ALLOW_DEV_TOKENS")) |v|
+        std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true")
+    else
+        false;
+
+    const allow_private_http = if (getEnvSlice("CONCAVE_ALLOW_PRIVATE_HTTP")) |v|
+        std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true")
+    else
+        false;
+
+    const secret_provider = try secrets_mod.SecretProvider.init(g_alloc, io, .{
+        .gcp_project = getEnvSlice("CONCAVE_GCP_PROJECT") orelse getEnvSlice("GOOGLE_CLOUD_PROJECT"),
+        .secrets_dir = getEnvSlice("CONCAVE_SECRETS_DIR"),
+        .local_vault_path = getEnvSlice("CONCAVE_SECRETS_VAULT"),
+        .vault_passphrase = getEnvSlice("CONCAVE_VAULT_PASSPHRASE"),
+        .gcp_api_base = getEnvSlice("CONCAVE_GCP_SECRET_API_URL"),
+        .gcp_access_token_override = getEnvSlice("CONCAVE_GCP_ACCESS_TOKEN"),
+        .google_application_credentials = getEnvSlice("GOOGLE_APPLICATION_CREDENTIALS"),
+        .home_dir = getEnvSlice("HOME"),
+        .allow_insecure_api = allow_private_http,
+    });
+    defer secret_provider.deinit();
+
+    // Resolve `gcp-secret://...` bootstrap secrets before initializing storage, auth, and server.
+    const resolved_database_url = try resolveOptSecret(secret_provider, database_url);
+    defer freeSecretOpt(resolved_database_url);
+    const resolved_jwt_secret = try resolveOptSecret(secret_provider, getEnvSlice("CONCAVE_JWT_SECRET"));
+    defer freeSecretOpt(resolved_jwt_secret);
+    const resolved_jwt_ed25519_pk = try resolveOptSecret(secret_provider, getEnvSlice("CONCAVE_JWT_ED25519_PUBLIC_KEY"));
+    defer freeSecretOpt(resolved_jwt_ed25519_pk);
+    const resolved_storage_secret = try resolveOptSecret(secret_provider, getEnvSlice("CONCAVE_STORAGE_SECRET"));
+    defer freeSecretOpt(resolved_storage_secret);
+    const resolved_admin_key = try resolveOptSecret(secret_provider, getEnvSlice("CONCAVE_ADMIN_KEY"));
+    defer freeSecretOpt(resolved_admin_key);
+    const resolved_operator_token = try resolveOptSecret(secret_provider, getEnvSlice("CONCAVE_OPERATOR_TOKEN"));
+    defer freeSecretOpt(resolved_operator_token);
+
     var wal_store: ?*WalStore = null;
     var pg_store: ?*PgStore = null;
     defer if (wal_store) |w| w.deinit();
     defer if (pg_store) |p| p.deinit();
 
-    const storage: storage_mod.Storage = if (database_url) |url| blk: {
+    const storage: storage_mod.Storage = if (resolved_database_url) |url| blk: {
         const max_conns: usize = if (getEnvSlice("CONCAVE_PG_MAX_CONNECTIONS")) |s|
             std.fmt.parseInt(usize, s, 10) catch 8
         else
@@ -1026,27 +1196,28 @@ fn runServer(
         break :blk .{ .wal = wal_store.? };
     };
 
-    const allow_dev = if (getEnvSlice("CONCAVE_ALLOW_DEV_TOKENS")) |v|
-        !std.mem.eql(u8, v, "false") and !std.mem.eql(u8, v, "0")
-    else
-        true;
-
     const jwks_url = getEnvSlice("CONCAVE_JWKS_URL");
     const jwks_json = getEnvSlice("CONCAVE_JWKS_JSON");
     var jwks_cache: ?*auth_mod.JwksCache = null;
     if (jwks_url != null or jwks_json != null) {
-        jwks_cache = try auth_mod.JwksCache.init(g_alloc, jwks_url, jwks_json);
+        jwks_cache = try auth_mod.JwksCache.initWithOpts(g_alloc, jwks_url, jwks_json, allow_private_http);
     }
     defer if (jwks_cache) |jc| jc.deinit();
 
     var engine = try engine_mod.ConcaveEngine.init(g_alloc, io, storage, exec.asExecutor(), .{
-        .jwt_secret = getEnvSlice("CONCAVE_JWT_SECRET"),
+        .jwt_secret = resolved_jwt_secret,
         .jwks_cache = jwks_cache,
+        .ed25519_public_key_b64 = resolved_jwt_ed25519_pk,
         .expected_issuer = getEnvSlice("CONCAVE_JWT_ISSUER"),
         .expected_audience = getEnvSlice("CONCAVE_JWT_AUDIENCE"),
         .allow_dev_tokens = allow_dev,
     });
     defer engine.deinit();
+    engine.allow_private_http = allow_private_http;
+    engine.secret_provider = secret_provider;
+    if (getEnvSlice("CONCAVE_PG_COMMIT_LOG_KEEP")) |s| {
+        engine.pg_commit_log_keep = std.fmt.parseInt(usize, s, 10) catch 50_000;
+    }
 
     if (getEnvSlice("CONCAVE_LOG_FORMAT")) |fmt| {
         if (std.ascii.eqlIgnoreCase(fmt, "json")) {
@@ -1082,13 +1253,33 @@ fn runServer(
         };
     };
 
-    const blob_store = try BlobStore.init(g_alloc, io, storage_dir, public_url, s3_opt);
+    const blob_store = try BlobStore.initWithSecret(
+        g_alloc,
+        io,
+        storage_dir,
+        public_url,
+        s3_opt,
+        resolved_storage_secret,
+    );
     defer blob_store.deinit();
     engine.blob_store = blob_store;
 
+    var cors_origins_list: std.ArrayList([]const u8) = .empty;
+    defer cors_origins_list.deinit(g_alloc);
+    if (getEnvSlice("CONCAVE_CORS_ORIGINS")) |raw_cors| {
+        var cit = std.mem.splitScalar(u8, raw_cors, ',');
+        while (cit.next()) |item| {
+            const trimmed = std.mem.trim(u8, item, " \t");
+            if (trimmed.len > 0) {
+                try cors_origins_list.append(g_alloc, trimmed);
+            }
+        }
+    }
+
     var tailer_thread: ?std.Thread = null;
     if (commit_poll_ms > 0) {
-        tailer_thread = try engine.spawnCommitTailer(commit_poll_ms);
+        const clamped_commit_ms = std.math.clamp(commit_poll_ms, 10, 60_000);
+        tailer_thread = try engine.spawnCommitTailer(clamped_commit_ms);
     }
 
     const sched_poll_ms: u64 = if (getEnvSlice("CONCAVE_SCHEDULER_POLL_MS")) |s|
@@ -1097,7 +1288,8 @@ fn runServer(
         200;
     var sched_thread: ?std.Thread = null;
     if (sched_poll_ms > 0) {
-        sched_thread = try engine.spawnSchedulerWorker(sched_poll_ms);
+        const clamped_sched_ms = std.math.clamp(sched_poll_ms, 10, 60_000);
+        sched_thread = try engine.spawnSchedulerWorker(clamped_sched_ms);
     }
 
     // Spawn a lightweight graceful-shutdown coordinator that drains WS clients and unblocks accept().
@@ -1126,15 +1318,19 @@ fn runServer(
         .connect_host = default_host,
         .port = port,
     }});
-    watcher.detach();
+    defer {
+        g_shutdown.store(true, .release);
+        watcher.join();
+    }
 
     var static_watcher_thread: ?std.Thread = null;
     if (live_reload) {
         if (static_dir) |sd| {
-            const poll_ms: u64 = if (getEnvSlice("CONCAVE_LIVE_RELOAD_POLL_MS")) |s|
+            const raw_poll_ms: u64 = if (getEnvSlice("CONCAVE_LIVE_RELOAD_POLL_MS")) |s|
                 std.fmt.parseInt(u64, s, 10) catch 200
             else
                 200;
+            const poll_ms: u64 = std.math.clamp(raw_poll_ms, 10, 60_000);
             const StaticWatcher = struct {
                 allocator: Allocator,
                 io: std.Io,
@@ -1175,17 +1371,35 @@ fn runServer(
         }
     }
 
+    const rate_limit_rps: u32 = if (getEnvSlice("CONCAVE_RATE_LIMIT_RPS")) |s|
+        std.fmt.parseInt(u32, s, 10) catch 200
+    else
+        200;
+    const rate_limit_burst: u32 = if (getEnvSlice("CONCAVE_RATE_LIMIT_BURST")) |s|
+        std.fmt.parseInt(u32, s, 10) catch (rate_limit_rps *| 2)
+    else
+        (rate_limit_rps *| 2);
+    const trust_proxy = if (getEnvSlice("CONCAVE_TRUST_PROXY")) |v|
+        std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true")
+    else
+        false;
+
     try server_mod.serve(g_alloc, io, engine, .{
         .host = host,
         .port = port,
         .static_dir = static_dir,
         .live_reload = live_reload,
-        .admin_key = getEnvSlice("CONCAVE_ADMIN_KEY"),
-        .operator_token = getEnvSlice("CONCAVE_OPERATOR_TOKEN"),
+        .admin_key = resolved_admin_key,
+        .operator_token = resolved_operator_token,
+        .cors_origins = cors_origins_list.items,
+        .rate_limit_rps = rate_limit_rps,
+        .rate_limit_burst = rate_limit_burst,
+        .trust_proxy = trust_proxy,
         .shutdown_flag = &g_shutdown,
     });
 
     // Cleanly stop & join background workers before tearing down storage/engine.
+    g_shutdown.store(true, .release);
     engine.stop_tailer.store(true, .release);
     if (static_watcher_thread) |t| t.join();
     if (tailer_thread) |t| t.join();

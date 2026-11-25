@@ -32,19 +32,52 @@ pub fn computeAcceptKey(key: []const u8, out_buf: *[28]u8) []const u8 {
     return std.base64.standard.Encoder.encode(out_buf, &digest);
 }
 
-/// Thread-safe WebSocket writer handle shared between the connection loop and broadcast fanout.
+/// Thread-safe, reference-counted WebSocket writer handle shared between the connection loop and broadcast fanout.
+/// Reference counting allows broadcast threads to send frames outside `clients_mutex`/`sync_mutex`
+/// without any risk of use-after-free or fd reuse if the connection disconnects concurrently.
 pub const WsSender = struct {
     io: std.Io,
     stream: std.Io.net.Stream,
     mutex: std.Io.Mutex = .init,
     closed: std.atomic.Value(bool) = .init(false),
+    ref_count: std.atomic.Value(usize) = .init(1),
+    allocator: ?Allocator = null,
+    owns_stream: bool = false,
 
     pub fn init(io: std.Io, stream: std.Io.net.Stream) WsSender {
+        const tv = std.posix.timeval{ .sec = 5, .usec = 0 };
+        std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
         return .{ .io = io, .stream = stream };
+    }
+
+    pub fn createShared(allocator: Allocator, io: std.Io, stream: std.Io.net.Stream, owns_stream: bool) !*WsSender {
+        const self = try allocator.create(WsSender);
+        self.* = init(io, stream);
+        self.allocator = allocator;
+        self.owns_stream = owns_stream;
+        return self;
+    }
+
+    pub fn retain(self: *WsSender) void {
+        _ = self.ref_count.fetchAdd(1, .monotonic);
+    }
+
+    pub fn release(self: *WsSender) void {
+        if (self.ref_count.fetchSub(1, .acq_rel) == 1) {
+            if (self.owns_stream) {
+                self.stream.close(self.io);
+            }
+            if (self.allocator) |alloc| {
+                alloc.destroy(self);
+            }
+        }
     }
 
     pub fn markClosed(self: *WsSender) void {
         self.closed.store(true, .release);
+        if (self.owns_stream) {
+            self.stream.shutdown(self.io, .send) catch {};
+        }
     }
 
     pub fn sendText(self: *WsSender, payload: []const u8) !void {
@@ -112,17 +145,22 @@ pub const WsReadError = error{
 };
 
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_FRAMES_PER_MSG: usize = 256;
 
 /// Read the next complete RFC 6455 message from `reader` (handling fragmentation and unmasking).
-/// Interleaved Ping/Pong control frames during a fragmented message are buffered safely via an
-/// optional `on_ping` callback or discarded without leaking/corrupting the active fragment buffer.
+/// Enforces RFC 6455 §5.1 client-to-server masking, UTF-8 validation on text frames, and a cap
+/// on interleaved/continuation frames per message to prevent CPU spin DoS.
 pub fn readFrame(allocator: Allocator, reader: *std.Io.Reader) WsReadError!Frame {
     var msg_buf: std.ArrayList(u8) = .empty;
     defer msg_buf.deinit(allocator);
     var in_fragment = false;
     var frag_is_binary = false;
+    var frame_count: usize = 0;
 
     while (true) {
+        frame_count += 1;
+        if (frame_count > MAX_FRAMES_PER_MSG) return error.ProtocolError;
+
         const b0 = reader.takeByte() catch return .close;
         const b1 = reader.takeByte() catch return .close;
 
@@ -132,6 +170,8 @@ pub fn readFrame(allocator: Allocator, reader: *std.Io.Reader) WsReadError!Frame
         const fin = (b0 & 0x80) != 0;
         const opcode = b0 & 0x0F;
         const masked = (b1 & 0x80) != 0;
+        // RFC 6455 §5.1: A server MUST close the connection upon receiving an unmasked frame.
+        if (!masked) return error.ProtocolError;
         var payload_len: u64 = b1 & 0x7F;
 
         const is_control = opcode >= 0x8;
@@ -201,6 +241,7 @@ pub fn readFrame(allocator: Allocator, reader: *std.Io.Reader) WsReadError!Frame
                 if (in_fragment) return error.ProtocolError;
                 const is_bin = (opcode == 0x2);
                 if (fin) {
+                    if (!is_bin and !std.unicode.utf8ValidateSlice(chunk)) return error.ProtocolError;
                     keep_chunk = true;
                     return if (is_bin) .{ .binary = chunk } else .{ .text = chunk };
                 }
@@ -213,6 +254,7 @@ pub fn readFrame(allocator: Allocator, reader: *std.Io.Reader) WsReadError!Frame
                 if (msg_buf.items.len + chunk.len > MAX_MESSAGE_BYTES) return error.FrameTooLarge;
                 try msg_buf.appendSlice(allocator, chunk);
                 if (fin) {
+                    if (!frag_is_binary and !std.unicode.utf8ValidateSlice(msg_buf.items)) return error.ProtocolError;
                     const owned = try msg_buf.toOwnedSlice(allocator);
                     return if (frag_is_binary) .{ .binary = owned } else .{ .text = owned };
                 }

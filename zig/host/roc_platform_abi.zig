@@ -114,7 +114,8 @@ pub fn rocErasedCallableAllocate(
     const ptr_width = @sizeOf(usize);
     const alignment = @max(ptr_width, roc_erased_callable_payload_alignment);
     const extra_bytes = @max(ptr_width, roc_erased_callable_payload_alignment);
-    const length = extra_bytes + rocErasedCallablePayloadSize(capture_size);
+    const payload_size = std.math.add(usize, roc_erased_callable_capture_offset, capture_size) catch @panic("rocErasedCallableAllocate: size overflow");
+    const length = std.math.add(usize, extra_bytes, payload_size) catch @panic("rocErasedCallableAllocate: size overflow");
     const base: [*]u8 = @ptrCast(roc_host.roc_alloc(roc_host, length, alignment));
     const data = base + extra_bytes;
     const rc: *isize = @ptrFromInt(@intFromPtr(data) - @sizeOf(isize));
@@ -150,7 +151,8 @@ pub fn allocateBox(
     const required_space: usize = if (payload_contains_refcounted) (2 * ptr_width) else ptr_width;
     const header_bytes = @max(required_space, payload_alignment);
     const alloc_alignment = @max(ptr_width, payload_alignment);
-    const base: [*]u8 = @ptrCast(roc_host.roc_alloc(roc_host, header_bytes + payload_size, alloc_alignment));
+    const total = std.math.add(usize, header_bytes, payload_size) catch @panic("allocateBox: size overflow");
+    const base: [*]u8 = @ptrCast(roc_host.roc_alloc(roc_host, total, alloc_alignment));
     const data = base + header_bytes;
     const rc: *isize = @ptrFromInt(@intFromPtr(data) - @sizeOf(isize));
     rc.* = 1;
@@ -199,9 +201,9 @@ pub fn decrefBoxWith(
 ) void {
     const data = boxDataPtr(data_ptr) orelse return;
     const rc = boxRefcountPtr(data);
-    if (rc.* == 0) return; // REFCOUNT_STATIC_DATA
+    if (@atomicLoad(isize, rc, .acquire) == 0) return; // REFCOUNT_STATIC_DATA
 
-    const prev = @atomicRmw(isize, rc, .Sub, 1, .monotonic);
+    const prev = @atomicRmw(isize, rc, .Sub, 1, .acq_rel);
     if (prev == 1) {
         if (payload_decref) |callback| callback(data_ptr, roc_host);
         freeBoxAllocation(data, payload_alignment, payload_contains_refcounted, roc_host);
@@ -275,6 +277,10 @@ pub const RocStr = extern struct {
 
     /// Return the string contents as a `[]const u8` slice.
     pub fn asSlice(self: *const Self) []const u8 {
+        if (!self.isSmallStr()) {
+            const ptr = self.bytes orelse return "";
+            return ptr[0..self.length];
+        }
         return self.asU8ptr()[0..self.len()];
     }
 
@@ -327,7 +333,7 @@ pub const RocStr = extern struct {
         } else {
             const ptr_width = @sizeOf(usize);
             const extra_bytes = ptr_width;
-            const total = extra_bytes + slice.len;
+            const total = std.math.add(usize, extra_bytes, slice.len) catch @panic("RocStr.fromSlice: size overflow");
             const base: [*]u8 = @ptrCast(roc_host.roc_alloc(roc_host, total, @alignOf(usize)));
             const data_ptr = base + extra_bytes;
             const rc: *isize = @ptrFromInt(@intFromPtr(data_ptr) - @sizeOf(isize));
@@ -347,8 +353,8 @@ pub const RocStr = extern struct {
         const alloc_ptr = self.getAllocationPtr() orelse return;
         const data_addr = @intFromPtr(alloc_ptr);
         const rc: *isize = @ptrFromInt(data_addr - @sizeOf(isize));
-        if (rc.* == 0) return; // REFCOUNT_STATIC_DATA—bytes are in read-only memory
-        const prev = @atomicRmw(isize, rc, .Sub, 1, .monotonic);
+        if (@atomicLoad(isize, rc, .acquire) == 0) return; // REFCOUNT_STATIC_DATA—bytes are in read-only memory
+        const prev = @atomicRmw(isize, rc, .Sub, 1, .acq_rel);
         if (prev == 1) {
             const ptr_width = @sizeOf(usize);
             const base: *anyopaque = @ptrFromInt(data_addr - ptr_width);
@@ -465,8 +471,8 @@ pub fn RocListWith(comptime T: type, comptime elements_refcounted: bool) type {
         /// Allocate a new list with space for `length` elements.
         pub fn allocate(length: usize, roc_host: *RocHost) Self {
             if (length == 0) return empty();
-            const data_bytes = length * @sizeOf(T);
-            const total = data_bytes + header_bytes;
+            const data_bytes = std.math.mul(usize, length, @sizeOf(T)) catch @panic("RocList.allocate: size overflow");
+            const total = std.math.add(usize, data_bytes, header_bytes) catch @panic("RocList.allocate: size overflow");
             const base: [*]u8 = @ptrCast(roc_host.roc_alloc(roc_host, total, alloc_align));
             const data_ptr = base + header_bytes;
             const rc: *isize = @ptrFromInt(@intFromPtr(data_ptr) - @sizeOf(isize));
@@ -503,8 +509,8 @@ pub fn RocListWith(comptime T: type, comptime elements_refcounted: bool) type {
             const alloc_ptr = self.getAllocationPtr() orelse return;
             const data_addr = @intFromPtr(alloc_ptr);
             const rc: *isize = @ptrFromInt(data_addr - @sizeOf(isize));
-            if (rc.* == 0) return; // REFCOUNT_STATIC_DATA—bytes are in read-only memory
-            const prev = @atomicRmw(isize, rc, .Sub, 1, .monotonic);
+            if (@atomicLoad(isize, rc, .acquire) == 0) return; // REFCOUNT_STATIC_DATA—bytes are in read-only memory
+            const prev = @atomicRmw(isize, rc, .Sub, 1, .acq_rel);
             if (prev == 1) {
                 const base: *anyopaque = @ptrFromInt(data_addr - header_bytes);
                 roc_host.roc_dealloc(roc_host, base, alloc_align);
@@ -1101,9 +1107,16 @@ pub const DefaultAllocators = struct {
         const allocator = env.allocator;
 
         const min_alignment: usize = @max(alignment, @alignOf(usize));
+        if (!std.math.isPowerOfTwo(min_alignment)) {
+            env.roc_io.writeStderr("roc_alloc: invalid alignment\n");
+            env.roc_io.onFatal();
+        }
         const align_enum = std.mem.Alignment.fromByteUnits(min_alignment);
         const size_storage_bytes = min_alignment;
-        const total_size = length + size_storage_bytes;
+        const total_size = std.math.add(usize, length, size_storage_bytes) catch {
+            env.roc_io.writeStderr("roc_alloc: size overflow\n");
+            env.roc_io.onFatal();
+        };
 
         const base_ptr = allocator.rawAlloc(total_size, align_enum, @returnAddress()) orelse {
             env.roc_io.writeStderr("roc_alloc: out of memory\n");
@@ -1123,6 +1136,10 @@ pub const DefaultAllocators = struct {
         const allocator = env.allocator;
 
         const min_alignment: usize = @max(alignment, @alignOf(usize));
+        if (!std.math.isPowerOfTwo(min_alignment)) {
+            env.roc_io.writeStderr("roc_dealloc: invalid alignment\n");
+            env.roc_io.onFatal();
+        }
         const align_enum = std.mem.Alignment.fromByteUnits(min_alignment);
         const size_storage_bytes = min_alignment;
 
@@ -1140,6 +1157,10 @@ pub const DefaultAllocators = struct {
         const allocator = env.allocator;
 
         const min_alignment: usize = @max(alignment, @alignOf(usize));
+        if (!std.math.isPowerOfTwo(min_alignment)) {
+            env.roc_io.writeStderr("roc_realloc: invalid alignment\n");
+            env.roc_io.onFatal();
+        }
         const align_enum = std.mem.Alignment.fromByteUnits(min_alignment);
         const size_storage_bytes = min_alignment;
 
@@ -1149,14 +1170,20 @@ pub const DefaultAllocators = struct {
         const old_base_ptr: [*]u8 = @ptrFromInt(@intFromPtr(ptr) - size_storage_bytes);
 
         // Allocate new block
-        const new_total_size = new_length + size_storage_bytes;
+        const new_total_size = std.math.add(usize, new_length, size_storage_bytes) catch {
+            env.roc_io.writeStderr("roc_realloc: size overflow\n");
+            env.roc_io.onFatal();
+        };
         const new_base_ptr = allocator.rawAlloc(new_total_size, align_enum, @returnAddress()) orelse {
             env.roc_io.writeStderr("roc_realloc: out of memory\n");
             env.roc_io.onFatal();
         };
 
         // Copy old user data to new location
-        const old_user_data_size = old_total_size - size_storage_bytes;
+        const old_user_data_size = std.math.sub(usize, old_total_size, size_storage_bytes) catch {
+            env.roc_io.writeStderr("roc_realloc: corrupt allocation header\n");
+            env.roc_io.onFatal();
+        };
         const copy_size = @min(old_user_data_size, new_length);
         const new_user_ptr: [*]u8 = @ptrFromInt(@intFromPtr(new_base_ptr) + size_storage_bytes);
         const old_user_ptr: [*]const u8 = @ptrCast(ptr);

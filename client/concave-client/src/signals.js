@@ -39,26 +39,40 @@ function notifySubscribers(source) {
   }
 }
 
+const MAX_FLUSH_ITERATIONS = 1000;
+let flushing = false;
+
 function flushEffects() {
-  if (batchDepth > 0) return;
-  while (pendingEffects.size > 0) {
-    const queue = Array.from(pendingEffects);
-    pendingEffects.clear();
-    for (const eff of queue) {
-      if (eff.disposed) continue;
-      // Pull any dirty computed dependencies first; skip if no dependency version actually changed.
-      let changed = eff.dependencies.size === 0;
-      for (const [dep, seenVersion] of eff.dependencies) {
-        if (dep.refresh) dep.refresh();
-        if (dep.version !== seenVersion) {
-          changed = true;
-          break;
+  if (batchDepth > 0 || flushing) return;
+  flushing = true;
+  let iterations = 0;
+  try {
+    while (pendingEffects.size > 0) {
+      iterations += 1;
+      if (iterations > MAX_FLUSH_ITERATIONS) {
+        pendingEffects.clear();
+        throw new Error("Reactive effect cycle detected");
+      }
+      const queue = Array.from(pendingEffects);
+      pendingEffects.clear();
+      for (const eff of queue) {
+        if (eff.disposed) continue;
+        // Pull any dirty computed dependencies first; skip if no dependency version actually changed.
+        let changed = eff.dependencies.size === 0;
+        for (const [dep, seenVersion] of eff.dependencies) {
+          if (dep.refresh) dep.refresh();
+          if (dep.version !== seenVersion) {
+            changed = true;
+            break;
+          }
+        }
+        if (changed) {
+          eff.execute();
         }
       }
-      if (changed) {
-        eff.execute();
-      }
     }
+  } finally {
+    flushing = false;
   }
 }
 
